@@ -119,6 +119,23 @@ Pinned in `Cargo.toml`:
 Do not add, remove, or swap crates without asking. Versions are locked
 via `Cargo.lock`. `rust-toolchain.toml` pins the compiler.
 
+### Resolving dependency versions
+
+Use `cargo` to look up and add crate versions; **do not use WebFetch
+for crates.io or any crate metadata**. `cargo` resolves the latest
+compatible version against the existing lock file, writes correct
+semver, and works in environments where outbound HTTPS is restricted
+to the registry path. WebFetch is neither necessary nor reliable for
+this and may fail in sandboxed environments.
+
+- `cargo add <crate>` — adds the latest compatible version to
+  `Cargo.toml` and updates `Cargo.lock`. Use `cargo add <crate>@<req>`
+  to pin to a specific version.
+- `cargo search <crate>` — inspect available versions if needed.
+
+Never hand-edit version strings in `Cargo.toml` from guessed values.
+Let `cargo add` write them, then commit `Cargo.lock`.
+
 Release profile: `opt-level = "z"`, `lto = "fat"`,
 `codegen-units = 1`, `panic = "abort"`, `strip = "symbols"`.
 

@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(RUSTUP_TOOLCHAIN=stable cargo fmt --check)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(/home/kostya/.cargo/bin/cargo info *)",
+      "Bash(cargo add *)",
+      "Bash(RUSTUP_TOOLCHAIN=stable cargo check --locked)",
+      "Bash(RUSTUP_TOOLCHAIN=stable cargo clippy --locked --all-targets -- -D warnings)",
+      "Bash(RUSTUP_TOOLCHAIN=stable cargo test --locked)"
+    ]
+  }
+}

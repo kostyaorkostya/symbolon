@@ -108,13 +108,18 @@ accessible to the App.
 
 Pinned in `Cargo.toml`:
 
-- `compio` (runtime + net)
+- `compio` with features `runtime,macros,net,fs,signal,time,io-uring`
+  (async runtime; `macros` for `#[compio::main]`; `net`+`fs`+`signal`+
+  `time` for the daemon surface; `io-uring` listed explicitly so a
+  future change to compio's default features can't silently disable it)
 - `cyper` (HTTPS client for provider APIs)
 - `jsonwebtoken` (App JWT)
 - `serde`, `serde_json`, `toml` (config + provider responses)
 - `tracing`, `tracing-subscriber` (JSON logging)
 - `ulid` (request IDs)
 - `thiserror` (errors)
+- `rustix` with feature `process` (signal delivery to stunnel via
+  `kill(2)` after enroll/revoke rewrites `gcb.psk`)
 
 Do not add, remove, or swap crates without asking. Versions are locked
 via `Cargo.lock`. `rust-toolchain.toml` pins the compiler.

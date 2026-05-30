@@ -1,0 +1,19 @@
+//! `gcb` — a Rust daemon that mints short-lived, single-repository git
+//! credentials on demand.
+//!
+//! Currently implements GitHub via GitHub App installation tokens. The
+//! broker holds the provider's private key on a trusted host and hands
+//! out ≤1-hour, repository-scoped tokens to enrolled clients, so a
+//! client compromise cannot leak account-wide credentials.
+//!
+//! See [`AGENTS.md`](../AGENTS.md) for the design rationale and
+//! architectural invariants, and [`docs/PROTOCOLS.md`](../docs/PROTOCOLS.md)
+//! for wire formats and file schemas.
+
+pub mod admin;
+pub mod config;
+pub mod daemon;
+pub mod errors;
+pub mod git_credential;
+pub mod providers;
+pub mod proxy_protocol;

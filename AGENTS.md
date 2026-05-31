@@ -159,8 +159,11 @@ Addenda:
   `<Module>Error`). `anyhow` only at the binary's `main` boundary.
 - No `#[allow(...)]` without an explanatory comment.
 - Default visibility is `pub(crate)`. Only `lib.rs` re-exports `pub`.
-- Doc comments on every public item.
-- Inline comments explain non-obvious choices.
+- Default to no comments. Add a doc comment only when the *why* or the
+  contract isn't obvious from the name and signature — hidden
+  invariants, surprising edge cases, security-load-bearing rules (e.g.
+  the CR/LF rejection in `git_credential`). Don't restate what
+  well-named code already says.
 
 ## Diagnostic discipline (mandatory)
 

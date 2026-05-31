@@ -7,7 +7,12 @@
       "Bash(cargo add *)",
       "Bash(RUSTUP_TOOLCHAIN=stable cargo check --locked)",
       "Bash(RUSTUP_TOOLCHAIN=stable cargo clippy --locked --all-targets -- -D warnings)",
-      "Bash(RUSTUP_TOOLCHAIN=stable cargo test --locked)"
+      "Bash(RUSTUP_TOOLCHAIN=stable cargo test --locked)",
+      "mcp__serena__get_symbols_overview",
+      "Bash(cargo check *)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo test *)",
+      "Bash(cargo fmt *)"
     ]
   }
 }

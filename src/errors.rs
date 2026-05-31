@@ -1,7 +1,9 @@
-//! Crate-wide error composition.
+//! Crate-wide error composition (deferred).
 //!
-//! Single responsibility: top-level error types that bridge module
-//! errors at boundaries. Per the AGENTS.md style guide each module
-//! defines its own `thiserror`-derived `<Module>Error`; this file
-//! holds whatever wider enum the daemon/CLI need to surface those
-//! at the `main` boundary.
+//! Originally intended to hold a top-level enum that bridges the
+//! per-module `<Module>Error` types at the `main` boundary. In
+//! practice `main.rs` matches on the relevant errors directly via
+//! their `Display` impls (`tracing::error!(error = %e)`), so no
+//! unified enum is needed today. Kept as a stub for the AGENTS.md
+//! module layout; revisit when a consumer actually needs a single
+//! error type.

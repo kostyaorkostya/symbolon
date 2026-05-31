@@ -836,6 +836,7 @@ version = "0.1.0"
 dependencies = [
  "compio",
  "cyper",
+ "futures-util",
  "jsonwebtoken",
  "rustix",
  "serde",

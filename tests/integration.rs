@@ -78,11 +78,13 @@ async fn mint_happy_path() {
     mount_mint_ok(&server).await;
 
     let provider = build_provider(server.uri());
-    let resp = provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
+    let outcome = provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
 
-    assert_eq!(resp.username, "x-access-token");
-    assert_eq!(resp.password, TOKEN);
-    let secs = resp
+    assert_eq!(outcome.response.username, "x-access-token");
+    assert_eq!(outcome.response.password, TOKEN);
+    assert_eq!(outcome.repo_id, REPO_ID);
+    let secs = outcome
+        .response
         .password_expiry_utc
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -444,7 +446,7 @@ mod daemon_e2e {
         let cfg = build_config(socket_path.clone(), clients_path.clone(), server.uri());
 
         compio::runtime::spawn(async move {
-            let _ = gcb::daemon::run(&cfg).await;
+            let _ = gcb::daemon::run(&cfg, std::path::Path::new("/test/config.toml")).await;
         })
         .detach();
         wait_for_socket(&socket_path).await;
@@ -473,7 +475,7 @@ mod daemon_e2e {
         let cfg = build_config(socket_path.clone(), clients_path.clone(), server.uri());
 
         compio::runtime::spawn(async move {
-            let _ = gcb::daemon::run(&cfg).await;
+            let _ = gcb::daemon::run(&cfg, std::path::Path::new("/test/config.toml")).await;
         })
         .detach();
         wait_for_socket(&socket_path).await;
@@ -497,7 +499,7 @@ mod daemon_e2e {
         let cfg = build_config(socket_path.clone(), clients_path.clone(), server.uri());
 
         compio::runtime::spawn(async move {
-            let _ = gcb::daemon::run(&cfg).await;
+            let _ = gcb::daemon::run(&cfg, std::path::Path::new("/test/config.toml")).await;
         })
         .detach();
         wait_for_socket(&socket_path).await;
@@ -519,7 +521,7 @@ mod daemon_e2e {
         let cfg = build_config(socket_path.clone(), clients_path.clone(), server.uri());
 
         compio::runtime::spawn(async move {
-            let _ = gcb::daemon::run(&cfg).await;
+            let _ = gcb::daemon::run(&cfg, std::path::Path::new("/test/config.toml")).await;
         })
         .detach();
         wait_for_socket(&socket_path).await;
@@ -632,7 +634,7 @@ mod admin_e2e {
     async fn spawn_daemon(paths: &TempPaths, api_base: String) {
         let cfg = build_full_config(paths, api_base);
         compio::runtime::spawn(async move {
-            let _ = gcb::daemon::run(&cfg).await;
+            let _ = gcb::daemon::run(&cfg, std::path::Path::new("/test/config.toml")).await;
         })
         .detach();
         wait_for_socket(&paths.admin).await;

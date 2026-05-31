@@ -13,16 +13,20 @@
 //! IP from the PROXY v2 header is the daemon's only source of client
 //! identity.
 //!
-//! Signal handling, the startup `selfcheck`, the `evt=shutdown`
-//! drain, and `clients.json` hot reload are deferred to the
-//! follow-up session that also wires `admin.rs`.
+//! Lifecycle: `SIGTERM` and `SIGINT` race the accept loop; on either,
+//! `shutting_down` flips, in-flight handlers drain with a 5-second
+//! deadline (PROTOCOLS.md § "Shutdown"), the admin and listen sockets
+//! are unlinked in that order, and `evt=shutdown` is logged. `SIGHUP`
+//! re-reads `clients.json` and swaps the in-memory table.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use futures_util::FutureExt;
 
 use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use compio::net::{UnixListener, UnixStream};
@@ -80,9 +84,30 @@ pub struct SharedState {
     pub clients_file_path: PathBuf,
     pub stunnel_pidfile: PathBuf,
     pub start_time: SystemTime,
+    pub inflight: Cell<usize>,
+    pub shutting_down: Cell<bool>,
 }
 
-pub async fn run(cfg: &Config) -> Result<(), DaemonError> {
+/// RAII increment of `state.inflight`. Drop decrements. Wrapping a
+/// per-connection handler in one lets the shutdown coordinator wait
+/// for in-flight handlers to finish (up to a deadline) before
+/// unlinking sockets.
+pub struct DrainGuard(Rc<SharedState>);
+
+impl DrainGuard {
+    pub fn new(state: Rc<SharedState>) -> Self {
+        state.inflight.set(state.inflight.get() + 1);
+        Self(state)
+    }
+}
+
+impl Drop for DrainGuard {
+    fn drop(&mut self) {
+        self.0.inflight.set(self.0.inflight.get().saturating_sub(1));
+    }
+}
+
+pub async fn run(cfg: &Config, config_path: &Path) -> Result<(), DaemonError> {
     let clients_file = crate::config::load_clients_file(&cfg.clients.file)?;
     let clients_table = build_clients_table(clients_file)?;
 
@@ -99,6 +124,8 @@ pub async fn run(cfg: &Config) -> Result<(), DaemonError> {
         clients_file_path: cfg.clients.file.clone(),
         stunnel_pidfile: cfg.stunnel.pidfile.clone(),
         start_time: SystemTime::now(),
+        inflight: Cell::new(0),
+        shutting_down: Cell::new(false),
     });
 
     let listen_path = &cfg.listen.socket;
@@ -124,6 +151,7 @@ pub async fn run(cfg: &Config) -> Result<(), DaemonError> {
     info!(
         evt = "startup",
         version = env!("CARGO_PKG_VERSION"),
+        config_path = %config_path.display(),
         listen_socket = %listen_path.display(),
         admin_socket = %admin_path.display(),
         providers = ?provider_names,
@@ -138,19 +166,116 @@ pub async fn run(cfg: &Config) -> Result<(), DaemonError> {
     })
     .detach();
 
-    loop {
-        let (stream, _peer) = listener.accept().await.map_err(DaemonError::Accept)?;
-        let req_id = ulid::Ulid::new().to_string();
-        let state = state.clone();
-        compio::runtime::spawn(async move {
-            let _ = compio::time::timeout(
-                PER_CONNECTION_TIMEOUT,
-                handle_connection(stream, req_id, state),
-            )
-            .await;
-        })
-        .detach();
+    // Startup selfcheck — soft fail per PROTOCOLS.md step 6.
+    for (host, provider) in &state.providers {
+        match provider.selfcheck().await {
+            Ok(outcome) => {
+                info!(
+                    evt = "selfcheck",
+                    provider = %host,
+                    ok = true,
+                    clock_skew_sec = outcome.clock_skew_sec,
+                );
+            }
+            Err(e) => {
+                warn!(
+                    evt = "selfcheck",
+                    provider = %host,
+                    ok = false,
+                    error = %e,
+                );
+            }
+        }
     }
+
+    // SIGHUP — re-read clients.json and swap the in-memory table.
+    let hup_state = state.clone();
+    let hup_path = cfg.clients.file.clone();
+    compio::runtime::spawn(async move {
+        let sig = rustix::process::Signal::HUP.as_raw();
+        loop {
+            if compio::signal::unix::signal(sig).await.is_err() {
+                break;
+            }
+            reload_clients(&hup_state, &hup_path);
+        }
+    })
+    .detach();
+
+    // Main accept loop, racing against SIGTERM / SIGINT.
+    let sigterm_fut = compio::signal::unix::signal(rustix::process::Signal::TERM.as_raw());
+    let sigint_fut = compio::signal::unix::signal(rustix::process::Signal::INT.as_raw());
+    futures_util::pin_mut!(sigterm_fut, sigint_fut);
+
+    let signal_name = loop {
+        futures_util::select! {
+            accept_res = listener.accept().fuse() => {
+                let (stream, _peer) = accept_res.map_err(DaemonError::Accept)?;
+                let req_id = ulid::Ulid::new().to_string();
+                let state = state.clone();
+                compio::runtime::spawn(async move {
+                    let _guard = DrainGuard::new(state.clone());
+                    let _ = compio::time::timeout(
+                        PER_CONNECTION_TIMEOUT,
+                        handle_connection(stream, req_id, state),
+                    )
+                    .await;
+                })
+                .detach();
+            }
+            _ = sigterm_fut.as_mut().fuse() => break "SIGTERM",
+            _ = sigint_fut.as_mut().fuse() => break "SIGINT",
+        }
+    };
+
+    // Shutdown drain.
+    state.shutting_down.set(true);
+    let initial_inflight = state.inflight.get();
+    let drain_start = Instant::now();
+    let drain_deadline = drain_start + Duration::from_secs(5);
+    while state.inflight.get() > 0 && Instant::now() < drain_deadline {
+        compio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let drain_ms = drain_start.elapsed().as_millis() as u64;
+    let remaining = state.inflight.get();
+    let inflight_drained = initial_inflight.saturating_sub(remaining);
+
+    // PROTOCOLS.md step 3: "Close the admin socket and the listen
+    // socket (unlinking them)." — admin first, then listen.
+    let _ = std::fs::remove_file(&cfg.admin.socket_path);
+    let _ = std::fs::remove_file(&cfg.listen.socket);
+
+    info!(
+        evt = "shutdown",
+        signal = signal_name,
+        inflight_drained = inflight_drained,
+        drain_ms = drain_ms,
+    );
+    Ok(())
+}
+
+fn reload_clients(state: &Rc<SharedState>, path: &Path) {
+    let file = match crate::config::load_clients_file(path) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(evt = "config_reload", triggered_by = "sighup", ok = false, error = %e);
+            return;
+        }
+    };
+    let new_table = match build_clients_table(file) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(evt = "config_reload", triggered_by = "sighup", ok = false, error = %e);
+            return;
+        }
+    };
+    let count = new_table.len();
+    *state.clients.borrow_mut() = new_table;
+    info!(
+        evt = "config_reload",
+        triggered_by = "sighup",
+        client_count = count
+    );
 }
 
 fn unlink_stale(path: &Path) -> Result<(), DaemonError> {
@@ -251,9 +376,21 @@ async fn handle_connection(mut stream: UnixStream, req_id: String, state: Rc<Sha
     let mint_result = provider.mint(&request.path).await;
     let provider_ms = started.elapsed().as_millis() as u64;
 
-    let response = match mint_result {
-        Ok(r) => r,
+    let (response, repo_id) = match mint_result {
+        Ok(outcome) => (outcome.response, outcome.repo_id),
         Err(e) => {
+            // RepoNotFound at mint-time = the provider just invalidated
+            // a (possibly cached) repo-id; surface that to the operator
+            // as a distinct event per PROTOCOLS.md.
+            if matches!(e, GithubError::RepoNotFound { .. }) {
+                info!(
+                    req_id = %req_id,
+                    evt = "cache_invalidated",
+                    provider = %request.host,
+                    repo = %request.path,
+                    cause = "404",
+                );
+            }
             log_mint_error(
                 &req_id,
                 &client.name,
@@ -295,6 +432,7 @@ async fn handle_connection(mut stream: UnixStream, req_id: String, state: Rc<Sha
         provider = %request.host,
         client = %client.name,
         repo = %request.path,
+        repo_id = repo_id,
         ttl_sec = ttl_sec,
         expires_at_unix = expires_at_secs,
         provider_ms = provider_ms,
@@ -406,5 +544,61 @@ mod tests {
             clients: vec![],
         };
         assert_eq!(build_clients_table(file).unwrap().len(), 0);
+    }
+
+    fn empty_state() -> Rc<SharedState> {
+        Rc::new(SharedState {
+            clients: RefCell::new(HashMap::new()),
+            providers: HashMap::new(),
+            psk_file_path: PathBuf::new(),
+            clients_file_path: PathBuf::new(),
+            stunnel_pidfile: PathBuf::new(),
+            start_time: SystemTime::now(),
+            inflight: Cell::new(0),
+            shutting_down: Cell::new(false),
+        })
+    }
+
+    #[test]
+    fn drain_guard_increments_and_decrements() {
+        let state = empty_state();
+        assert_eq!(state.inflight.get(), 0);
+        let g1 = DrainGuard::new(state.clone());
+        assert_eq!(state.inflight.get(), 1);
+        let g2 = DrainGuard::new(state.clone());
+        assert_eq!(state.inflight.get(), 2);
+        drop(g1);
+        assert_eq!(state.inflight.get(), 1);
+        drop(g2);
+        assert_eq!(state.inflight.get(), 0);
+    }
+
+    #[test]
+    fn reload_clients_swaps_in_place() {
+        let state = empty_state();
+        // Seed with one entry.
+        state.clients.borrow_mut().insert(
+            "10.0.0.1".parse().unwrap(),
+            ResolvedClient {
+                name: "old".to_string(),
+                providers: HashSet::new(),
+                enrolled_at: "x".to_string(),
+                note: None,
+            },
+        );
+        // Write a new clients.json containing a different IP.
+        let path = std::env::temp_dir().join(format!("gcb-reload-test-{}.json", ulid::Ulid::new()));
+        std::fs::write(
+            &path,
+            r#"{"version":1,"clients":[{"name":"new","ip":"10.0.0.2","providers":["github"],"enrolled_at":"y","note":null}]}"#,
+        )
+        .unwrap();
+        reload_clients(&state, &path);
+        let borrow = state.clients.borrow();
+        assert_eq!(borrow.len(), 1);
+        assert!(borrow.get(&"10.0.0.2".parse().unwrap()).is_some());
+        assert!(borrow.get(&"10.0.0.1".parse().unwrap()).is_none());
+        drop(borrow);
+        let _ = std::fs::remove_file(&path);
     }
 }

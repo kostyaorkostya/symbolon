@@ -107,6 +107,12 @@ pub struct SelfcheckOutcome {
     pub clock_skew_sec: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct MintOutcome {
+    pub response: git_credential::Response,
+    pub repo_id: u64,
+}
+
 impl From<cyper::Error> for GithubError {
     fn from(e: cyper::Error) -> Self {
         GithubError::Http(e)
@@ -192,6 +198,19 @@ impl GitHubProvider {
             500..=599 => return Err(GithubError::ServerError(status)),
             other => return Err(GithubError::UnexpectedStatus(other)),
         }
+        // HTTP `Date` header (IMF-fixdate per RFC 7231 § 7.1.1.1) is
+        // accepted by `time`'s Rfc2822 parser (`GMT` → zero offset).
+        // Silently 0 if the header is missing or unparseable; clock
+        // skew is informational, not a hard failure.
+        let clock_skew_sec = resp
+            .headers()
+            .get("date")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| {
+                OffsetDateTime::parse(s, &time::format_description::well_known::Rfc2822).ok()
+            })
+            .map(|server_t| server_t.unix_timestamp() - OffsetDateTime::now_utc().unix_timestamp())
+            .unwrap_or(0);
         let body = resp.bytes().await?;
         let v: serde_json::Value =
             serde_json::from_slice(&body).map_err(|source| GithubError::JsonParse {
@@ -211,20 +230,15 @@ impl GitHubProvider {
                 reported,
             });
         }
-        // Clock-skew computation from the HTTP `Date` header is a
-        // future improvement — HTTP IMF-fixdate isn't quite RFC 2822,
-        // so it'd need a custom format descriptor. Reporting 0 is
-        // still useful: the operator gets confirmation the App is
-        // reachable and the App ID matches.
         Ok(SelfcheckOutcome {
             app_id: self.app_id,
             installation_id: self.installation_id,
             api_base: self.api_base.clone(),
-            clock_skew_sec: 0,
+            clock_skew_sec,
         })
     }
 
-    pub async fn mint(&self, path: &str) -> Result<git_credential::Response, GithubError> {
+    pub async fn mint(&self, path: &str) -> Result<MintOutcome, GithubError> {
         let (owner, repo) = split_owner_repo(path)?;
         let key = format!(
             "{}/{}",
@@ -243,10 +257,13 @@ impl GitHubProvider {
         };
 
         match self.mint_token(repo_id, path).await {
-            Ok((token, expires_at)) => Ok(git_credential::Response {
-                username: "x-access-token".to_string(),
-                password: token,
-                password_expiry_utc: expires_at,
+            Ok((token, expires_at)) => Ok(MintOutcome {
+                response: git_credential::Response {
+                    username: "x-access-token".to_string(),
+                    password: token,
+                    password_expiry_utc: expires_at,
+                },
+                repo_id,
             }),
             Err(GithubError::RepoNotFound { path: p }) => {
                 // Repo deleted/recreated since the resolve — drop the
@@ -466,6 +483,17 @@ fn parse_rfc3339_to_systemtime(s: &str) -> Result<SystemTime, GithubError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_date_rfc2822_parses_imf_fixdate() {
+        // RFC 7231 § 7.1.1.1 example.
+        let dt = OffsetDateTime::parse(
+            "Sun, 06 Nov 1994 08:49:37 GMT",
+            &time::format_description::well_known::Rfc2822,
+        )
+        .unwrap();
+        assert_eq!(dt.unix_timestamp(), 784_111_777);
+    }
 
     const FIXTURE_PEM: &str = include_str!("../../tests/fixtures/test_app_key.pem");
 

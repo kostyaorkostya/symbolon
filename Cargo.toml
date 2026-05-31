@@ -15,6 +15,7 @@ compio = { version = "0.18.0", features = [
   "time",
 ] }
 cyper = "0.8.3"
+futures-util = "0.3.32"
 jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 rustix = { version = "1.1.4", features = ["process"] }
 serde = { version = "1.0.228", features = ["derive"] }

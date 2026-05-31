@@ -172,8 +172,13 @@ pub async fn run_admin_loop(
 ) -> Result<(), AdminError> {
     loop {
         let (stream, _peer) = listener.accept().await.map_err(AdminError::Accept)?;
+        if state.shutting_down.get() {
+            drop(stream);
+            continue;
+        }
         let state = state.clone();
         compio::runtime::spawn(async move {
+            let _guard = crate::daemon::DrainGuard::new(state.clone());
             let _ =
                 compio::time::timeout(PER_CONNECTION_TIMEOUT, handle_admin(stream, state)).await;
         })
@@ -439,17 +444,19 @@ async fn handle_mint(
         ));
     }
     match provider_obj.mint(path).await {
-        Ok(resp) => {
-            let expires_unix = resp
+        Ok(outcome) => {
+            let expires_unix = outcome
+                .response
                 .password_expiry_utc
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             Ok(serde_json::json!({
                 "ok": true,
-                "username": resp.username,
-                "password": resp.password,
+                "username": outcome.response.username,
+                "password": outcome.response.password,
                 "expires_at_unix": expires_unix,
+                "repo_id": outcome.repo_id,
             }))
         }
         Err(e) => Err(error_response_from_github(&e)),

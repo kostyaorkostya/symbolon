@@ -192,6 +192,43 @@ no normalization, no suffix matching, no default) against the
 `host` values in configured `[provider.X]` sections. Unknown host →
 `evt=mint_denied reason=unknown_host`.
 
+### Admin socket protocol
+
+Line-delimited JSON over Unix-domain stream at
+`admin.socket_path`. One request per connection. The daemon writes
+one response and closes.
+
+**Request:** `{"op":"<status|list|enroll|revoke|mint|selfcheck>",
+…op-specific fields}\n`
+
+**Response on success:** `{"ok":true, …op-specific fields}\n`
+
+**Response on failure:** `{"ok":false, "error":"<message>",
+"code":"<machine-code>"}\n`
+
+Op fields (request → response):
+
+| op | request fields | response fields |
+|---|---|---|
+| `status` | — | `uptime_sec`, `providers`, `client_count` |
+| `list` | — | `clients` (array of `{name, ip, providers, enrolled_at, note}`) |
+| `enroll` | `provider`, `client`, `ip`, `note` (nullable) | `identity`, `psk_hex` (64 hex chars), `client_name` |
+| `revoke` | `provider`, `client` | — |
+| `mint` | `provider`, `client`, `path` | `username`, `password`, `expires_at_unix`, `repo_id` |
+| `selfcheck` | `provider` | `app_id`, `installation_id`, `api_base`, `clock_skew_sec` |
+
+Error codes:
+`bad_request | unknown_provider | unknown_client |
+client_already_enrolled | client_ip_collision | malformed_request |
+internal | repo_not_accessible | provider_4xx`.
+
+The daemon serialises admin requests, so file writes to
+`clients.json` / `gcb.psk` do not race the listen-side accept loop
+(AGENTS.md invariant #10).
+
+CR or embedded LF inside any string field is rejected (same
+Clone2Leak-class defence applied to the admin path).
+
 ### GitHub provider outbound
 
 References: [REST API for App installations][gh-installs],
@@ -307,3 +344,9 @@ line.
 
 `reason` values for `mint_denied`:
 `client_unknown | unknown_host | repo_not_accessible | provider_4xx | malformed_request`.
+
+`endpoint` and `body_snippet` on `provider_error` are deferred
+pending a redaction layer to avoid leaking sensitive data (provider
+5xx responses can carry tokens). `cause = ttl_expired` on
+`cache_invalidated` is also deferred — only `cause = "404"` fires
+today.

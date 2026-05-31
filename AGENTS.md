@@ -118,15 +118,23 @@ Pinned in `Cargo.toml`:
   crate panics at sign-time. `rust_crypto` over `aws_lc_rs` keeps
   the musl build pure-Rust with no C FFI.)
 - `serde`, `serde_json`, `toml` (config + provider responses)
-- `time` with `default-features = false, features = ["parsing"]`
-  (RFC3339 → `SystemTime` for GitHub's `expires_at`; future
-  calendar-aware needs). Defaults disabled to strip formatting/
-  macros/etc. surface we don't use.
-- `tracing`, `tracing-subscriber` (JSON logging)
+- `time` with `default-features = false, features = ["parsing",
+  "formatting"]` (RFC3339 → `SystemTime` for GitHub's `expires_at`,
+  RFC2822 for the HTTP `Date` header in selfcheck, and RFC3339
+  rendering of `enrolled_at` on enroll plus the `ts` field in JSON
+  log lines). Defaults disabled to strip the surface we don't use.
+- `tracing`, `tracing-subscriber` (JSON logging; custom
+  `FormatEvent` in `src/main.rs` renames `timestamp`/`level` to
+  `ts`/`lvl` per PROTOCOLS.md).
+- `futures-util` (`select!` and `FutureExt::fuse()` for the
+  accept-vs-signal race in `daemon::run`; compio's own examples
+  pull it in the same way — see compio-0.18 `examples/tick.rs`).
 - `ulid` (request IDs)
 - `thiserror` (errors)
 - `rustix` with feature `process` (signal delivery to stunnel via
-  `kill(2)` after enroll/revoke rewrites `gcb.psk`)
+  `kill(2)` after enroll/revoke rewrites `gcb.psk`; also used for
+  the `Signal::HUP`/`Signal::INT`/`Signal::TERM` raw values handed
+  to `compio_signal::unix::signal`)
 
 Do not add, remove, or swap crates without asking. Versions are locked
 via `Cargo.lock`. `rust-toolchain.toml` pins the compiler.
@@ -201,7 +209,7 @@ src/
   proxy_protocol.rs    # PROXY v2 parsing
   daemon.rs            # accept loop, per-connection handler, signal handling
   admin.rs             # Unix socket + CLI dispatch
-  errors.rs            # crate-wide error composition
+  errors.rs            # crate-wide error composition (stub; deferred)
   providers/
     mod.rs             # Provider abstraction (lightweight)
     github.rs          # GitHub: JWT, repo-ID resolve, mint
@@ -221,9 +229,19 @@ Known omissions, not oversights:
 - **Webhook handling.** No live notification when the App's
   permissions change provider-side; `gcb github selfcheck` is the
   on-demand check.
-- **CLI without daemon.** Operator commands require a running
-  daemon. No emergency offline state mutation.
+- **Emergency offline state mutation.** Operator commands talk to
+  the admin socket of a running daemon. No CLI path that mutates
+  `clients.json` or `gcb.psk` directly.
 - **App-key hot reload.** Restart the daemon to pick up a new key.
+- **`provider_error` `endpoint` / `body_snippet` fields.**
+  PROTOCOLS.md lists them in the logging schema; the daemon does
+  not emit them yet. Adding `body_snippet` requires a redaction
+  layer (provider responses can carry tokens on 5xx); doing this
+  safely is its own task.
+- **TTL-driven `evt=cache_invalidated`.** Only 404-driven
+  invalidation fires the event today. TTL expiry is silently
+  re-resolved; the provider doesn't currently surface "I just
+  dropped an expired entry" to the daemon.
 - **Multiple instances of the same provider** (e.g. github.com +
   github.example.com on one broker). Section name `[provider.X]` is
   also the dispatch key; introduce a `kind` field if/when needed.

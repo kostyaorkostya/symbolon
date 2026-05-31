@@ -112,6 +112,7 @@ file = "/etc/gcb/clients.json"
 
 [stunnel]
 psk_file = "/etc/stunnel/gcb.psk"
+pidfile  = "/run/stunnel/stunnel.pid"   # must match `pid = …` in step 3.7
 
 [logging]
 level = "info"
@@ -176,6 +177,10 @@ rc-service stunnel start
 ```
 
 (systemd: `systemctl enable --now stunnel.service`.)
+
+The path in `pid = …` must match `[stunnel] pidfile` in
+`/etc/gcb/config.toml` — the daemon reads it to send `SIGHUP` after
+`gcb github enroll`/`revoke` rewrites `gcb.psk`.
 
 ### 3.8 Lock down with nftables
 

@@ -108,6 +108,10 @@ accessible to the App.
 
 Pinned in `Cargo.toml`:
 
+- `argh` (derive-based argv parser used by `src/main.rs`. Picked over
+  `clap` for code-size and over hand-rolled parsing for maintainability.
+  Daemon mode is preserved on bare `gcb` by synthesising a hidden
+  `daemon` subcommand in `main`; everything else is regular argh.)
 - `compio` with features `runtime,macros,net,fs,signal,time,io-uring`
   (async runtime; `macros` for `#[compio::main]`; `net`+`fs`+`signal`+
   `time` for the daemon surface; `io-uring` listed explicitly so a

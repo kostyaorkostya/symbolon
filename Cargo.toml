@@ -5,6 +5,7 @@ edition = "2021"
 license = "Apache-2.0"
 
 [dependencies]
+argh = "0.1.19"
 compio = { version = "0.18.0", features = [
   "fs",
   "io-uring",

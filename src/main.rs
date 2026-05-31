@@ -6,6 +6,7 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use argh::FromArgs;
 use tracing::Level;
 use tracing_subscriber::filter::{filter_fn, LevelFilter};
 use tracing_subscriber::fmt;
@@ -20,28 +21,60 @@ const DEFAULT_CONFIG_PATH: &str = "/etc/gcb/config.toml";
 
 #[compio::main]
 async fn main() -> ExitCode {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    let parsed = match parse_argv(&argv) {
-        Ok(p) => p,
-        Err(msg) => {
-            eprintln!("gcb: {msg}");
-            eprintln!("usage: gcb [--config <path>] [<subcommand> ...]");
-            eprintln!(
-                "subcommands: status | list | github enroll <client> --ip <ip> [--note <text>]"
-            );
-            eprintln!("             github revoke <client> | github mint <client> <owner/repo>");
-            eprintln!("             github selfcheck");
-            return ExitCode::from(2);
-        }
+    let argv: Vec<String> = std::env::args().collect();
+    let cmd_name = argv.first().map(String::as_str).unwrap_or("gcb");
+    let mut rest: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
+    // argh requires a subcommand; preserve the documented bare-`gcb`
+    // daemon contract by synthesising `daemon` when only --config (or
+    // nothing) is present. Anything else falls through to argh so it
+    // can error on unknown flags/subcommands as usual.
+    if no_subcommand_present(&rest) {
+        rest.push("daemon");
+    }
+    let args = match Args::from_args(&[cmd_name], &rest) {
+        Ok(a) => a,
+        Err(early) => match early.status {
+            Ok(()) => {
+                print!("{}", early.output);
+                return ExitCode::SUCCESS;
+            }
+            Err(()) => {
+                eprint!("{}", early.output);
+                return ExitCode::from(2);
+            }
+        },
     };
 
-    match parsed {
-        Invocation::Daemon { config_path } => run_daemon(config_path).await,
-        Invocation::Cli {
-            config_path,
-            command,
-        } => run_cli(config_path, command).await,
+    let config_path = args
+        .config
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
+
+    match args.cmd {
+        Subcommand::Daemon(_) => run_daemon(config_path).await,
+        Subcommand::Status(_) => run_cli(config_path, CliCommand::Status).await,
+        Subcommand::List(_) => run_cli(config_path, CliCommand::List).await,
+        Subcommand::Github(g) => run_cli(config_path, github_to_cli(g)).await,
     }
+}
+
+fn no_subcommand_present(args: &[&str]) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "--config" {
+            // Skip the flag + its value; if missing, let argh produce
+            // the error rather than silently injecting `daemon`.
+            if i + 1 >= args.len() {
+                return false;
+            }
+            i += 2;
+        } else if a.starts_with("--config=") {
+            i += 1;
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 async fn run_daemon(config_path: PathBuf) -> ExitCode {
@@ -78,140 +111,109 @@ async fn run_cli(config_path: PathBuf, command: CliCommand) -> ExitCode {
     }
 }
 
-enum Invocation {
-    Daemon {
-        config_path: PathBuf,
-    },
-    Cli {
-        config_path: PathBuf,
-        command: CliCommand,
-    },
+/// gcb — git credentials broker. With no subcommand, runs as a daemon.
+#[derive(FromArgs)]
+struct Args {
+    /// path to config.toml (default /etc/gcb/config.toml)
+    #[argh(option)]
+    config: Option<PathBuf>,
+
+    #[argh(subcommand)]
+    cmd: Subcommand,
 }
 
-fn parse_argv(argv: &[String]) -> Result<Invocation, String> {
-    let mut config_path: Option<PathBuf> = None;
-    let mut positional: Vec<String> = Vec::new();
-    let mut i = 0;
-    // First-pass: extract `--config` (which is a daemon/CLI common flag);
-    // collect everything else positionally for the subcommand parser.
-    while i < argv.len() {
-        let arg = &argv[i];
-        if let Some(rest) = arg.strip_prefix("--config=") {
-            config_path = Some(PathBuf::from(rest));
-            i += 1;
-        } else if arg == "--config" {
-            let next = argv
-                .get(i + 1)
-                .ok_or_else(|| "--config requires a path argument".to_string())?;
-            config_path = Some(PathBuf::from(next));
-            i += 2;
-        } else {
-            positional.push(arg.clone());
-            i += 1;
-        }
-    }
-    let config_path = config_path.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
-
-    if positional.is_empty() {
-        return Ok(Invocation::Daemon { config_path });
-    }
-
-    let command = parse_subcommand(&positional)?;
-    Ok(Invocation::Cli {
-        config_path,
-        command,
-    })
+#[derive(FromArgs)]
+#[argh(subcommand)]
+enum Subcommand {
+    Daemon(DaemonArgs),
+    Status(StatusArgs),
+    List(ListArgs),
+    Github(GithubArgs),
 }
 
-fn parse_subcommand(positional: &[String]) -> Result<CliCommand, String> {
-    let head = positional[0].as_str();
-    let rest = &positional[1..];
-    match head {
-        "status" => {
-            if !rest.is_empty() {
-                return Err("`status` takes no arguments".to_string());
-            }
-            Ok(CliCommand::Status)
-        }
-        "list" => {
-            if !rest.is_empty() {
-                return Err("`list` takes no arguments".to_string());
-            }
-            Ok(CliCommand::List)
-        }
-        "github" => parse_github_subcommand(rest),
-        other => Err(format!("unknown subcommand: {other}")),
-    }
+/// run as the broker daemon (default when no subcommand is given)
+#[derive(FromArgs)]
+#[argh(subcommand, name = "daemon")]
+struct DaemonArgs {}
+
+/// show daemon status
+#[derive(FromArgs)]
+#[argh(subcommand, name = "status")]
+struct StatusArgs {}
+
+/// list enrolled clients
+#[derive(FromArgs)]
+#[argh(subcommand, name = "list")]
+struct ListArgs {}
+
+/// GitHub provider commands
+#[derive(FromArgs)]
+#[argh(subcommand, name = "github")]
+struct GithubArgs {
+    #[argh(subcommand)]
+    cmd: GithubSub,
 }
 
-fn parse_github_subcommand(rest: &[String]) -> Result<CliCommand, String> {
-    let head = rest
-        .first()
-        .ok_or("`github` requires a subcommand")?
-        .as_str();
-    let rest = &rest[1..];
-    match head {
-        "enroll" => parse_github_enroll(rest),
-        "revoke" => {
-            if rest.len() != 1 {
-                return Err("`github revoke` requires <client>".to_string());
-            }
-            Ok(CliCommand::GithubRevoke {
-                client: rest[0].clone(),
-            })
-        }
-        "mint" => {
-            if rest.len() != 2 {
-                return Err("`github mint` requires <client> <owner/repo>".to_string());
-            }
-            Ok(CliCommand::GithubMint {
-                client: rest[0].clone(),
-                path: rest[1].clone(),
-            })
-        }
-        "selfcheck" => {
-            if !rest.is_empty() {
-                return Err("`github selfcheck` takes no arguments".to_string());
-            }
-            Ok(CliCommand::GithubSelfcheck)
-        }
-        other => Err(format!("unknown github subcommand: {other}")),
-    }
+#[derive(FromArgs)]
+#[argh(subcommand)]
+enum GithubSub {
+    Enroll(EnrollArgs),
+    Revoke(RevokeArgs),
+    Mint(MintArgs),
+    Selfcheck(SelfcheckArgs),
 }
 
-fn parse_github_enroll(rest: &[String]) -> Result<CliCommand, String> {
-    let client = rest
-        .first()
-        .ok_or("`github enroll` requires <client>")?
-        .clone();
-    if client.starts_with("--") {
-        return Err("missing <client> before flags".to_string());
+/// enroll a client by source IP
+#[derive(FromArgs)]
+#[argh(subcommand, name = "enroll")]
+struct EnrollArgs {
+    #[argh(positional)]
+    client: String,
+    /// source IP address (attested upstream)
+    #[argh(option)]
+    ip: IpAddr,
+    /// free-form note
+    #[argh(option)]
+    note: Option<String>,
+}
+
+/// revoke an enrolled client
+#[derive(FromArgs)]
+#[argh(subcommand, name = "revoke")]
+struct RevokeArgs {
+    #[argh(positional)]
+    client: String,
+}
+
+/// mint a token for <client> <owner/repo>
+#[derive(FromArgs)]
+#[argh(subcommand, name = "mint")]
+struct MintArgs {
+    #[argh(positional)]
+    client: String,
+    #[argh(positional)]
+    repo: String,
+}
+
+/// run provider self-check
+#[derive(FromArgs)]
+#[argh(subcommand, name = "selfcheck")]
+struct SelfcheckArgs {}
+
+fn github_to_cli(g: GithubArgs) -> CliCommand {
+    match g.cmd {
+        GithubSub::Enroll(a) => CliCommand::GithubEnroll {
+            client: a.client,
+            ip: a.ip,
+            note: a.note,
+        },
+        GithubSub::Revoke(a) => CliCommand::GithubRevoke { client: a.client },
+        GithubSub::Mint(a) => CliCommand::GithubMint {
+            client: a.client,
+            path: a.repo,
+        },
+        GithubSub::Selfcheck(_) => CliCommand::GithubSelfcheck,
     }
-    let mut ip: Option<IpAddr> = None;
-    let mut note: Option<String> = None;
-    let mut i = 1;
-    while i < rest.len() {
-        let arg = &rest[i];
-        if arg == "--ip" {
-            let val = rest.get(i + 1).ok_or("--ip requires a value")?;
-            ip = Some(val.parse().map_err(|_| format!("invalid IP: {val}"))?);
-            i += 2;
-        } else if let Some(val) = arg.strip_prefix("--ip=") {
-            ip = Some(val.parse().map_err(|_| format!("invalid IP: {val}"))?);
-            i += 1;
-        } else if arg == "--note" {
-            let val = rest.get(i + 1).ok_or("--note requires a value")?;
-            note = Some(val.clone());
-            i += 2;
-        } else if let Some(val) = arg.strip_prefix("--note=") {
-            note = Some(val.to_string());
-            i += 1;
-        } else {
-            return Err(format!("unexpected argument to enroll: {arg}"));
-        }
-    }
-    let ip = ip.ok_or("`github enroll` requires --ip <ip>")?;
-    Ok(CliCommand::GithubEnroll { client, ip, note })
 }
 
 fn setup_tracing(level: LogLevel) {

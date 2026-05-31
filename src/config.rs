@@ -54,6 +54,10 @@ pub struct StunnelConfig {
     /// Path to stunnel's PSK secrets file. The daemon rewrites this
     /// via the admin socket on enroll/revoke and then SIGHUPs stunnel.
     pub psk_file: PathBuf,
+    /// stunnel's pidfile (stunnel writes it via its own `pid = …`
+    /// config). The daemon reads this to send SIGHUP after
+    /// enroll/revoke rewrites `psk_file`.
+    pub pidfile: PathBuf,
 }
 
 /// `[logging]` section.
@@ -208,6 +212,7 @@ file = "/etc/gcb/clients.json"
 
 [stunnel]
 psk_file = "/etc/stunnel/gcb.psk"
+pidfile = "/run/stunnel/stunnel.pid"
 
 [logging]
 level = "info"
@@ -227,6 +232,10 @@ private_key_path = "/etc/gcb/github-app.pem"
         assert_eq!(cfg.admin.socket_path, PathBuf::from("/run/gcb/admin.sock"));
         assert_eq!(cfg.clients.file, PathBuf::from("/etc/gcb/clients.json"));
         assert_eq!(cfg.stunnel.psk_file, PathBuf::from("/etc/stunnel/gcb.psk"));
+        assert_eq!(
+            cfg.stunnel.pidfile,
+            PathBuf::from("/run/stunnel/stunnel.pid")
+        );
         assert_eq!(cfg.logging.level, LogLevel::Info);
         let gh = cfg.provider.github.expect("github provider present");
         assert_eq!(gh.host, "github.com");

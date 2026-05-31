@@ -17,9 +17,10 @@
 //! drain, and `clients.json` hot reload are deferred to the
 //! follow-up session that also wires `admin.rs`.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -62,63 +63,104 @@ pub enum DaemonError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ResolvedClient {
-    name: String,
-    #[allow(dead_code)] // reserved for per-provider allowlist; see invariant #3
-    providers: HashSet<String>,
+pub struct ResolvedClient {
+    pub name: String,
+    pub providers: HashSet<String>,
+    pub enrolled_at: String,
+    pub note: Option<String>,
+}
+
+/// Shared between the listen-side accept loop and the admin-side
+/// accept loop. `clients` is mutable so admin enroll/revoke can
+/// update it in place; `providers` is fixed at startup.
+pub struct SharedState {
+    pub clients: RefCell<HashMap<IpAddr, ResolvedClient>>,
+    pub providers: HashMap<String, GitHubProvider>,
+    pub psk_file_path: PathBuf,
+    pub clients_file_path: PathBuf,
+    pub stunnel_pidfile: PathBuf,
+    pub start_time: SystemTime,
 }
 
 pub async fn run(cfg: &Config) -> Result<(), DaemonError> {
     let clients_file = crate::config::load_clients_file(&cfg.clients.file)?;
-    let clients = Rc::new(build_clients_table(clients_file)?);
+    let clients_table = build_clients_table(clients_file)?;
 
     let mut providers: HashMap<String, GitHubProvider> = HashMap::new();
     if let Some(gh) = &cfg.provider.github {
         let provider = GitHubProvider::new(gh)?;
         providers.insert(gh.host.clone(), provider);
     }
-    let providers = Rc::new(providers);
 
-    let socket_path = &cfg.listen.socket;
-    match std::fs::remove_file(socket_path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(source) => {
-            return Err(DaemonError::Unlink {
-                path: socket_path.clone(),
-                source,
-            });
-        }
-    }
-    let listener = UnixListener::bind(socket_path)
+    let state = Rc::new(SharedState {
+        clients: RefCell::new(clients_table),
+        providers,
+        psk_file_path: cfg.stunnel.psk_file.clone(),
+        clients_file_path: cfg.clients.file.clone(),
+        stunnel_pidfile: cfg.stunnel.pidfile.clone(),
+        start_time: SystemTime::now(),
+    });
+
+    let listen_path = &cfg.listen.socket;
+    unlink_stale(listen_path)?;
+    let listener = UnixListener::bind(listen_path)
         .await
         .map_err(|source| DaemonError::Bind {
-            path: socket_path.clone(),
+            path: listen_path.clone(),
             source,
         })?;
 
-    let provider_names: Vec<&str> = providers.keys().map(String::as_str).collect();
+    let admin_path = &cfg.admin.socket_path;
+    unlink_stale(admin_path)?;
+    let admin_listener =
+        UnixListener::bind(admin_path)
+            .await
+            .map_err(|source| DaemonError::Bind {
+                path: admin_path.clone(),
+                source,
+            })?;
+
+    let provider_names: Vec<&str> = state.providers.keys().map(String::as_str).collect();
     info!(
         evt = "startup",
         version = env!("CARGO_PKG_VERSION"),
-        listen_socket = %socket_path.display(),
+        listen_socket = %listen_path.display(),
+        admin_socket = %admin_path.display(),
         providers = ?provider_names,
         "daemon started"
     );
 
+    let admin_state = state.clone();
+    compio::runtime::spawn(async move {
+        if let Err(e) = crate::admin::run_admin_loop(admin_listener, admin_state).await {
+            tracing::error!(error = %e, "admin loop exited");
+        }
+    })
+    .detach();
+
     loop {
         let (stream, _peer) = listener.accept().await.map_err(DaemonError::Accept)?;
         let req_id = ulid::Ulid::new().to_string();
-        let providers = providers.clone();
-        let clients = clients.clone();
+        let state = state.clone();
         compio::runtime::spawn(async move {
             let _ = compio::time::timeout(
                 PER_CONNECTION_TIMEOUT,
-                handle_connection(stream, req_id, providers, clients),
+                handle_connection(stream, req_id, state),
             )
             .await;
         })
         .detach();
+    }
+}
+
+fn unlink_stale(path: &Path) -> Result<(), DaemonError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(DaemonError::Unlink {
+            path: path.to_path_buf(),
+            source,
+        }),
     }
 }
 
@@ -129,6 +171,8 @@ fn build_clients_table(file: ClientsFile) -> Result<HashMap<IpAddr, ResolvedClie
         let value = ResolvedClient {
             name: entry.name,
             providers: entry.providers.into_iter().collect(),
+            enrolled_at: entry.enrolled_at,
+            note: entry.note,
         };
         if table.insert(key, value).is_some() {
             return Err(DaemonError::DuplicateClientIp(key));
@@ -137,12 +181,7 @@ fn build_clients_table(file: ClientsFile) -> Result<HashMap<IpAddr, ResolvedClie
     Ok(table)
 }
 
-async fn handle_connection(
-    mut stream: UnixStream,
-    req_id: String,
-    providers: Rc<HashMap<String, GitHubProvider>>,
-    clients: Rc<HashMap<IpAddr, ResolvedClient>>,
-) {
+async fn handle_connection(mut stream: UnixStream, req_id: String, state: Rc<SharedState>) {
     // ------ Phase 1: PROXY v2 header ------
     let mut buf: Vec<u8> = Vec::with_capacity(MAX_REQUEST_BYTES);
     let parsed = loop {
@@ -166,8 +205,8 @@ async fn handle_connection(
     };
 
     // ------ Phase 2: IP → client lookup ------
-    let client = match clients.get(&parsed.source_ip) {
-        Some(c) => c.clone(),
+    let client = match state.clients.borrow().get(&parsed.source_ip).cloned() {
+        Some(c) => c,
         None => {
             warn!(req_id = %req_id, evt = "mint_denied", reason = "client_unknown", src_ip = %parsed.source_ip);
             return;
@@ -199,7 +238,7 @@ async fn handle_connection(
     };
 
     // ------ Phase 4: host dispatch ------
-    let provider = match providers.get(&request.host) {
+    let provider = match state.providers.get(&request.host) {
         Some(p) => p,
         None => {
             warn!(req_id = %req_id, evt = "mint_denied", reason = "unknown_host", host = %request.host, client = %client.name);

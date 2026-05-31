@@ -22,6 +22,7 @@ file = "/etc/gcb/clients.json"
 
 [stunnel]
 psk_file = "/etc/stunnel/gcb.psk"
+pidfile = "/run/stunnel/stunnel.pid"
 
 [logging]
 level = "info"   # trace | debug | info | warn | error

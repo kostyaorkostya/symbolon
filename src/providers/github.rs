@@ -95,6 +95,16 @@ pub enum GithubError {
     ServerError(u16),
     #[error("unexpected provider status: {0}")]
     UnexpectedStatus(u16),
+    #[error("App ID mismatch: configured {configured}, GitHub reports {reported}")]
+    AppIdMismatch { configured: u64, reported: u64 },
+}
+
+#[derive(Debug, Clone)]
+pub struct SelfcheckOutcome {
+    pub app_id: u64,
+    pub installation_id: u64,
+    pub api_base: String,
+    pub clock_skew_sec: i64,
 }
 
 impl From<cyper::Error> for GithubError {
@@ -145,6 +155,73 @@ impl GitHubProvider {
 
     pub fn host(&self) -> &str {
         &self.host
+    }
+
+    pub fn app_id(&self) -> u64 {
+        self.app_id
+    }
+
+    pub fn installation_id(&self) -> u64 {
+        self.installation_id
+    }
+
+    pub fn api_base(&self) -> &str {
+        &self.api_base
+    }
+
+    /// Verify the App private key signs a valid JWT and the App is
+    /// reachable at `api_base`. The reported App ID must match the
+    /// configured one — a mismatch indicates a wrong key/App pairing.
+    pub async fn selfcheck(&self) -> Result<SelfcheckOutcome, GithubError> {
+        let jwt = self.sign_jwt_now()?;
+        let url = format!("{}/app", self.api_base);
+        let resp = self
+            .client
+            .get(&url)?
+            .bearer_auth(&jwt)?
+            .header("Accept", ACCEPT_HEADER)?
+            .header("X-GitHub-Api-Version", GITHUB_API_VERSION)?
+            .header("User-Agent", &self.user_agent)?
+            .send()
+            .await?;
+        let status = resp.status().as_u16();
+        match status {
+            200 => {}
+            401 => return Err(GithubError::Unauthorized),
+            403 => return Err(GithubError::Forbidden),
+            500..=599 => return Err(GithubError::ServerError(status)),
+            other => return Err(GithubError::UnexpectedStatus(other)),
+        }
+        let body = resp.bytes().await?;
+        let v: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|source| GithubError::JsonParse {
+                context: "selfcheck",
+                source,
+            })?;
+        let reported = v
+            .get("id")
+            .and_then(|i| i.as_u64())
+            .ok_or(GithubError::MissingField {
+                context: "selfcheck",
+                field: "id",
+            })?;
+        if reported != self.app_id {
+            return Err(GithubError::AppIdMismatch {
+                configured: self.app_id,
+                reported,
+            });
+        }
+        // Clock-skew computation from the HTTP `Date` header is a
+        // future improvement — HTTP IMF-fixdate isn't quite RFC 2822,
+        // so it'd need a custom format descriptor. Reporting 0 is
+        // still useful: the operator gets confirmation the App is
+        // reachable and the App ID matches.
+        Ok(SelfcheckOutcome {
+            app_id: self.app_id,
+            installation_id: self.installation_id,
+            api_base: self.api_base.clone(),
+            clock_skew_sec: 0,
+        })
     }
 
     pub async fn mint(&self, path: &str) -> Result<git_credential::Response, GithubError> {

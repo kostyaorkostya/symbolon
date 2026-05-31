@@ -126,10 +126,10 @@ pub(crate) struct ClientEntry {
     pub(crate) name: String,
     pub(crate) ip: IpAddr,
     pub(crate) providers: Vec<String>,
-    /// RFC 3339 UTC timestamp. Kept as a `String` because adding a
-    /// date crate (`time`, `chrono`) would be a new direct dependency
-    /// AGENTS.md prohibits without prior approval. Consumers parse on
-    /// use; the daemon is the sole writer and writes a known format.
+    /// RFC 3339 UTC timestamp. Kept as a `String`; consumers parse
+    /// on use via `time::OffsetDateTime` if/when they need a typed
+    /// value. The daemon is the sole writer and writes a known
+    /// format. Retyping this field is a separate task.
     pub(crate) enrolled_at: String,
     pub(crate) note: Option<String>,
 }

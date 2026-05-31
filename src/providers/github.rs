@@ -22,6 +22,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::Serialize;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 use crate::config::ProviderGithub;
 use crate::git_credential;
@@ -346,7 +348,7 @@ fn parse_mint_response(bytes: &[u8]) -> Result<(String, SystemTime), GithubError
                 context: "mint",
                 field: "expires_at",
             })?;
-    let expires_at = parse_rfc3339_z(expires_at_str)?;
+    let expires_at = parse_rfc3339_to_systemtime(expires_at_str)?;
     Ok((token, expires_at))
 }
 
@@ -377,78 +379,16 @@ fn split_owner_repo(path: &str) -> Result<(&str, &str), GithubError> {
     Ok((owner, repo))
 }
 
-fn parse_rfc3339_z(s: &str) -> Result<SystemTime, GithubError> {
-    let bad = || GithubError::BadExpiresAt(s.to_string());
-    let bytes = s.as_bytes();
-    if bytes.len() != 20 {
-        return Err(bad());
-    }
-    if bytes[4] != b'-'
-        || bytes[7] != b'-'
-        || bytes[10] != b'T'
-        || bytes[13] != b':'
-        || bytes[16] != b':'
-        || bytes[19] != b'Z'
-    {
-        return Err(bad());
-    }
-    let parse_int = |range: std::ops::Range<usize>| -> Result<u32, GithubError> {
-        let slice = &bytes[range];
-        if !slice.iter().all(u8::is_ascii_digit) {
-            return Err(bad());
-        }
-        std::str::from_utf8(slice)
-            .map_err(|_| bad())?
-            .parse()
-            .map_err(|_| bad())
-    };
-    let year = parse_int(0..4)?;
-    let month = parse_int(5..7)?;
-    let day = parse_int(8..10)?;
-    let hour = parse_int(11..13)?;
-    let minute = parse_int(14..16)?;
-    let second = parse_int(17..19)?;
-
-    if year < 1970 || !(1..=12).contains(&month) {
-        return Err(bad());
-    }
-    if !(1..=days_in_month(year, month)).contains(&day) {
-        return Err(bad());
-    }
-    if hour > 23 || minute > 59 || second > 59 {
-        return Err(bad());
-    }
-
-    let days = days_from_civil(year as i64, month as i64, day as i64);
-    let secs = days * 86_400 + (hour as i64) * 3600 + (minute as i64) * 60 + second as i64;
+fn parse_rfc3339_to_systemtime(s: &str) -> Result<SystemTime, GithubError> {
+    let dt =
+        OffsetDateTime::parse(s, &Rfc3339).map_err(|_| GithubError::BadExpiresAt(s.to_string()))?;
+    let secs = dt.unix_timestamp();
+    // SystemTime + Duration::from_secs takes u64; a negative
+    // unix-timestamp (pre-1970) would underflow on the cast below.
     if secs < 0 {
-        return Err(bad());
+        return Err(GithubError::BadExpiresAt(s.to_string()));
     }
     Ok(UNIX_EPOCH + Duration::from_secs(secs as u64))
-}
-
-fn days_in_month(year: u32, month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if is_leap_year(year) => 29,
-        2 => 28,
-        _ => 0,
-    }
-}
-
-fn is_leap_year(year: u32) -> bool {
-    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
-}
-
-// Howard Hinnant's days-from-civil: days between 1970-01-01 and y-m-d.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y / 400 } else { (y - 399) / 400 };
-    let yoe = y - era * 400;
-    let doy = (153 * if m > 2 { m - 3 } else { m + 9 } + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
 }
 
 #[cfg(test)]
@@ -492,7 +432,16 @@ mod tests {
         let body = br#"{"token":"ghs_x","expires_at":"2026-05-31T13:00:00Z","extra":"ignored"}"#;
         let (tok, exp) = parse_mint_response(body).unwrap();
         assert_eq!(tok, "ghs_x");
-        assert_eq!(exp, parse_rfc3339_z("2026-05-31T13:00:00Z").unwrap());
+        // 2026-05-31T13:00:00Z = 1780232400.
+        let secs = exp.duration_since(UNIX_EPOCH).unwrap().as_secs();
+        assert_eq!(secs, 1_780_232_400);
+    }
+
+    #[test]
+    fn parse_mint_response_bad_expires_at() {
+        let body = br#"{"token":"ghs_x","expires_at":"not-a-date"}"#;
+        let err = parse_mint_response(body).unwrap_err();
+        assert!(matches!(err, GithubError::BadExpiresAt(_)));
     }
 
     #[test]
@@ -538,49 +487,6 @@ mod tests {
                 field: "id"
             }
         ));
-    }
-
-    #[test]
-    fn parse_rfc3339_known() {
-        let exp = parse_rfc3339_z("2026-05-31T12:34:56Z").unwrap();
-        let secs = exp.duration_since(UNIX_EPOCH).unwrap().as_secs();
-        // 2026-05-31 12:34:56 UTC = 1780230896 (verified via `date -u`).
-        assert_eq!(secs, 1_780_230_896);
-    }
-
-    #[test]
-    fn parse_rfc3339_epoch() {
-        assert_eq!(parse_rfc3339_z("1970-01-01T00:00:00Z").unwrap(), UNIX_EPOCH);
-    }
-
-    #[test]
-    fn parse_rfc3339_rejects_offset() {
-        assert!(parse_rfc3339_z("2026-05-31T12:34:56+01:00").is_err());
-    }
-
-    #[test]
-    fn parse_rfc3339_rejects_subseconds() {
-        assert!(parse_rfc3339_z("2026-05-31T12:34:56.123Z").is_err());
-    }
-
-    #[test]
-    fn parse_rfc3339_rejects_invalid_month() {
-        assert!(parse_rfc3339_z("2026-13-01T00:00:00Z").is_err());
-    }
-
-    #[test]
-    fn parse_rfc3339_rejects_feb_30() {
-        assert!(parse_rfc3339_z("2026-02-30T00:00:00Z").is_err());
-    }
-
-    #[test]
-    fn parse_rfc3339_accepts_leap_day_in_leap_year() {
-        assert!(parse_rfc3339_z("2024-02-29T00:00:00Z").is_ok());
-    }
-
-    #[test]
-    fn parse_rfc3339_rejects_leap_day_in_non_leap_year() {
-        assert!(parse_rfc3339_z("2023-02-29T00:00:00Z").is_err());
     }
 
     #[test]

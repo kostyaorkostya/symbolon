@@ -113,8 +113,15 @@ Pinned in `Cargo.toml`:
   `time` for the daemon surface; `io-uring` listed explicitly so a
   future change to compio's default features can't silently disable it)
 - `cyper` (HTTPS client for provider APIs)
-- `jsonwebtoken` (App JWT)
+- `jsonwebtoken` with feature `rust_crypto` (App JWT; `rust_crypto`
+  is mandatory in 10.x — without a crypto-provider feature the
+  crate panics at sign-time. `rust_crypto` over `aws_lc_rs` keeps
+  the musl build pure-Rust with no C FFI.)
 - `serde`, `serde_json`, `toml` (config + provider responses)
+- `time` with `default-features = false, features = ["parsing"]`
+  (RFC3339 → `SystemTime` for GitHub's `expires_at`; future
+  calendar-aware needs). Defaults disabled to strip formatting/
+  macros/etc. surface we don't use.
 - `tracing`, `tracing-subscriber` (JSON logging)
 - `ulid` (request IDs)
 - `thiserror` (errors)

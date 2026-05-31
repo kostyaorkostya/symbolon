@@ -284,3 +284,221 @@ async fn mint_invalidates_on_404() {
     provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
     // Drop of `server` at end of test verifies all `.expect(N)` counts.
 }
+
+// =====================================================================
+// Daemon end-to-end tests
+// =====================================================================
+
+mod daemon_e2e {
+    use super::*;
+
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+    use compio::net::UnixStream;
+    use compio::BufResult;
+    use gcb::config::{
+        AdminConfig, ClientsConfig, Config, ListenConfig, LogLevel, LoggingConfig, Providers,
+        StunnelConfig,
+    };
+
+    const PROXY_V2_SIGNATURE: [u8; 12] = [
+        0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+    ];
+    const CLIENT_IP: &str = "192.168.122.10";
+
+    fn unique_id() -> u64 {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn unique_paths() -> (PathBuf, PathBuf) {
+        let id = unique_id();
+        let pid = std::process::id();
+        let socket = std::env::temp_dir().join(format!("gcb-test-{pid}-{id}.sock"));
+        let clients = std::env::temp_dir().join(format!("gcb-test-{pid}-{id}-clients.json"));
+        (socket, clients)
+    }
+
+    fn write_clients_json(path: &Path, entries: &[(&str, &str)]) {
+        let entries_json: Vec<String> = entries
+            .iter()
+            .map(|(name, ip)| {
+                format!(
+                    r#"{{"name":"{name}","ip":"{ip}","providers":["github"],"enrolled_at":"2026-05-31T00:00:00Z","note":null}}"#
+                )
+            })
+            .collect();
+        let body = format!(r#"{{"version":1,"clients":[{}]}}"#, entries_json.join(","));
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn build_config(socket_path: PathBuf, clients_path: PathBuf, api_base: String) -> Config {
+        Config {
+            listen: ListenConfig {
+                socket: socket_path,
+            },
+            admin: AdminConfig {
+                socket_path: PathBuf::from("/unused-in-tests/admin.sock"),
+            },
+            clients: ClientsConfig { file: clients_path },
+            stunnel: StunnelConfig {
+                psk_file: PathBuf::from("/unused-in-tests/gcb.psk"),
+            },
+            logging: LoggingConfig {
+                level: LogLevel::Info,
+            },
+            provider: Providers {
+                github: Some(ProviderGithub {
+                    host: "github.com".to_string(),
+                    api_base,
+                    app_id: APP_ID,
+                    installation_id: INSTALLATION_ID,
+                    private_key_path: fixture_pem_path(),
+                }),
+            },
+        }
+    }
+
+    fn build_proxy_v4(src: [u8; 4]) -> Vec<u8> {
+        let mut buf = PROXY_V2_SIGNATURE.to_vec();
+        buf.push(0x21); // version 2, command PROXY
+        buf.push(0x11); // TCP/IPv4
+        buf.extend_from_slice(&12u16.to_be_bytes()); // address-block length
+        buf.extend_from_slice(&src);
+        buf.extend_from_slice(&[10, 0, 0, 1]); // dst IP
+        buf.extend_from_slice(&[0x12, 0x34]); // src port
+        buf.extend_from_slice(&[0x56, 0x78]); // dst port
+        buf
+    }
+
+    async fn wait_for_socket(path: &Path) {
+        for _ in 0..200 {
+            if path.exists() {
+                return;
+            }
+            compio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("socket {} did not appear within 1s", path.display());
+    }
+
+    async fn send_and_read_all(socket_path: &Path, payload: Vec<u8>) -> Vec<u8> {
+        let mut stream = UnixStream::connect(socket_path).await.unwrap();
+        let BufResult(write_res, _) = stream.write_all(payload).await;
+        write_res.unwrap();
+        let _ = stream.flush().await;
+        let mut response = Vec::new();
+        loop {
+            let chunk = Vec::with_capacity(1024);
+            let BufResult(res, chunk) = stream.read(chunk).await;
+            match res {
+                Ok(0) => break,
+                Ok(_) => response.extend_from_slice(&chunk),
+                Err(_) => break,
+            }
+        }
+        response
+    }
+
+    #[compio::test]
+    async fn daemon_happy_path() {
+        let (socket_path, clients_path) = unique_paths();
+        write_clients_json(&clients_path, &[("vm-1", CLIENT_IP)]);
+        let server = MockServer::start().await;
+        mount_repo_ok(&server).await;
+        mount_mint_ok(&server).await;
+        let cfg = build_config(socket_path.clone(), clients_path.clone(), server.uri());
+
+        compio::runtime::spawn(async move {
+            let _ = gcb::daemon::run(&cfg).await;
+        })
+        .detach();
+        wait_for_socket(&socket_path).await;
+
+        let mut payload = build_proxy_v4([192, 168, 122, 10]);
+        payload.extend_from_slice(
+            format!("protocol=https\nhost=github.com\npath={OWNER}/{REPO}\n\n").as_bytes(),
+        );
+        let resp = send_and_read_all(&socket_path, payload).await;
+        let body = std::str::from_utf8(&resp).unwrap();
+        assert!(
+            body.contains(&format!("password={TOKEN}\n")),
+            "response: {body:?}"
+        );
+        assert!(body.starts_with("username=x-access-token\n"));
+
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_file(&clients_path);
+    }
+
+    #[compio::test]
+    async fn daemon_rejects_unknown_client_ip() {
+        let (socket_path, clients_path) = unique_paths();
+        write_clients_json(&clients_path, &[("vm-1", CLIENT_IP)]);
+        let server = MockServer::start().await;
+        let cfg = build_config(socket_path.clone(), clients_path.clone(), server.uri());
+
+        compio::runtime::spawn(async move {
+            let _ = gcb::daemon::run(&cfg).await;
+        })
+        .detach();
+        wait_for_socket(&socket_path).await;
+
+        let mut payload = build_proxy_v4([10, 0, 0, 99]); // not in clients.json
+        payload.extend_from_slice(
+            format!("protocol=https\nhost=github.com\npath={OWNER}/{REPO}\n\n").as_bytes(),
+        );
+        let resp = send_and_read_all(&socket_path, payload).await;
+        assert!(resp.is_empty(), "expected EOF, got: {resp:?}");
+
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_file(&clients_path);
+    }
+
+    #[compio::test]
+    async fn daemon_rejects_unknown_host() {
+        let (socket_path, clients_path) = unique_paths();
+        write_clients_json(&clients_path, &[("vm-1", CLIENT_IP)]);
+        let server = MockServer::start().await;
+        let cfg = build_config(socket_path.clone(), clients_path.clone(), server.uri());
+
+        compio::runtime::spawn(async move {
+            let _ = gcb::daemon::run(&cfg).await;
+        })
+        .detach();
+        wait_for_socket(&socket_path).await;
+
+        let mut payload = build_proxy_v4([192, 168, 122, 10]);
+        payload.extend_from_slice(b"protocol=https\nhost=evil.example\npath=foo/bar\n\n");
+        let resp = send_and_read_all(&socket_path, payload).await;
+        assert!(resp.is_empty(), "expected EOF, got: {resp:?}");
+
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_file(&clients_path);
+    }
+
+    #[compio::test]
+    async fn daemon_rejects_malformed_request() {
+        let (socket_path, clients_path) = unique_paths();
+        write_clients_json(&clients_path, &[("vm-1", CLIENT_IP)]);
+        let server = MockServer::start().await;
+        let cfg = build_config(socket_path.clone(), clients_path.clone(), server.uri());
+
+        compio::runtime::spawn(async move {
+            let _ = gcb::daemon::run(&cfg).await;
+        })
+        .detach();
+        wait_for_socket(&socket_path).await;
+
+        // Missing `path=` line.
+        let mut payload = build_proxy_v4([192, 168, 122, 10]);
+        payload.extend_from_slice(b"protocol=https\nhost=github.com\n\n");
+        let resp = send_and_read_all(&socket_path, payload).await;
+        assert!(resp.is_empty(), "expected EOF, got: {resp:?}");
+
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_file(&clients_path);
+    }
+}

@@ -5,12 +5,6 @@
 //! `docs/PROTOCOLS.md` into typed Rust values, and reject unknown
 //! fields. All deserializers carry `#[serde(deny_unknown_fields)]`.
 
-// Transitional: the `load_*` entry points and the `Io`/`Toml` error
-// variants have no in-crate caller yet — `daemon` and `admin` are
-// still stubs. Remove this allow when those modules land and start
-// calling `load_config` / `load_clients_file`.
-#![allow(dead_code)]
-
 use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -20,54 +14,54 @@ use serde::Deserialize;
 /// Top-level parsed `config.toml`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Config {
-    pub(crate) listen: ListenConfig,
-    pub(crate) admin: AdminConfig,
-    pub(crate) clients: ClientsConfig,
-    pub(crate) stunnel: StunnelConfig,
-    pub(crate) logging: LoggingConfig,
-    pub(crate) provider: Providers,
+pub struct Config {
+    pub listen: ListenConfig,
+    pub admin: AdminConfig,
+    pub clients: ClientsConfig,
+    pub stunnel: StunnelConfig,
+    pub logging: LoggingConfig,
+    pub provider: Providers,
 }
 
 /// `[listen]` section.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ListenConfig {
+pub struct ListenConfig {
     /// Unix-domain socket the daemon listens on; stunnel forwards here.
-    pub(crate) socket: PathBuf,
+    pub socket: PathBuf,
 }
 
 /// `[admin]` section.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AdminConfig {
+pub struct AdminConfig {
     /// Unix-domain socket the CLI talks to for operator commands.
-    pub(crate) socket_path: PathBuf,
+    pub socket_path: PathBuf,
 }
 
 /// `[clients]` section.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ClientsConfig {
+pub struct ClientsConfig {
     /// Path to the JSON file holding enrolled clients.
-    pub(crate) file: PathBuf,
+    pub file: PathBuf,
 }
 
 /// `[stunnel]` section.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct StunnelConfig {
+pub struct StunnelConfig {
     /// Path to stunnel's PSK secrets file. The daemon rewrites this
     /// via the admin socket on enroll/revoke and then SIGHUPs stunnel.
-    pub(crate) psk_file: PathBuf,
+    pub psk_file: PathBuf,
 }
 
 /// `[logging]` section.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct LoggingConfig {
+pub struct LoggingConfig {
     /// Minimum log level the subscriber emits.
-    pub(crate) level: LogLevel,
+    pub level: LogLevel,
 }
 
 /// Log level as it appears in `config.toml`. Mirrors the levels
@@ -75,7 +69,7 @@ pub(crate) struct LoggingConfig {
 /// because `tracing::Level` does not implement `serde::Deserialize`.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum LogLevel {
+pub enum LogLevel {
     Trace,
     Debug,
     Info,
@@ -86,11 +80,11 @@ pub(crate) enum LogLevel {
 /// `[provider.*]` parent table.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Providers {
+pub struct Providers {
     /// `[provider.github]` block; absent means no GitHub provider
     /// configured. The daemon errors at startup if no provider is
     /// configured at all.
-    pub(crate) github: Option<ProviderGithub>,
+    pub github: Option<ProviderGithub>,
 }
 
 /// `[provider.github]` section.
@@ -113,30 +107,30 @@ pub struct ProviderGithub {
 /// Top-level parsed `clients.json`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ClientsFile {
+pub struct ClientsFile {
     /// Schema version. Only `1` is supported today.
-    pub(crate) version: u32,
-    pub(crate) clients: Vec<ClientEntry>,
+    pub version: u32,
+    pub clients: Vec<ClientEntry>,
 }
 
 /// One enrolled client.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ClientEntry {
-    pub(crate) name: String,
-    pub(crate) ip: IpAddr,
-    pub(crate) providers: Vec<String>,
+pub struct ClientEntry {
+    pub name: String,
+    pub ip: IpAddr,
+    pub providers: Vec<String>,
     /// RFC 3339 UTC timestamp. Kept as a `String`; consumers parse
     /// on use via `time::OffsetDateTime` if/when they need a typed
     /// value. The daemon is the sole writer and writes a known
     /// format. Retyping this field is a separate task.
-    pub(crate) enrolled_at: String,
-    pub(crate) note: Option<String>,
+    pub enrolled_at: String,
+    pub note: Option<String>,
 }
 
 /// Errors returned by the config-loading entry points.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ConfigError {
+pub enum ConfigError {
     /// Reading the file from disk failed.
     #[error("failed to read {}", path.display())]
     Io {
@@ -164,7 +158,7 @@ pub(crate) enum ConfigError {
 }
 
 /// Load and parse `config.toml`.
-pub(crate) fn load_config(path: &Path) -> Result<Config, ConfigError> {
+pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
     let text = fs::read_to_string(path).map_err(|source| ConfigError::Io {
         path: path.to_path_buf(),
         source,
@@ -176,7 +170,7 @@ pub(crate) fn load_config(path: &Path) -> Result<Config, ConfigError> {
 }
 
 /// Load and parse `clients.json`.
-pub(crate) fn load_clients_file(path: &Path) -> Result<ClientsFile, ConfigError> {
+pub fn load_clients_file(path: &Path) -> Result<ClientsFile, ConfigError> {
     let text = fs::read_to_string(path).map_err(|source| ConfigError::Io {
         path: path.to_path_buf(),
         source,

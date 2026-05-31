@@ -10,11 +10,6 @@
 //! See `docs/PROTOCOLS.md` ("GitHub provider outbound") for the
 //! wire-level contract.
 
-// Transitional: nothing in the crate calls into this module yet —
-// `daemon` is still a stub. Remove this allow when the dispatch
-// path lands.
-#![allow(dead_code)]
-
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;

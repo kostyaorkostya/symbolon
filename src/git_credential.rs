@@ -16,18 +16,13 @@
 //! is expected to close the connection without a response on any
 //! `Err` and log `evt=mint_denied reason=malformed_request`.
 
-// Transitional: nothing in the crate calls `parse` or `write_response`
-// yet — `daemon` and `admin` are still stubs. Remove this allow when
-// those modules land and start calling into this one.
-#![allow(dead_code)]
-
 use std::time::SystemTime;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Request {
-    pub(crate) protocol: String,
-    pub(crate) host: String,
-    pub(crate) path: String,
+pub struct Request {
+    pub protocol: String,
+    pub host: String,
+    pub path: String,
 }
 
 #[derive(Debug, Clone)]
@@ -38,7 +33,7 @@ pub struct Response {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum GitCredentialError {
+pub enum GitCredentialError {
     #[error("request block is not terminated by an empty line")]
     UnterminatedBlock,
     #[error("trailing bytes after the empty terminator line")]
@@ -65,7 +60,7 @@ pub(crate) enum GitCredentialError {
     EmitInvalidExpiry,
 }
 
-pub(crate) fn parse(input: &[u8]) -> Result<Request, GitCredentialError> {
+pub fn parse(input: &[u8]) -> Result<Request, GitCredentialError> {
     let term_pos = input
         .windows(2)
         .position(|w| w == b"\n\n")
@@ -165,7 +160,7 @@ pub(crate) fn parse(input: &[u8]) -> Result<Request, GitCredentialError> {
     })
 }
 
-pub(crate) fn write_response(resp: &Response, out: &mut Vec<u8>) -> Result<(), GitCredentialError> {
+pub fn write_response(resp: &Response, out: &mut Vec<u8>) -> Result<(), GitCredentialError> {
     check_response_field("username", &resp.username)?;
     check_response_field("password", &resp.password)?;
 

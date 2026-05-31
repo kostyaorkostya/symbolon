@@ -21,10 +21,6 @@
 //! Reference:
 //! <https://www.haproxy.org/download/2.4/doc/proxy-protocol.txt>.
 
-// Transitional: `daemon` is still a stub and does not call this yet.
-// Remove this allow when the accept loop lands.
-#![allow(dead_code)]
-
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 const SIGNATURE: [u8; 12] = [
@@ -42,13 +38,13 @@ const CMD_PROXY: u8 = 0x1;
 const EXPECTED_VERSION: u8 = 0x2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Parsed {
-    pub(crate) source_ip: IpAddr,
-    pub(crate) header_len: usize,
+pub struct Parsed {
+    pub source_ip: IpAddr,
+    pub header_len: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ProxyProtocolError {
+pub enum ProxyProtocolError {
     #[error("incomplete header: have {have} bytes, need {need_total}")]
     Incomplete { have: usize, need_total: usize },
     #[error("invalid 12-byte signature")]
@@ -65,7 +61,7 @@ pub(crate) enum ProxyProtocolError {
     AddressBlockTooShort { family: u8, len: u16 },
 }
 
-pub(crate) fn parse(input: &[u8]) -> Result<Parsed, ProxyProtocolError> {
+pub fn parse(input: &[u8]) -> Result<Parsed, ProxyProtocolError> {
     // Streaming contract: at fewer than 12 bytes, do not peek at the
     // signature — a slow socket read must not be misclassified as
     // `InvalidSignature`. Once 12 bytes are present, signature

@@ -31,10 +31,10 @@ pub(crate) struct Request {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Response {
-    pub(crate) username: String,
-    pub(crate) password: String,
-    pub(crate) password_expiry_utc: SystemTime,
+pub struct Response {
+    pub username: String,
+    pub password: String,
+    pub password_expiry_utc: SystemTime,
 }
 
 #[derive(Debug, thiserror::Error)]

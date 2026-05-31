@@ -96,18 +96,18 @@ pub(crate) struct Providers {
 /// `[provider.github]` section.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ProviderGithub {
+pub struct ProviderGithub {
     /// Host string matched byte-exact against the `host=` field in
     /// git-credential requests (AGENTS.md invariant #11).
-    pub(crate) host: String,
+    pub host: String,
     /// API base URL, e.g. `https://api.github.com`. Kept as a plain
     /// string at this layer; URL parsing is the provider module's
     /// responsibility.
-    pub(crate) api_base: String,
-    pub(crate) app_id: u64,
-    pub(crate) installation_id: u64,
+    pub api_base: String,
+    pub app_id: u64,
+    pub installation_id: u64,
     /// PEM-encoded App private key; loaded once at startup.
-    pub(crate) private_key_path: PathBuf,
+    pub private_key_path: PathBuf,
 }
 
 /// Top-level parsed `clients.json`.

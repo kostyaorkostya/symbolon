@@ -5,9 +5,17 @@ edition = "2021"
 license = "Apache-2.0"
 
 [dependencies]
-compio = { version = "0.18.0", features = ["fs", "io-uring", "macros", "net", "runtime", "signal", "time"] }
+compio = { version = "0.18.0", features = [
+  "fs",
+  "io-uring",
+  "macros",
+  "net",
+  "runtime",
+  "signal",
+  "time",
+] }
 cyper = "0.8.3"
-jsonwebtoken = "10.4.0"
+jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 rustix = { version = "1.1.4", features = ["process"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
@@ -23,3 +31,6 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+[dev-dependencies]
+wiremock = "0.6.5"

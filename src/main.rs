@@ -8,11 +8,11 @@ use std::process::ExitCode;
 
 use argh::FromArgs;
 use tracing::Level;
-use tracing_subscriber::filter::{filter_fn, LevelFilter};
+use tracing_subscriber::Layer;
+use tracing_subscriber::filter::{LevelFilter, filter_fn};
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::Layer;
 
 use gcb::admin::CliCommand;
 use gcb::config::{self, LogLevel};

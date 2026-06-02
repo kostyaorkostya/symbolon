@@ -28,9 +28,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::FutureExt;
 
+use compio::BufResult;
 use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use compio::net::{UnixListener, UnixStream};
-use compio::BufResult;
 use tracing::{info, warn};
 
 use crate::config::{ClientsFile, Config, SandboxMode};

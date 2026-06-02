@@ -1,12 +1,20 @@
 [package]
 name = "gcb"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "Apache-2.0"
 
 [dependencies]
 argh = "0.1.19"
-compio = { version = "0.19", features = ["fs", "io-uring", "macros", "net", "runtime", "signal", "time"] }
+compio = { version = "0.19", features = [
+  "fs",
+  "io-uring",
+  "macros",
+  "net",
+  "runtime",
+  "signal",
+  "time",
+] }
 cyper = "0.9"
 futures-util = "0.3.32"
 jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }

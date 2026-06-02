@@ -27,9 +27,9 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use compio::BufResult;
 use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use compio::net::{UnixListener, UnixStream};
-use compio::BufResult;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 

@@ -298,9 +298,9 @@ mod daemon_e2e {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
+    use compio::BufResult;
     use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
     use compio::net::UnixStream;
-    use compio::BufResult;
     use gcb::config::{
         AdminConfig, ClientsConfig, Config, ListenConfig, LogLevel, LoggingConfig, Providers,
         SandboxMode, SecurityConfig, StunnelConfig,
@@ -546,16 +546,16 @@ mod daemon_e2e {
 // =====================================================================
 
 mod admin_e2e {
-    use super::daemon_e2e::{unique_paths_full, TempPaths};
+    use super::daemon_e2e::{TempPaths, unique_paths_full};
     use super::*;
 
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::time::Duration;
 
+    use compio::BufResult;
     use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
     use compio::net::UnixStream;
-    use compio::BufResult;
     use gcb::config::{
         AdminConfig, ClientsConfig, Config, ListenConfig, LogLevel, LoggingConfig, Providers,
         SandboxMode, SecurityConfig, StunnelConfig,

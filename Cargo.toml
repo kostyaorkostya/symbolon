@@ -6,16 +6,8 @@ license = "Apache-2.0"
 
 [dependencies]
 argh = "0.1.19"
-compio = { version = "0.18.0", features = [
-  "fs",
-  "io-uring",
-  "macros",
-  "net",
-  "runtime",
-  "signal",
-  "time",
-] }
-cyper = "0.8.3"
+compio = { version = "0.19", features = ["fs", "io-uring", "macros", "net", "runtime", "signal", "time"] }
+cyper = "0.9"
 futures-util = "0.3.32"
 jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 landlock = "0.4.5"

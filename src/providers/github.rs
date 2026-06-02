@@ -152,7 +152,7 @@ impl GitHubProvider {
             app_id: cfg.app_id,
             installation_id: cfg.installation_id,
             encoding_key,
-            client: cyper::Client::new(),
+            client: cyper::Client::new()?,
             user_agent: format!("gcb/{}", env!("CARGO_PKG_VERSION")),
             clock,
             repo_ids: RepoIdCache::default(),

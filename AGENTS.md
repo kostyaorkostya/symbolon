@@ -121,6 +121,22 @@ Pinned in `Cargo.toml`:
   is mandatory in 10.x — without a crypto-provider feature the
   crate panics at sign-time. `rust_crypto` over `aws_lc_rs` keeps
   the musl build pure-Rust with no C FFI.)
+- `landlock` (Linux LSM sandboxing for FS + TCP-connect + abstract-UDS
+  scope at ABI 6. Applied in `src/sandbox.rs` after both Unix-domain
+  sockets are bound and before the accept loop; gated by `[security]
+  sandbox` in `config.toml` with default `best_effort`. Pure Rust +
+  `libc` only; works on musl. Used together with `seccompiler` —
+  landlock cannot enable `Scope::Signal` because the daemon must keep
+  SIGHUP-ing stunnel, which lives in a separate process tree.)
+- `libc` (raw syscall numbers and signal constants for the
+  `seccompiler` BPF filter; transitively required by landlock and
+  seccompiler anyway, so the explicit dep adds no surface.)
+- `seccompiler` (Firecracker's pure-Rust seccomp-BPF compiler. The
+  filter built in `src/sandbox.rs` returns `EPERM` for every
+  `kill`/`tkill`/`tgkill`/`pidfd_send_signal`/`rt_sigqueueinfo`/
+  `rt_tgsigqueueinfo` whose signum argument isn't `SIGHUP`.
+  Substitutes for landlock's `Scope::Signal` while preserving
+  the legitimate SIGHUP-to-stunnel path.)
 - `serde`, `serde_json`, `toml` (config + provider responses)
 - `time` with `default-features = false, features = ["parsing",
   "formatting"]` (RFC3339 → `SystemTime` for GitHub's `expires_at`,

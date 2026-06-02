@@ -33,10 +33,11 @@ use compio::net::{UnixListener, UnixStream};
 use compio::BufResult;
 use tracing::{info, warn};
 
-use crate::config::{ClientsFile, Config};
+use crate::config::{ClientsFile, Config, SandboxMode};
 use crate::git_credential::{self, GitCredentialError};
 use crate::providers::github::{GitHubProvider, GithubError};
 use crate::proxy_protocol::{self, ProxyProtocolError};
+use crate::sandbox::{self, SandboxError, SandboxLevel, SandboxPaths};
 
 const MAX_REQUEST_BYTES: usize = 8 * 1024;
 const PER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -64,6 +65,10 @@ pub enum DaemonError {
     Accept(#[source] std::io::Error),
     #[error("clients.json contains duplicate IP address {0}")]
     DuplicateClientIp(IpAddr),
+    #[error("config path {0} has no parent directory; sandbox cannot grant write access")]
+    NoParentDir(&'static str),
+    #[error("failed to apply sandbox")]
+    Sandbox(#[from] SandboxError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,6 +151,8 @@ pub async fn run(cfg: &Config, config_path: &Path) -> Result<(), DaemonError> {
                 path: admin_path.clone(),
                 source,
             })?;
+
+    apply_sandbox(cfg)?;
 
     let provider_names: Vec<&str> = state.providers.keys().map(String::as_str).collect();
     info!(
@@ -251,6 +258,73 @@ pub async fn run(cfg: &Config, config_path: &Path) -> Result<(), DaemonError> {
         inflight_drained = inflight_drained,
         drain_ms = drain_ms,
     );
+    Ok(())
+}
+
+fn apply_sandbox(cfg: &Config) -> Result<(), DaemonError> {
+    let level = match cfg.security.sandbox {
+        SandboxMode::Required => SandboxLevel::Required,
+        SandboxMode::BestEffort => SandboxLevel::BestEffort,
+        SandboxMode::Off => SandboxLevel::Off,
+    };
+    let mut read_dirs = vec![PathBuf::from("/etc/ssl/certs")];
+    read_dirs.extend(cfg.security.extra_read_dirs.iter().cloned());
+    let paths = SandboxPaths {
+        read_files: vec![
+            cfg.clients.file.clone(),
+            cfg.stunnel.pidfile.clone(),
+            PathBuf::from("/dev/urandom"),
+        ],
+        read_dirs,
+        resolv_files: [
+            "/etc/resolv.conf",
+            "/etc/hosts",
+            "/etc/nsswitch.conf",
+            "/etc/host.conf",
+            "/etc/gai.conf",
+            "/etc/services",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect(),
+        write_parent_dirs: vec![
+            cfg.clients
+                .file
+                .parent()
+                .ok_or(DaemonError::NoParentDir("clients.file"))?
+                .to_path_buf(),
+            cfg.stunnel
+                .psk_file
+                .parent()
+                .ok_or(DaemonError::NoParentDir("stunnel.psk_file"))?
+                .to_path_buf(),
+        ],
+    };
+    let outcome = sandbox::apply(level, &paths)?;
+    let degraded = !matches!(outcome.status, "fully_enforced" | "off");
+    if degraded {
+        warn!(
+            evt = "sandbox_applied",
+            policy = ?cfg.security.sandbox,
+            abi = outcome.requested_abi,
+            status = outcome.status,
+            fs = outcome.fs,
+            tcp = outcome.tcp,
+            scope = outcome.scope,
+            seccomp = outcome.seccomp,
+        );
+    } else {
+        info!(
+            evt = "sandbox_applied",
+            policy = ?cfg.security.sandbox,
+            abi = outcome.requested_abi,
+            status = outcome.status,
+            fs = outcome.fs,
+            tcp = outcome.tcp,
+            scope = outcome.scope,
+            seccomp = outcome.seccomp,
+        );
+    }
     Ok(())
 }
 

@@ -20,6 +20,8 @@ pub struct Config {
     pub clients: ClientsConfig,
     pub stunnel: StunnelConfig,
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub security: SecurityConfig,
     pub provider: Providers,
 }
 
@@ -79,6 +81,33 @@ pub enum LogLevel {
     Info,
     Warn,
     Error,
+}
+
+/// `[security]` section. Absent in `config.toml` means `Default` —
+/// `sandbox = "best_effort"`, no extra read dirs.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityConfig {
+    #[serde(default)]
+    pub sandbox: SandboxMode,
+    /// Extra read-only dirs to grant landlock access on. RHEL/Fedora
+    /// hosts typically need `"/etc/pki/tls/certs"` for OpenSSL CA
+    /// roots.
+    #[serde(default)]
+    pub extra_read_dirs: Vec<PathBuf>,
+}
+
+/// Sandbox enforcement policy, controlling landlock + seccomp.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxMode {
+    /// Refuse to start if the kernel can't enforce the full ABI.
+    Required,
+    /// Apply whatever the kernel supports; log degradation.
+    #[default]
+    BestEffort,
+    /// Skip sandboxing entirely. Not recommended; useful in tests.
+    Off,
 }
 
 /// `[provider.*]` parent table.
@@ -208,7 +237,7 @@ socket = "/run/gcb/daemon.sock"
 socket_path = "/run/gcb/admin.sock"
 
 [clients]
-file = "/etc/gcb/clients.json"
+file = "/var/lib/gcb/clients.json"
 
 [stunnel]
 psk_file = "/etc/stunnel/gcb.psk"
@@ -230,7 +259,7 @@ private_key_path = "/etc/gcb/github-app.pem"
         let cfg: Config = toml::from_str(KNOWN_GOOD_CONFIG).unwrap();
         assert_eq!(cfg.listen.socket, PathBuf::from("/run/gcb/daemon.sock"));
         assert_eq!(cfg.admin.socket_path, PathBuf::from("/run/gcb/admin.sock"));
-        assert_eq!(cfg.clients.file, PathBuf::from("/etc/gcb/clients.json"));
+        assert_eq!(cfg.clients.file, PathBuf::from("/var/lib/gcb/clients.json"));
         assert_eq!(cfg.stunnel.psk_file, PathBuf::from("/etc/stunnel/gcb.psk"));
         assert_eq!(
             cfg.stunnel.pidfile,
@@ -288,6 +317,58 @@ private_key_path = "/etc/gcb/github-app.pem"
     #[test]
     fn log_level_fatal_rejected() {
         assert!(toml::from_str::<LoggingConfig>(r#"level = "fatal""#).is_err());
+    }
+
+    #[test]
+    fn security_section_absent_defaults_to_best_effort() {
+        let cfg: Config = toml::from_str(KNOWN_GOOD_CONFIG).unwrap();
+        assert_eq!(cfg.security.sandbox, SandboxMode::BestEffort);
+        assert!(cfg.security.extra_read_dirs.is_empty());
+    }
+
+    #[test]
+    fn security_required_parses() {
+        let src = format!("{KNOWN_GOOD_CONFIG}\n[security]\nsandbox = \"required\"\n");
+        let cfg: Config = toml::from_str(&src).unwrap();
+        assert_eq!(cfg.security.sandbox, SandboxMode::Required);
+    }
+
+    #[test]
+    fn security_off_parses() {
+        let src = format!("{KNOWN_GOOD_CONFIG}\n[security]\nsandbox = \"off\"\n");
+        let cfg: Config = toml::from_str(&src).unwrap();
+        assert_eq!(cfg.security.sandbox, SandboxMode::Off);
+    }
+
+    #[test]
+    fn security_best_effort_parses_explicitly() {
+        let src = format!("{KNOWN_GOOD_CONFIG}\n[security]\nsandbox = \"best_effort\"\n");
+        let cfg: Config = toml::from_str(&src).unwrap();
+        assert_eq!(cfg.security.sandbox, SandboxMode::BestEffort);
+    }
+
+    #[test]
+    fn security_invalid_value_rejected() {
+        let src = format!("{KNOWN_GOOD_CONFIG}\n[security]\nsandbox = \"strict\"\n");
+        assert!(toml::from_str::<Config>(&src).is_err());
+    }
+
+    #[test]
+    fn security_extra_read_dirs_parses() {
+        let src = format!(
+            "{KNOWN_GOOD_CONFIG}\n[security]\nsandbox = \"best_effort\"\nextra_read_dirs = [\"/etc/pki/tls/certs\"]\n"
+        );
+        let cfg: Config = toml::from_str(&src).unwrap();
+        assert_eq!(
+            cfg.security.extra_read_dirs,
+            vec![PathBuf::from("/etc/pki/tls/certs")]
+        );
+    }
+
+    #[test]
+    fn security_unknown_field_rejected() {
+        let src = format!("{KNOWN_GOOD_CONFIG}\n[security]\nsandbox = \"off\"\nrogue = true\n");
+        assert!(toml::from_str::<Config>(&src).is_err());
     }
 
     #[test]

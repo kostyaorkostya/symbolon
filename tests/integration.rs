@@ -303,7 +303,7 @@ mod daemon_e2e {
     use compio::BufResult;
     use gcb::config::{
         AdminConfig, ClientsConfig, Config, ListenConfig, LogLevel, LoggingConfig, Providers,
-        StunnelConfig,
+        SandboxMode, SecurityConfig, StunnelConfig,
     };
 
     const PROXY_V2_SIGNATURE: [u8; 12] = [
@@ -383,6 +383,10 @@ mod daemon_e2e {
             },
             logging: LoggingConfig {
                 level: LogLevel::Info,
+            },
+            security: SecurityConfig {
+                sandbox: SandboxMode::Off,
+                extra_read_dirs: vec![],
             },
             provider: Providers {
                 github: Some(ProviderGithub {
@@ -554,7 +558,7 @@ mod admin_e2e {
     use compio::BufResult;
     use gcb::config::{
         AdminConfig, ClientsConfig, Config, ListenConfig, LogLevel, LoggingConfig, Providers,
-        StunnelConfig,
+        SandboxMode, SecurityConfig, StunnelConfig,
     };
     use serde_json::Value;
 
@@ -575,6 +579,10 @@ mod admin_e2e {
             },
             logging: LoggingConfig {
                 level: LogLevel::Info,
+            },
+            security: SecurityConfig {
+                sandbox: SandboxMode::Off,
+                extra_read_dirs: vec![],
             },
             provider: Providers {
                 github: Some(ProviderGithub {

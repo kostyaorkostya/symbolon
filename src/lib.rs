@@ -17,3 +17,4 @@ pub mod errors;
 pub mod git_credential;
 pub mod providers;
 pub mod proxy_protocol;
+pub mod sandbox;

@@ -20,6 +20,15 @@ package versions, and provider UIs change. The stable design lives in
   - [`stunnel`](https://www.stunnel.org/) package available.
   - Outbound HTTPS to `api.github.com` (or your GHES API base).
   - Enough headroom for a ~3 MiB daemon plus `stunnel`.
+  - **Linux kernel 6.10+** recommended. The broker self-sandboxes
+    with landlock (FS + TCP-connect + abstract-UDS scope at ABI 6)
+    plus a seccomp-BPF filter scoping the kill-family syscalls to
+    `SIGHUP` only. Older kernels degrade under the default
+    `[security] sandbox = "best_effort"` policy and the daemon emits
+    `evt=sandbox_applied lvl=warn status=partially_enforced` so the
+    operator notices. Check with `uname -r`; check landlock LSM is
+    enabled with `grep landlock /sys/kernel/security/lsm`. In an LXC
+    container, the host kernel is what counts.
 - On each client: `openssl`, `git`, and the ability to drop a small
   shell script and a config file in place.
 
@@ -71,11 +80,29 @@ adduser  -S -G gcb -H -D -s /sbin/nologin gcb
 adduser  stunnel gcb   # Alpine; Debian/Ubuntu: `usermod -aG gcb stunnel`
 
 install -d -o gcb -g gcb     -m 0700 /etc/gcb
+install -d -o gcb -g gcb     -m 0700 /var/lib/gcb
 install -d -o gcb -g gcb     -m 0750 /run/gcb
 install -d -o gcb -g stunnel -m 0750 /etc/stunnel
 ```
 
+`/etc/gcb/` holds the App PEM key and `config.toml` (read-only at
+runtime); `/var/lib/gcb/` holds `clients.json` (mutated atomically by
+the daemon). They are kept separate because the daemon's landlock
+ruleset grants write access to `/var/lib/gcb/` (needed for the
+tempfile-then-rename atomic-write pattern); putting the PEM key
+under that dir would defeat the sandbox's protection of the key.
+
 The `/run/gcb` directory is recreated on every boot — see §3.10.
+
+**Upgrading from a pre-`/var/lib/gcb` layout:** if your existing
+deployment places `clients.json` under `/etc/gcb/`, move it before
+restarting the daemon and update `clients.file` in `config.toml`:
+
+```sh
+install -d -o gcb -g gcb -m 0700 /var/lib/gcb
+mv /etc/gcb/clients.json /var/lib/gcb/clients.json
+sed -i 's,/etc/gcb/clients.json,/var/lib/gcb/clients.json,' /etc/gcb/config.toml
+```
 
 ### 3.3 Fetch and verify the binary
 
@@ -108,7 +135,7 @@ socket = "/run/gcb/daemon.sock"
 socket_path = "/run/gcb/admin.sock"
 
 [clients]
-file = "/etc/gcb/clients.json"
+file = "/var/lib/gcb/clients.json"
 
 [stunnel]
 psk_file = "/etc/stunnel/gcb.psk"
@@ -116,6 +143,13 @@ pidfile  = "/run/stunnel/stunnel.pid"   # must match `pid = …` in step 3.7
 
 [logging]
 level = "info"
+
+# Optional. Defaults to `sandbox = "best_effort"` with no extra dirs.
+# Uncomment and set `extra_read_dirs = ["/etc/pki/tls/certs"]` on
+# RHEL/Fedora where OpenSSL's CA roots live outside /etc/ssl/certs.
+# [security]
+# sandbox = "best_effort"
+# extra_read_dirs = []
 
 [provider.github]
 # For github.com, keep these defaults.
@@ -137,9 +171,9 @@ chmod 0600    /etc/gcb/config.toml
 ### 3.6 Initialize state files
 
 ```sh
-echo '{"version":1,"clients":[]}' > /etc/gcb/clients.json
-chown gcb:gcb /etc/gcb/clients.json
-chmod 0600    /etc/gcb/clients.json
+echo '{"version":1,"clients":[]}' > /var/lib/gcb/clients.json
+chown gcb:gcb /var/lib/gcb/clients.json
+chmod 0600    /var/lib/gcb/clients.json
 
 install -o gcb -g stunnel -m 0640 /dev/null /etc/stunnel/gcb.psk
 ```

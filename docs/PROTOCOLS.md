@@ -18,7 +18,7 @@ socket = "/run/gcb/daemon.sock"
 socket_path = "/run/gcb/admin.sock"
 
 [clients]
-file = "/etc/gcb/clients.json"
+file = "/var/lib/gcb/clients.json"
 
 [stunnel]
 psk_file = "/etc/stunnel/gcb.psk"
@@ -26,6 +26,22 @@ pidfile = "/run/stunnel/stunnel.pid"
 
 [logging]
 level = "info"   # trace | debug | info | warn | error
+
+[security]
+# Sandbox enforcement policy. Controls landlock (FS + TCP-connect +
+# abstract-UDS scope at ABI 6) and a seccomp filter that confines the
+# kill-family syscalls to SIGHUP only.
+#
+#   required    – refuse to start if the kernel can't enforce ABI 6.
+#   best_effort – default. Apply what the kernel supports; degrade and
+#                 log a `sandbox_applied` warn event if not fully
+#                 enforced.
+#   off         – skip sandboxing entirely (tests, debugging).
+sandbox = "best_effort"
+# Extra read-only dirs to grant landlock access on at startup. The
+# default ruleset already includes /etc/ssl/certs; RHEL/Fedora hosts
+# typically also need /etc/pki/tls/certs for OpenSSL CA roots.
+extra_read_dirs = []
 
 [provider.github]
 # For github.com, keep defaults below.
@@ -40,9 +56,19 @@ private_key_path = "/etc/gcb/github-app.pem"
 ```
 
 Unknown top-level keys are rejected by `serde` deserialization
-(`#[serde(deny_unknown_fields)]` on every struct).
+(`#[serde(deny_unknown_fields)]` on every struct). The `[security]`
+section is optional and defaults to `sandbox = "best_effort"` with
+no extra read dirs.
 
-### `/etc/gcb/clients.json` — machine-authored
+The PEM key path (`provider.github.private_key_path`) is read once
+at startup, **before** the sandbox is applied. The default sandbox
+ruleset deliberately omits `/etc/gcb/` so a post-compromise process
+inside the daemon cannot re-open the key. Keep the PEM under
+`/etc/gcb/` (or any other dir outside `/var/lib/gcb/` and
+`/etc/stunnel/`); do not place it in either of the directories
+granted write access for atomic state-file writes.
+
+### `/var/lib/gcb/clients.json` — machine-authored
 
 ```json
 {
@@ -288,9 +314,16 @@ References: [REST API for App installations][gh-installs],
 3. Unlink any stale `listen.socket` and `admin.socket_path`.
 4. Bind both Unix sockets; set mode `0660`, owner `gcb:gcb`.
 5. Load `clients.json`. Fail fast on schema errors.
-6. Run selfcheck (verify App ID matches JWT, verify each provider's
+6. Apply sandbox (landlock + seccomp). Per `[security] sandbox`:
+   `required` aborts on missing kernel features; `best_effort`
+   degrades and emits `evt=sandbox_applied` at `warn` lvl; `off`
+   skips. After this step the PEM key dir is unreachable, only the
+   small allowlist (state dirs, `/dev/urandom`, `/etc/ssl/certs`,
+   nameservice files, TCP-connect to port 443, SIGHUP sends) remains
+   permitted.
+7. Run selfcheck (verify App ID matches JWT, verify each provider's
    `api_base` reachable, log clock skew).
-7. Enter the accept loop.
+8. Enter the accept loop.
 
 ### Shutdown
 
@@ -341,6 +374,8 @@ line.
 | `revoke` | `provider`, `client` |
 | `config_reload` | `triggered_by` (`sighup`) |
 | `cache_invalidated` | `provider`, `repo`, `cause` (`404` \| `ttl_expired`) |
+| `sandbox_applied` | `policy` (`required` \| `best_effort` \| `off`), `abi` (landlock ABI requested; `0` if off), `status` (`fully_enforced` \| `partially_enforced` \| `not_enforced` \| `off`), `fs`, `tcp`, `scope`, `seccomp` (bool per subsystem actually engaged) |
+| `sandbox_path_skipped` | `path`, `reason` (`enoent` \| `open_failed`), `error` (when applicable) — emitted at `debug` for nameservice / CA-bundle paths absent on this host |
 
 `reason` values for `mint_denied`:
 `client_unknown | unknown_host | repo_not_accessible | provider_4xx | malformed_request`.

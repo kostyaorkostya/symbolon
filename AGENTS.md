@@ -265,3 +265,18 @@ Known omissions, not oversights:
 - **Multiple instances of the same provider** (e.g. github.com +
   github.example.com on one broker). Section name `[provider.X]` is
   also the dispatch key; introduce a `kind` field if/when needed.
+- **Async DNS via `hickory-resolver` (optionally with DoH).** Today
+  the daemon uses the system resolver via libc `getaddrinfo`; the
+  sandbox allowlist therefore includes 6 nameservice files
+  (`/etc/resolv.conf`, `/etc/hosts`, `/etc/nsswitch.conf`,
+  `/etc/host.conf`, `/etc/gai.conf`, `/etc/services`). `cyper` 0.9
+  exposes a `hickory-dns` feature that swaps in `cyper-hickory` +
+  `hickory-resolver` for compio-native async DNS, optionally over
+  DoH. Skipped today because the win is aesthetic (drops 5 of 6
+  nameservice paths from the allowlist — `/etc/resolv.conf` is still
+  needed for the nameserver list) versus ~10 transitive deps plus a
+  0.1.0 glue crate, and the privacy / resolver-auth properties DoH
+  provides aren't part of the homelab threat model. Landlock has no
+  UDP rule type either, so DNS-over-UDP-53 is unrestricted today
+  anyway. Reopen if internal-DNS GHES or high-volume resolution
+  shows up.

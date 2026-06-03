@@ -172,7 +172,7 @@ pub async fn run_admin_loop(
 ) -> Result<(), AdminError> {
     loop {
         let (stream, _peer) = listener.accept().await.map_err(AdminError::Accept)?;
-        if state.shutting_down.get() {
+        if state.shutdown.is_cancelled() {
             drop(stream);
             continue;
         }

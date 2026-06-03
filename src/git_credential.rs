@@ -60,6 +60,19 @@ pub enum GitCredentialError {
     EmitInvalidExpiry,
 }
 
+/// Parse a git-credential request block.
+///
+/// The format is a sequence of `key=value\n` lines terminated by an
+/// empty line (`\n\n`). Recognised keys are `protocol`, `host`, and
+/// `path`; unknown keys (e.g. `wwwauth[]`, `capability[]`) are
+/// accepted and ignored per `gitcredentials(7)`. `path` has a single
+/// trailing `.git` suffix stripped per `docs/PROTOCOLS.md` § "`path`
+/// handling".
+///
+/// CR (0x0D) and NUL (0x00) bytes in any recognised key's value are
+/// rejected (Clone2Leak defence — see the module-level docs).
+/// Returns `Err` on any deviation; the daemon closes the connection
+/// without a response on any error from this function.
 pub fn parse(input: &[u8]) -> Result<Request, GitCredentialError> {
     let term_pos = input
         .windows(2)
@@ -75,69 +88,67 @@ pub fn parse(input: &[u8]) -> Result<Request, GitCredentialError> {
     let mut host: Option<String> = None;
     let mut path: Option<String> = None;
 
-    if !block.is_empty() {
-        for (i, line) in block.split(|&c| c == b'\n').enumerate() {
-            let line_no = i + 1;
-            let eq_pos = line
-                .iter()
-                .position(|&c| c == b'=')
-                .ok_or(GitCredentialError::MissingSeparator { line_no })?;
-            let key_bytes = &line[..eq_pos];
-            let value_bytes = &line[eq_pos + 1..];
+    for (i, line) in block.split(|&c| c == b'\n').enumerate() {
+        let line_no = i + 1;
+        let eq_pos = line
+            .iter()
+            .position(|&c| c == b'=')
+            .ok_or(GitCredentialError::MissingSeparator { line_no })?;
+        let key_bytes = &line[..eq_pos];
+        let value_bytes = &line[eq_pos + 1..];
 
-            if key_bytes.is_empty() {
-                return Err(GitCredentialError::EmptyKey { line_no });
-            }
-
-            // Unknown keys are accepted and ignored: `gitcredentials(7)`
-            // is extensible (`wwwauth[]`, `capability[]`, etc.).
-            // Whitespace-around-`=` requests also land here as unknown
-            // keys (e.g. `host ` with a trailing space), and `url=`
-            // shorthand is rejected implicitly by the same path.
-            let key_static: &'static str = match key_bytes {
-                b"protocol" => "protocol",
-                b"host" => "host",
-                b"path" => "path",
-                _ => continue,
-            };
-
-            for &b in value_bytes {
-                match b {
-                    0x00 => {
-                        return Err(GitCredentialError::NulInValue {
-                            key: key_static.to_string(),
-                        });
-                    }
-                    0x0D => {
-                        return Err(GitCredentialError::CarriageReturnInValue {
-                            key: key_static.to_string(),
-                        });
-                    }
-                    _ => {}
-                }
-            }
-
-            if value_bytes.is_empty() {
-                return Err(GitCredentialError::EmptyValue { key: key_static });
-            }
-
-            let value = std::str::from_utf8(value_bytes)
-                .map_err(|_| GitCredentialError::InvalidUtf8 {
-                    key: key_static.to_string(),
-                })?
-                .to_string();
-
-            let slot = match key_static {
-                "protocol" => &mut protocol,
-                "host" => &mut host,
-                "path" => &mut path,
-                _ => unreachable!(),
-            };
-            if slot.is_some() {
-                return Err(GitCredentialError::DuplicateKey { key: key_static });
-            }
-            *slot = Some(value);
+        if key_bytes.is_empty() {
+            return Err(GitCredentialError::EmptyKey { line_no });
         }
+
+        // Unknown keys are accepted and ignored: `gitcredentials(7)`
+        // is extensible (`wwwauth[]`, `capability[]`, etc.).
+        // Whitespace-around-`=` requests also land here as unknown
+        // keys (e.g. `host ` with a trailing space), and `url=`
+        // shorthand is rejected implicitly by the same path.
+        let key_static: &'static str = match key_bytes {
+            b"protocol" => "protocol",
+            b"host" => "host",
+            b"path" => "path",
+            _ => continue,
+        };
+
+        for &b in value_bytes {
+            match b {
+                0x00 => {
+                    return Err(GitCredentialError::NulInValue {
+                        key: key_static.to_string(),
+                    });
+                }
+                0x0D => {
+                    return Err(GitCredentialError::CarriageReturnInValue {
+                        key: key_static.to_string(),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        if value_bytes.is_empty() {
+            return Err(GitCredentialError::EmptyValue { key: key_static });
+        }
+
+        let value = std::str::from_utf8(value_bytes)
+            .map_err(|_| GitCredentialError::InvalidUtf8 {
+                key: key_static.to_string(),
+            })?
+            .to_string();
+
+        let slot = match key_static {
+            "protocol" => &mut protocol,
+            "host" => &mut host,
+            "path" => &mut path,
+            _ => unreachable!(),
+        };
+        if slot.is_some() {
+            return Err(GitCredentialError::DuplicateKey { key: key_static });
+        }
+        *slot = Some(value);
     }
 
     let protocol = protocol.ok_or(GitCredentialError::MissingRequiredKey { key: "protocol" })?;
@@ -169,7 +180,12 @@ pub fn write_response(resp: &Response, out: &mut Vec<u8>) -> Result<(), GitCrede
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| GitCredentialError::EmitInvalidExpiry)?
         .as_secs();
+    let expiry_str = expiry_secs.to_string();
 
+    // Single growth: "username=" + user + "\npassword=" + pass +
+    // "\npassword_expiry_utc=" + digits + "\n\n". Fixed labels sum
+    // to 41 bytes; max u64 in decimal is 20 digits.
+    out.reserve(41 + resp.username.len() + resp.password.len() + expiry_str.len() + 2);
     out.extend_from_slice(b"username=");
     out.extend_from_slice(resp.username.as_bytes());
     out.push(b'\n');
@@ -177,7 +193,7 @@ pub fn write_response(resp: &Response, out: &mut Vec<u8>) -> Result<(), GitCrede
     out.extend_from_slice(resp.password.as_bytes());
     out.push(b'\n');
     out.extend_from_slice(b"password_expiry_utc=");
-    out.extend_from_slice(expiry_secs.to_string().as_bytes());
+    out.extend_from_slice(expiry_str.as_bytes());
     out.push(b'\n');
     out.push(b'\n');
 

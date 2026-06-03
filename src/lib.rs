@@ -13,8 +13,8 @@
 pub mod admin;
 pub mod config;
 pub mod daemon;
-pub mod errors;
 pub mod git_credential;
+pub mod logging;
 pub mod providers;
 pub mod proxy_protocol;
 pub mod sandbox;

@@ -13,11 +13,14 @@
 //! IP from the PROXY v2 header is the daemon's only source of client
 //! identity.
 //!
-//! Lifecycle: `SIGTERM` and `SIGINT` race the accept loop; on either,
-//! `shutting_down` flips, in-flight handlers drain with a 5-second
-//! deadline (PROTOCOLS.md § "Shutdown"), the admin and listen sockets
-//! are unlinked in that order, and `evt=shutdown` is logged. `SIGHUP`
-//! re-reads `clients.json` and swaps the in-memory table.
+//! Lifecycle: `SIGTERM` and `SIGINT` are watched by a small spawned
+//! task that races the two and cancels `state.shutdown` (a compio
+//! `CancelToken`) once either fires. The accept loop races
+//! `listener.accept()` against `shutdown.wait()`; in-flight handlers
+//! drain with a 5-second deadline (PROTOCOLS.md § "Shutdown"); the
+//! admin and listen sockets are unlinked in that order; and
+//! `evt=shutdown` is logged. `SIGHUP` re-reads `clients.json` and
+//! swaps the in-memory table.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -31,6 +34,7 @@ use futures_util::FutureExt;
 use compio::BufResult;
 use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use compio::net::{UnixListener, UnixStream};
+use compio::runtime::CancelToken;
 use tracing::{info, warn};
 
 use crate::config::{ClientsFile, Config, SandboxMode};
@@ -90,7 +94,15 @@ pub struct SharedState {
     pub stunnel_pidfile: PathBuf,
     pub start_time: SystemTime,
     pub inflight: Cell<usize>,
-    pub shutting_down: Cell<bool>,
+    /// Cancelled by the signal-watcher task on SIGTERM/SIGINT. The
+    /// accept loop races on it; the admin loop checks
+    /// `is_cancelled()` to refuse new connections post-shutdown.
+    pub shutdown: CancelToken,
+    /// Set by the signal-watcher task before it cancels `shutdown`.
+    /// Read by the `evt=shutdown` log line. Default `"SIGTERM"` —
+    /// shouldn't be observed unless cancel is triggered by some
+    /// future non-signal path.
+    pub signal_name: Cell<&'static str>,
 }
 
 /// RAII increment of `state.inflight`. Drop decrements. Wrapping a
@@ -130,7 +142,8 @@ pub async fn run(cfg: &Config, config_path: &Path) -> Result<(), DaemonError> {
         stunnel_pidfile: cfg.stunnel.pidfile.clone(),
         start_time: SystemTime::now(),
         inflight: Cell::new(0),
-        shutting_down: Cell::new(false),
+        shutdown: CancelToken::new(),
+        signal_name: Cell::new("SIGTERM"),
     });
 
     let listen_path = &cfg.listen.socket;
@@ -166,6 +179,8 @@ pub async fn run(cfg: &Config, config_path: &Path) -> Result<(), DaemonError> {
     );
 
     let admin_state = state.clone();
+    // detach: compio cancels a JoinHandle on drop; this background
+    // loop must outlive the handle.
     compio::runtime::spawn(async move {
         if let Err(e) = crate::admin::run_admin_loop(admin_listener, admin_state).await {
             tracing::error!(error = %e, "admin loop exited");
@@ -198,6 +213,8 @@ pub async fn run(cfg: &Config, config_path: &Path) -> Result<(), DaemonError> {
     // SIGHUP — re-read clients.json and swap the in-memory table.
     let hup_state = state.clone();
     let hup_path = cfg.clients.file.clone();
+    // detach: compio cancels a JoinHandle on drop; the reload loop
+    // must outlive the handle.
     compio::runtime::spawn(async move {
         let sig = rustix::process::Signal::HUP.as_raw();
         loop {
@@ -209,17 +226,33 @@ pub async fn run(cfg: &Config, config_path: &Path) -> Result<(), DaemonError> {
     })
     .detach();
 
-    // Main accept loop, racing against SIGTERM / SIGINT.
-    let sigterm_fut = compio::signal::unix::signal(rustix::process::Signal::TERM.as_raw());
-    let sigint_fut = compio::signal::unix::signal(rustix::process::Signal::INT.as_raw());
-    futures_util::pin_mut!(sigterm_fut, sigint_fut);
+    // SIGTERM / SIGINT watcher: races the two and triggers the
+    // shutdown CancelToken. Pulled out of the accept loop so the
+    // loop only races accept against the token.
+    let signal_state = state.clone();
+    // detach: same reason as the admin/SIGHUP loops.
+    compio::runtime::spawn(async move {
+        let term_fut = compio::signal::unix::signal(rustix::process::Signal::TERM.as_raw());
+        let int_fut = compio::signal::unix::signal(rustix::process::Signal::INT.as_raw());
+        futures_util::pin_mut!(term_fut, int_fut);
+        let sig = futures_util::select! {
+            _ = term_fut.as_mut().fuse() => "SIGTERM",
+            _ = int_fut.as_mut().fuse() => "SIGINT",
+        };
+        signal_state.signal_name.set(sig);
+        signal_state.shutdown.clone().cancel();
+    })
+    .detach();
 
-    let signal_name = loop {
+    // Main accept loop, racing against the shutdown token.
+    loop {
         futures_util::select! {
             accept_res = listener.accept().fuse() => {
                 let (stream, _peer) = accept_res.map_err(DaemonError::Accept)?;
                 let req_id = ulid::Ulid::new().to_string();
                 let state = state.clone();
+                // detach: compio cancels a JoinHandle on drop; the
+                // per-connection task must outlive its handle.
                 compio::runtime::spawn(async move {
                     let _guard = DrainGuard::new(state.clone());
                     let _ = compio::time::timeout(
@@ -230,13 +263,14 @@ pub async fn run(cfg: &Config, config_path: &Path) -> Result<(), DaemonError> {
                 })
                 .detach();
             }
-            _ = sigterm_fut.as_mut().fuse() => break "SIGTERM",
-            _ = sigint_fut.as_mut().fuse() => break "SIGINT",
+            _ = state.shutdown.clone().wait().fuse() => break,
         }
-    };
+    }
 
-    // Shutdown drain.
-    state.shutting_down.set(true);
+    // Shutdown drain. The signal-watcher already cancelled
+    // `state.shutdown`; the admin loop will see this via
+    // `is_cancelled()` and refuse new connections.
+    let signal_name = state.signal_name.get();
     let initial_inflight = state.inflight.get();
     let drain_start = Instant::now();
     let drain_deadline = drain_start + Duration::from_secs(5);
@@ -404,12 +438,9 @@ async fn handle_connection(mut stream: UnixStream, req_id: String, state: Rc<Sha
     };
 
     // ------ Phase 2: IP → client lookup ------
-    let client = match state.clients.borrow().get(&parsed.source_ip).cloned() {
-        Some(c) => c,
-        None => {
-            warn!(req_id = %req_id, evt = "mint_denied", reason = "client_unknown", src_ip = %parsed.source_ip);
-            return;
-        }
+    let Some(client) = state.clients.borrow().get(&parsed.source_ip).cloned() else {
+        warn!(req_id = %req_id, evt = "mint_denied", reason = "client_unknown", src_ip = %parsed.source_ip);
+        return;
     };
     info!(req_id = %req_id, evt = "accept", src_ip = %parsed.source_ip, client = %client.name);
 
@@ -437,12 +468,9 @@ async fn handle_connection(mut stream: UnixStream, req_id: String, state: Rc<Sha
     };
 
     // ------ Phase 4: host dispatch ------
-    let provider = match state.providers.get(&request.host) {
-        Some(p) => p,
-        None => {
-            warn!(req_id = %req_id, evt = "mint_denied", reason = "unknown_host", host = %request.host, client = %client.name);
-            return;
-        }
+    let Some(provider) = state.providers.get(&request.host) else {
+        warn!(req_id = %req_id, evt = "mint_denied", reason = "unknown_host", host = %request.host, client = %client.name);
+        return;
     };
 
     // ------ Phase 5: mint ------
@@ -629,12 +657,18 @@ mod tests {
             stunnel_pidfile: PathBuf::new(),
             start_time: SystemTime::now(),
             inflight: Cell::new(0),
-            shutting_down: Cell::new(false),
+            shutdown: CancelToken::new(),
+            signal_name: Cell::new("SIGTERM"),
         })
     }
 
-    #[test]
-    fn drain_guard_increments_and_decrements() {
+    // empty_state() builds a SharedState that contains a
+    // CancelToken; CancelToken::new() panics outside a compio
+    // runtime context. Tests that touch SharedState therefore run
+    // under #[compio::test] even when their bodies do no I/O.
+
+    #[compio::test]
+    async fn drain_guard_increments_and_decrements() {
         let state = empty_state();
         assert_eq!(state.inflight.get(), 0);
         let g1 = DrainGuard::new(state.clone());
@@ -647,8 +681,8 @@ mod tests {
         assert_eq!(state.inflight.get(), 0);
     }
 
-    #[test]
-    fn reload_clients_swaps_in_place() {
+    #[compio::test]
+    async fn reload_clients_swaps_in_place() {
         let state = empty_state();
         // Seed with one entry.
         state.clients.borrow_mut().insert(

@@ -13,14 +13,20 @@
 //! IP from the PROXY v2 header is the daemon's only source of client
 //! identity.
 //!
-//! Lifecycle: `SIGTERM` and `SIGINT` are watched by a small spawned
-//! task that races the two and cancels `state.shutdown` (a compio
-//! `CancelToken`) once either fires. The accept loop races
-//! `listener.accept()` against `shutdown.wait()`; in-flight handlers
-//! drain with a 5-second deadline (PROTOCOLS.md § "Shutdown"); the
-//! admin and listen sockets are unlinked in that order; and
-//! `evt=shutdown` is logged. `SIGHUP` re-reads `clients.json` and
-//! swaps the in-memory table.
+//! Lifecycle: three long-lived tasks are spawned by `run`:
+//! the admin loop, the SIGHUP handler, and a SIGTERM/SIGINT watcher.
+//! Their `JoinHandle`s are kept in locals and `await`ed in `run`
+//! before it returns — structured concurrency, per the user's
+//! "all futures must return or have a timeout" rule. The watcher
+//! triggers `state.shutdown` (a compio `CancelToken`) on either
+//! signal; the admin loop and SIGHUP loop also race their work
+//! against `shutdown.wait()` and exit cleanly on cancellation. The
+//! per-connection handler tasks are the one exception: they keep
+//! `spawn(...).detach()` and are tracked via `DrainGuard` /
+//! `inflight: Cell<usize>` — bounded by `PER_CONNECTION_TIMEOUT`
+//! (5 s) and a 5 s drain deadline before sockets unlink. The
+//! `evt=shutdown` event is then logged. `SIGHUP` re-reads
+//! `clients.json` and swaps the in-memory table.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -95,20 +101,22 @@ pub struct SharedState {
     pub start_time: SystemTime,
     pub inflight: Cell<usize>,
     /// Cancelled by the signal-watcher task on SIGTERM/SIGINT. The
-    /// accept loop races on it; the admin loop checks
-    /// `is_cancelled()` to refuse new connections post-shutdown.
+    /// main accept loop and the admin loop both race `wait()` on
+    /// it; the SIGHUP loop does too. Loops exit cleanly on cancel,
+    /// letting their `JoinHandle`s be joined from `run`.
     pub shutdown: CancelToken,
-    /// Set by the signal-watcher task before it cancels `shutdown`.
-    /// Read by the `evt=shutdown` log line. Default `"SIGTERM"` —
-    /// shouldn't be observed unless cancel is triggered by some
-    /// future non-signal path.
-    pub signal_name: Cell<&'static str>,
 }
 
 /// RAII increment of `state.inflight`. Drop decrements. Wrapping a
 /// per-connection handler in one lets the shutdown coordinator wait
 /// for in-flight handlers to finish (up to a deadline) before
-/// unlinking sockets.
+/// unlinking sockets. Effectively a hand-rolled WaitGroup over the
+/// unbounded stream of per-connection tasks — compio does not ship
+/// a `JoinSet`-style primitive. A future refactor could replace
+/// this counter with `futures::stream::FuturesUnordered<JoinHandle<()>>`
+/// for true structured concurrency on the per-connection layer; the
+/// counter + drain deadline already satisfies the
+/// "must return or have a timeout" rule, so the swap is deferred.
 pub struct DrainGuard(Rc<SharedState>);
 
 impl DrainGuard {
@@ -143,7 +151,6 @@ pub async fn run(cfg: &Config, config_path: &Path) -> Result<(), DaemonError> {
         start_time: SystemTime::now(),
         inflight: Cell::new(0),
         shutdown: CancelToken::new(),
-        signal_name: Cell::new("SIGTERM"),
     });
 
     let listen_path = &cfg.listen.socket;
@@ -178,15 +185,15 @@ pub async fn run(cfg: &Config, config_path: &Path) -> Result<(), DaemonError> {
         "daemon started"
     );
 
+    // Admin loop: held as a JoinHandle and awaited after the
+    // accept loop exits. The admin loop itself selects on
+    // `state.shutdown.wait()` so it terminates cleanly.
     let admin_state = state.clone();
-    // detach: compio cancels a JoinHandle on drop; this background
-    // loop must outlive the handle.
-    compio::runtime::spawn(async move {
+    let admin_handle = compio::runtime::spawn(async move {
         if let Err(e) = crate::admin::run_admin_loop(admin_listener, admin_state).await {
             tracing::error!(error = %e, "admin loop exited");
         }
-    })
-    .detach();
+    });
 
     // Startup selfcheck — soft fail per PROTOCOLS.md step 6.
     for (host, provider) in &state.providers {
@@ -210,49 +217,65 @@ pub async fn run(cfg: &Config, config_path: &Path) -> Result<(), DaemonError> {
         }
     }
 
-    // SIGHUP — re-read clients.json and swap the in-memory table.
+    // SIGHUP handler: held as a JoinHandle, also race-aware so
+    // shutdown lets it exit. compio::signal::unix::signal is
+    // one-shot, so we call it inside the loop.
     let hup_state = state.clone();
     let hup_path = cfg.clients.file.clone();
-    // detach: compio cancels a JoinHandle on drop; the reload loop
-    // must outlive the handle.
-    compio::runtime::spawn(async move {
+    let hup_shutdown = state.shutdown.clone();
+    let sighup_handle = compio::runtime::spawn(async move {
         let sig = rustix::process::Signal::HUP.as_raw();
         loop {
-            if compio::signal::unix::signal(sig).await.is_err() {
-                break;
+            futures_util::select! {
+                res = compio::signal::unix::signal(sig).fuse() => {
+                    if res.is_err() {
+                        break;
+                    }
+                    reload_clients(&hup_state, &hup_path);
+                }
+                _ = hup_shutdown.clone().wait().fuse() => break,
             }
-            reload_clients(&hup_state, &hup_path);
         }
-    })
-    .detach();
+    });
 
-    // SIGTERM / SIGINT watcher: races the two and triggers the
-    // shutdown CancelToken. Pulled out of the accept loop so the
-    // loop only races accept against the token.
-    let signal_state = state.clone();
-    // detach: same reason as the admin/SIGHUP loops.
-    compio::runtime::spawn(async move {
+    // SIGTERM / SIGINT watcher: races the two, cancels shutdown,
+    // and returns the signal name back to `run` via its JoinHandle.
+    // No side-channel needed.
+    let watcher_shutdown = state.shutdown.clone();
+    let signal_watcher = compio::runtime::spawn(async move {
         let term_fut = compio::signal::unix::signal(rustix::process::Signal::TERM.as_raw());
         let int_fut = compio::signal::unix::signal(rustix::process::Signal::INT.as_raw());
         futures_util::pin_mut!(term_fut, int_fut);
-        let sig = futures_util::select! {
+        let sig: &'static str = futures_util::select! {
             _ = term_fut.as_mut().fuse() => "SIGTERM",
             _ = int_fut.as_mut().fuse() => "SIGINT",
         };
-        signal_state.signal_name.set(sig);
-        signal_state.shutdown.clone().cancel();
-    })
-    .detach();
+        watcher_shutdown.cancel();
+        sig
+    });
 
-    // Main accept loop, racing against the shutdown token.
+    // Main accept loop, racing accept against the shutdown token.
+    // Shape matches Apache iggy's tcp_listener.rs.
     loop {
         futures_util::select! {
             accept_res = listener.accept().fuse() => {
                 let (stream, _peer) = accept_res.map_err(DaemonError::Accept)?;
+                // Race: accept can become ready at the same instant
+                // shutdown fires. Drop the connection rather than
+                // start a handler we won't drain. iggy does the same
+                // defensive check (`shard.is_shutting_down()`).
+                if state.shutdown.is_cancelled() {
+                    drop(stream);
+                    continue;
+                }
                 let req_id = ulid::Ulid::new().to_string();
                 let state = state.clone();
-                // detach: compio cancels a JoinHandle on drop; the
-                // per-connection task must outlive its handle.
+                // Per-connection handler. Detach + DrainGuard is
+                // the deliberate exception to join-everything:
+                // the work is bounded by PER_CONNECTION_TIMEOUT (5 s),
+                // shutdown waits via the drain loop below (also 5 s),
+                // and compio doesn't ship a JoinSet. See DrainGuard
+                // docs for the deferred FuturesUnordered swap.
                 compio::runtime::spawn(async move {
                     let _guard = DrainGuard::new(state.clone());
                     let _ = compio::time::timeout(
@@ -267,10 +290,8 @@ pub async fn run(cfg: &Config, config_path: &Path) -> Result<(), DaemonError> {
         }
     }
 
-    // Shutdown drain. The signal-watcher already cancelled
-    // `state.shutdown`; the admin loop will see this via
-    // `is_cancelled()` and refuse new connections.
-    let signal_name = state.signal_name.get();
+    // Drain in-flight per-connection handlers (listen-side and
+    // admin-side share the same counter). Bounded by deadline.
     let initial_inflight = state.inflight.get();
     let drain_start = Instant::now();
     let drain_deadline = drain_start + Duration::from_secs(5);
@@ -280,6 +301,17 @@ pub async fn run(cfg: &Config, config_path: &Path) -> Result<(), DaemonError> {
     let drain_ms = drain_start.elapsed().as_millis() as u64;
     let remaining = state.inflight.get();
     let inflight_drained = initial_inflight.saturating_sub(remaining);
+
+    // Join the three long-lived tasks. By this point
+    // `state.shutdown` has been cancelled, so admin and sighup
+    // will exit at their next select! poll; the watcher already
+    // returned the signal name. JoinHandle::await returns
+    // `Result<T, JoinError>`; the only way the watcher's
+    // JoinError fires is a runtime panic, which would have killed
+    // us already — fall back to "SIGTERM" defensively.
+    let signal_name: &'static str = signal_watcher.await.unwrap_or("SIGTERM");
+    let _ = admin_handle.await;
+    let _ = sighup_handle.await;
 
     // PROTOCOLS.md step 3: "Close the admin socket and the listen
     // socket (unlinking them)." — admin first, then listen.
@@ -658,7 +690,6 @@ mod tests {
             start_time: SystemTime::now(),
             inflight: Cell::new(0),
             shutdown: CancelToken::new(),
-            signal_name: Cell::new("SIGTERM"),
         })
     }
 

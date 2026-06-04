@@ -30,6 +30,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use compio::BufResult;
 use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use compio::net::{UnixListener, UnixStream};
+use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -171,19 +172,34 @@ pub async fn run_admin_loop(
     state: Rc<SharedState>,
 ) -> Result<(), AdminError> {
     loop {
-        let (stream, _peer) = listener.accept().await.map_err(AdminError::Accept)?;
-        if state.shutdown.is_cancelled() {
-            drop(stream);
-            continue;
+        futures_util::select! {
+            accept_res = listener.accept().fuse() => {
+                let (stream, _peer) = accept_res.map_err(AdminError::Accept)?;
+                // Same defensive race-check as the main accept loop.
+                if state.shutdown.is_cancelled() {
+                    drop(stream);
+                    continue;
+                }
+                let state = state.clone();
+                // Per-connection handler: detach + DrainGuard. Same
+                // rationale as the listener-side handler in
+                // daemon.rs — bounded by PER_CONNECTION_TIMEOUT,
+                // tracked via the shared inflight counter, drained
+                // with deadline at shutdown.
+                compio::runtime::spawn(async move {
+                    let _guard = crate::daemon::DrainGuard::new(state.clone());
+                    let _ = compio::time::timeout(
+                        PER_CONNECTION_TIMEOUT,
+                        handle_admin(stream, state),
+                    )
+                    .await;
+                })
+                .detach();
+            }
+            _ = state.shutdown.clone().wait().fuse() => break,
         }
-        let state = state.clone();
-        compio::runtime::spawn(async move {
-            let _guard = crate::daemon::DrainGuard::new(state.clone());
-            let _ =
-                compio::time::timeout(PER_CONNECTION_TIMEOUT, handle_admin(stream, state)).await;
-        })
-        .detach();
     }
+    Ok(())
 }
 
 async fn handle_admin(mut stream: UnixStream, state: Rc<SharedState>) {

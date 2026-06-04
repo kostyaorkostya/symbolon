@@ -241,6 +241,8 @@ src/
     github.rs          # GitHub: JWT, repo-ID resolve, mint
 tests/
   integration.rs       # wiremock-rs against provider APIs
+fuzz/                  # cargo-fuzz subproject (nightly-pinned)
+  fuzz_targets/        # parser harnesses (security tooling)
 ```
 
 ## Concurrency notes
@@ -276,6 +278,47 @@ For CPU work, two options:
 For long-but-async work, sprinkle explicit yield points via
 `compio_runtime`'s yield helpers (tokio's analogue is
 `tokio::task::yield_now().await`).
+
+## Security tooling
+
+**Miri** is not used. The codebase has exactly one `unsafe` block
+(in a `src/sandbox.rs` test calling `libc::kill`); production code
+is entirely safe Rust where Miri has nothing to find. Compio's
+io_uring backend additionally cannot run under Miri (no shim for
+the submission/completion queue model), so the ~28 `#[compio::test]`
+tests would be unrunnable regardless. Skipping miri.
+
+**Fuzzing** is set up for the two parsers that consume attacker-
+controlled bytes:
+
+- `gcb::proxy_protocol::parse` — PROXY v2 from stunnel. Identity
+  attestation depends on it (AGENTS.md invariant #7).
+- `gcb::git_credential::parse` — git-credential request block;
+  carries the CR/LF Clone2Leak defence (AGENTS.md invariant #12).
+
+Fuzz targets live under `fuzz/fuzz_targets/`. The `fuzz/` subproject
+pins nightly via its own `rust-toolchain.toml`; the main project
+stays on stable. Run ad-hoc:
+
+```sh
+cargo install cargo-fuzz   # one-shot, no project change
+cd fuzz
+cargo fuzz run git_credential_parse -- -max_total_time=600
+cargo fuzz run proxy_protocol_parse -- -max_total_time=600
+```
+
+(The `+nightly` switch isn't needed because `fuzz/rust-toolchain.toml`
+pins it.) The 10-minute budget is a baseline; longer runs find
+more. libFuzzer writes any crashing input to
+`fuzz/artifacts/<target>/` and exits non-zero. To reproduce:
+
+```sh
+cd fuzz
+cargo fuzz run git_credential_parse \
+  artifacts/git_credential_parse/<artifact-name>
+```
+
+No CI integration today — operator runs fuzz on demand.
 
 ## Out of scope (deferred)
 

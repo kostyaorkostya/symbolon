@@ -1,0 +1,31 @@
+[package]
+name = "gcb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.gcb]
+path = ".."
+
+# Prevent this crate from being workspaced into the parent project.
+[workspace]
+
+[[bin]]
+name = "git_credential_parse"
+path = "fuzz_targets/git_credential_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_protocol_parse"
+path = "fuzz_targets/proxy_protocol_parse.rs"
+test = false
+doc = false
+bench = false

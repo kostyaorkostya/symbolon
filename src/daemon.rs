@@ -254,9 +254,14 @@ impl Service {
             futures_util::select! {
                 accept_res = listener.accept().fuse() => {
                     let (stream, _peer) = accept_res.map_err(DaemonError::Accept)?;
-                    // Race: accept can become ready at the same instant
-                    // shutdown fires. Drop the connection rather than
-                    // start a handler we won't drain.
+                    // Race: shutdown.cancel() fired while accept was
+                    // already polled-ready in this same select!
+                    // iteration. Drop the stream rather than start
+                    // a handler we won't drain — the next loop
+                    // iteration's select! will pick the
+                    // shutdown.wait() arm and break. Net effect:
+                    // zero streams accepted after cancel; in-flight
+                    // handlers drain on their own timers.
                     if state.shutdown.is_cancelled() {
                         drop(stream);
                         continue;
@@ -364,13 +369,27 @@ fn apply_sandbox(cfg: &Config) -> Result<(), DaemonError> {
             PathBuf::from("/dev/urandom"),
         ],
         read_dirs,
+        // Files consulted by libc `getaddrinfo` for our single
+        // outbound HTTPS hostname (`api.github.com`). We resolve via
+        // the system resolver (cyper default) — hickory is deferred
+        // due to its tokio coupling, see AGENTS.md.
         resolv_files: [
+            // glibc + musl: DNS nameserver list and search domains.
             "/etc/resolv.conf",
+            // glibc + musl: static hostname→IP overrides; consulted
+            // before DNS depending on nsswitch order.
             "/etc/hosts",
+            // glibc: NSS module order (files vs dns vs mdns). musl
+            // ignores this file; safe to keep on the allowlist for
+            // glibc builds.
             "/etc/nsswitch.conf",
-            "/etc/host.conf",
+            // glibc: RFC 3484 address-sort preferences for the
+            // results getaddrinfo returns. musl ignores it.
             "/etc/gai.conf",
-            "/etc/services",
+            // /etc/host.conf and /etc/services intentionally NOT
+            // included: host.conf is legacy and ignored by modern
+            // libcs; /etc/services is for getservbyname (port-by-
+            // name) which we don't use — we pass numeric port 443.
         ]
         .iter()
         .map(PathBuf::from)
@@ -620,6 +639,12 @@ fn log_mint_error(
     }
 }
 
+// Per-iteration `Vec` allocation. For our traffic (<<1 mint/s) the
+// alloc cost is invisible relative to network RTT. If profiling
+// ever shows otherwise, iggy reuses a single
+// `BytesMut::with_capacity(...)` via `.clear()` across iterations
+// (see iggy/core/server/src/tcp/connection_handler.rs); compio's
+// `BufferPool` + `AsyncReadManaged` is the io_uring-native answer.
 async fn read_more(stream: &mut UnixStream, accumulated: &mut Vec<u8>) -> bool {
     let chunk = Vec::with_capacity(READ_CHUNK_BYTES);
     let BufResult(res, chunk) = stream.read(chunk).await;

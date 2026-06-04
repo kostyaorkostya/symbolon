@@ -12,6 +12,7 @@
 
 pub mod admin;
 pub mod config;
+pub mod cpu_worker;
 pub mod daemon;
 pub mod git_credential;
 pub mod loader;

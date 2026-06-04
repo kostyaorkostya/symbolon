@@ -230,6 +230,7 @@ src/
   main.rs              # entry; dispatches daemon vs CLI vs subcommands
   lib.rs               # crate-level docs, pub re-exports
   config.rs            # config.toml + clients.json parsing
+  cpu_worker.rs        # Dedicated OS thread for CPU-bound work
   git_credential.rs    # protocol parse/emit; CR/LF rejection mandatory
   proxy_protocol.rs    # PROXY v2 parsing
   daemon.rs            # accept loop, per-connection handler, signal handling
@@ -241,6 +242,40 @@ src/
 tests/
   integration.rs       # wiremock-rs against provider APIs
 ```
+
+## Concurrency notes
+
+Compio uses **cooperative scheduling**: tasks only yield at `.await`
+points. A long CPU-bound section without an `.await` blocks the
+single-threaded compio runtime and starves every other task. This
+is the same model Tokio uses (Tokio mitigates with per-task
+operation budgets — compio doesn't ship that yet).
+
+Goroutines differ: Go's runtime preempts via compile-time yield-
+point injection. Rust async can't, because the language doesn't
+expose that hook to executors. See
+[Tokio: Reducing tail latencies with automatic cooperative task yielding](https://tokio.rs/blog/2020-04-preemption)
+and [Async Rust: Cooperative vs Preemptive scheduling](https://kerkour.com/cooperative-vs-preemptive-scheduling).
+
+For CPU work, two options:
+
+- **Dedicated always-on thread** via the project-wide primitive
+  `crate::cpu_worker::CpuWorker`. Use when the work is recurring
+  and small (microseconds of communication overhead per call, no
+  thread-spawn churn). Construct as
+  `let worker = CpuWorker::new("descriptive-thread-name")?;` then
+  `worker.run(move || do_cpu_work()).await?`. The in-tree example
+  is `src/providers/github.rs::JwtSigner`, which holds an
+  `Arc<EncodingKey>` and dispatches each `sign_jwt_blocking` call
+  to a `gcb-jwt-signer`-named worker thread.
+- **`compio::runtime::spawn_blocking(f)`** for one-off CPU bursts.
+  Compio's pool lazily spawns up to 256 threads, 60 s idle reap.
+  Good fit when work is occasional; bad fit for high-frequency
+  recurring work (re-spawn cost dominates after each idle reap).
+
+For long-but-async work, sprinkle explicit yield points via
+`compio_runtime`'s yield helpers (tokio's analogue is
+`tokio::task::yield_now().await`).
 
 ## Out of scope (deferred)
 
@@ -274,9 +309,9 @@ Known omissions, not oversights:
   ([hickory-dns issue #2142](https://github.com/hickory-dns/hickory-dns/issues/2142)
   + multiple users-forum threads confirm no compio/async-std
   backend exists). AGENTS.md hard-NOTs tokio. The sandbox allowlist
-  therefore continues to include the six nameservice files
+  therefore continues to include four nameservice files
   (`/etc/resolv.conf`, `/etc/hosts`, `/etc/nsswitch.conf`,
-  `/etc/host.conf`, `/etc/gai.conf`, `/etc/services`) for libc
+  `/etc/gai.conf`) for libc
   `getaddrinfo`. Reopen when either (a) hickory ships a runtime-
   agnostic mode, (b) a compio-native DNS crate appears on crates.io,
   or (c) operator need is concrete enough to justify hand-rolling a
@@ -294,3 +329,12 @@ Known omissions, not oversights:
   lookup. At our traffic (<<1 mint/s) the natural failure/retry
   cycle covers IP rotation — no proactive resolver work needed.
   High-mint-rate deployments would want a connection-lifetime cap.
+- **Per-read buffer reuse.** Both `src/daemon.rs::read_more` and
+  `src/admin.rs::read_line` allocate a fresh `Vec` per read
+  iteration. Apache iggy reuses a `BytesMut::with_capacity` via
+  `.clear()` across iterations (see
+  `iggy/core/server/src/tcp/connection_handler.rs`). Compio also
+  offers `AsyncReadManaged` + `BufferPool` via io-uring's managed-
+  buffer support. At our traffic (<<1 mint/s) per-read allocation
+  cost is invisible relative to network RTT; revisit only if
+  profiling shows allocation in the critical path.

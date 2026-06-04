@@ -16,6 +16,7 @@ compio = { version = "0.19", features = [
   "time",
 ] }
 cyper = "0.9"
+futures-channel = "0.3"
 futures-util = "0.3.32"
 jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 landlock = "0.4.5"

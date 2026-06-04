@@ -959,6 +959,7 @@ dependencies = [
  "argh",
  "compio",
  "cyper",
+ "futures-channel",
  "futures-util",
  "jsonwebtoken",
  "landlock",

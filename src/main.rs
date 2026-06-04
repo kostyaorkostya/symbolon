@@ -73,6 +73,15 @@ async fn run_daemon(config_path: PathBuf) -> ExitCode {
 
     service.selfcheck().await;
 
+    // Lifecycle order: Service::bootstrap above already loaded
+    // config, built providers, bound BOTH Unix sockets (the kernel
+    // begins queueing incoming connections at bind time), and
+    // applied the sandbox. selfcheck just hit GitHub via HTTPS.
+    //
+    // Now we tell the init system we're ready. `service.run` below
+    // starts the accept loop; any connections the kernel queued
+    // between this notification and the first `accept()` syscall
+    // (microseconds) are processed normally.
     gcb::ready::notify(cfg.runtime.pidfile.as_deref()).await;
     tracing::info!(evt = "ready", pid = std::process::id());
 

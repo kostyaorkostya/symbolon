@@ -34,7 +34,7 @@ pub struct GitHubProvider {
     api_base: String,
     app_id: u64,
     installation_id: u64,
-    encoding_key: EncodingKey,
+    signer: JwtSigner,
     client: cyper::Client,
     user_agent: String,
     clock: fn() -> SystemTime,
@@ -66,6 +66,10 @@ pub enum GithubError {
     },
     #[error("failed to sign JWT")]
     JwtSign(#[source] jsonwebtoken::errors::Error),
+    #[error("failed to spawn JWT signer thread")]
+    SignerSpawn(#[source] std::io::Error),
+    #[error("JWT signer thread is no longer running")]
+    JwtSignerDead,
     #[error("HTTP transport error")]
     Http(#[source] cyper::Error),
     #[error("malformed response from {context}")]
@@ -147,12 +151,13 @@ impl GitHubProvider {
             .trim_end_matches('/')
             .to_string();
 
+        let signer = JwtSigner::new(encoding_key).map_err(GithubError::SignerSpawn)?;
         Ok(Self {
             host: cfg.host.clone(),
             api_base,
             app_id: cfg.app_id,
             installation_id: cfg.installation_id,
-            encoding_key,
+            signer,
             client: cyper::Client::new()?,
             user_agent: format!("gcb/{}", env!("CARGO_PKG_VERSION")),
             clock,
@@ -180,7 +185,7 @@ impl GitHubProvider {
     /// reachable at `api_base`. The reported App ID must match the
     /// configured one — a mismatch indicates a wrong key/App pairing.
     pub async fn selfcheck(&self) -> Result<SelfcheckOutcome, GithubError> {
-        let jwt = self.sign_jwt_now()?;
+        let jwt = self.sign_jwt_now().await?;
         let url = format!("{}/app", self.api_base);
         let resp = self
             .client
@@ -277,7 +282,7 @@ impl GitHubProvider {
     }
 
     async fn resolve_repo_id(&self, owner: &str, repo: &str) -> Result<u64, GithubError> {
-        let jwt = self.sign_jwt_now()?;
+        let jwt = self.sign_jwt_now().await?;
         let url = format!("{}/repos/{}/{}", self.api_base, owner, repo);
         let resp = self
             .client
@@ -311,7 +316,7 @@ impl GitHubProvider {
         repo_id: u64,
         path: &str,
     ) -> Result<(String, SystemTime), GithubError> {
-        let jwt = self.sign_jwt_now()?;
+        let jwt = self.sign_jwt_now().await?;
         let url = format!(
             "{}/app/installations/{}/access_tokens",
             self.api_base, self.installation_id
@@ -346,9 +351,9 @@ impl GitHubProvider {
         parse_mint_response(&bytes)
     }
 
-    fn sign_jwt_now(&self) -> Result<String, GithubError> {
+    async fn sign_jwt_now(&self) -> Result<String, GithubError> {
         let claims = build_claims((self.clock)(), self.app_id);
-        sign_jwt(&claims, &self.encoding_key)
+        self.signer.sign(claims).await
     }
 }
 
@@ -401,14 +406,50 @@ fn build_claims(now: SystemTime, app_id: u64) -> JwtClaims {
     }
 }
 
-fn sign_jwt(claims: &JwtClaims, key: &EncodingKey) -> Result<String, GithubError> {
-    // CPU: RSA-2048 signing blocks the compio runtime thread for
-    // ~1–2 ms per call. Acceptable at homelab traffic (≪ 1 mint/s).
-    // If mint throughput ever grows by orders of magnitude, wrap
-    // this in `compio::runtime::spawn_blocking` so it doesn't stall
-    // the accept loop.
+/// Synchronous JWT signing. RSA-2048 with the App's private key —
+/// ~1-2 ms per call on commodity hardware. NEVER call from the
+/// compio runtime thread directly; the `JwtSigner` worker thread
+/// is the only caller (plus a unit test).
+fn sign_jwt_blocking(claims: &JwtClaims, key: &EncodingKey) -> Result<String, GithubError> {
     let header = Header::new(Algorithm::RS256);
     jsonwebtoken::encode(&header, claims, key).map_err(GithubError::JwtSign)
+}
+
+/// Thin wrapper around [`crate::cpu_worker::CpuWorker`] that holds
+/// the App's `EncodingKey` and dispatches `sign_jwt_blocking` jobs
+/// to a dedicated `gcb-jwt-signer` OS thread.
+///
+/// The actual thread + mpsc + oneshot plumbing lives in
+/// `crate::cpu_worker`; this struct just owns the worker and the
+/// key, and gives callers a typed `sign(claims)` API.
+struct JwtSigner {
+    worker: crate::cpu_worker::CpuWorker,
+    // `Arc` so each `sign` call cheaply clones a handle into the
+    // closure shipped to the worker thread, without copying the
+    // key bytes.
+    key: std::sync::Arc<EncodingKey>,
+}
+
+impl JwtSigner {
+    fn new(key: EncodingKey) -> std::io::Result<Self> {
+        let worker = crate::cpu_worker::CpuWorker::new("gcb-jwt-signer")?;
+        Ok(Self {
+            worker,
+            key: std::sync::Arc::new(key),
+        })
+    }
+
+    async fn sign(&self, claims: JwtClaims) -> Result<String, GithubError> {
+        let key = std::sync::Arc::clone(&self.key);
+        match self
+            .worker
+            .run(move || sign_jwt_blocking(&claims, &key))
+            .await
+        {
+            Ok(res) => res,
+            Err(crate::cpu_worker::WorkerDead) => Err(GithubError::JwtSignerDead),
+        }
+    }
 }
 
 fn build_mint_body(repo_id: u64) -> Vec<u8> {
@@ -519,7 +560,7 @@ mod tests {
     fn sign_jwt_produces_three_parts() {
         let key = EncodingKey::from_rsa_pem(FIXTURE_PEM.as_bytes()).unwrap();
         let claims = build_claims(t(1_700_000_000), 42);
-        let token = sign_jwt(&claims, &key).unwrap();
+        let token = sign_jwt_blocking(&claims, &key).unwrap();
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3);
     }

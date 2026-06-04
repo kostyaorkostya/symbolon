@@ -176,7 +176,13 @@ pub async fn run_admin_loop(
         futures_util::select! {
             accept_res = listener.accept().fuse() => {
                 let (stream, _peer) = accept_res.map_err(AdminError::Accept)?;
-                // Same defensive race-check as the main accept loop.
+                // Race: shutdown.cancel() fired while accept was
+                // already polled-ready this select! iteration. Drop
+                // the stream; the next iteration breaks via the
+                // shutdown.wait() arm. Zero connections accepted
+                // after cancel; in-flight handlers drain on their
+                // own timers (see Service::run for the symmetric
+                // listener-side comment).
                 if state.shutdown.is_cancelled() {
                     drop(stream);
                     continue;
@@ -878,6 +884,11 @@ async fn sighup_stunnel(pidfile: &Path) -> Result<(), AdminError> {
     Ok(())
 }
 
+// Per-iteration `Vec` allocation. For the admin protocol's tiny
+// JSON requests this is invisible; iggy's `BytesMut::with_capacity`
+// + `.clear()` (or compio's `BufferPool` + `AsyncReadManaged`) is
+// the reuse pattern if it ever matters. See daemon.rs::read_more
+// for the symmetric comment.
 async fn read_line(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
     let mut accumulated = Vec::new();
     loop {

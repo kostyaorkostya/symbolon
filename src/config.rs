@@ -1,11 +1,11 @@
-//! Parsing and in-memory representation of `/etc/gcb/config.toml` and
-//! `/etc/gcb/clients.json`.
+//! Parsing and in-memory representation of `config.toml` and
+//! `clients.json`.
 //!
 //! Single responsibility: turn the on-disk schemas documented in
 //! `docs/PROTOCOLS.md` into typed Rust values, and reject unknown
-//! fields. All deserializers carry `#[serde(deny_unknown_fields)]`.
+//! fields. No filesystem access — that lives in `crate::loader`.
+//! All deserializers carry `#[serde(deny_unknown_fields)]`.
 
-use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
@@ -22,7 +22,25 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub security: SecurityConfig,
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
     pub provider: Providers,
+}
+
+/// `[runtime]` section. Optional knobs that don't fit elsewhere.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeConfig {
+    /// Optional pidfile path. When set, the daemon writes its PID
+    /// here once it's ready to serve (for OpenRC's
+    /// `command_background=yes` + `pidfile=...` convention). Under
+    /// systemd, leave unset and use `Type=notify` — sd_notify
+    /// READY=1 covers readiness without a pidfile.
+    ///
+    /// The parent directory of this path is added to the sandbox
+    /// write-allowlist automatically.
+    #[serde(default)]
+    pub pidfile: Option<PathBuf>,
 }
 
 /// `[listen]` section.
@@ -161,7 +179,7 @@ pub struct ClientEntry {
     pub note: Option<String>,
 }
 
-/// Errors returned by the config-loading entry points.
+/// Errors returned by config parsing.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     /// Reading the file from disk failed.
@@ -170,6 +188,13 @@ pub enum ConfigError {
         path: PathBuf,
         #[source]
         source: std::io::Error,
+    },
+    /// File bytes were not valid UTF-8.
+    #[error("file contents are not valid UTF-8: {}", path.display())]
+    Utf8 {
+        path: PathBuf,
+        #[source]
+        source: std::str::Utf8Error,
     },
     /// TOML deserialization failed.
     #[error("failed to parse {}", path.display())]
@@ -190,31 +215,16 @@ pub enum ConfigError {
     UnsupportedClientsVersion(u32),
 }
 
-/// Load and parse `config.toml`.
-pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
-    let text = fs::read_to_string(path).map_err(|source| ConfigError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    toml::from_str(&text).map_err(|source| ConfigError::Toml {
+/// Parse `config.toml` from a UTF-8 string.
+pub fn parse_config(text: &str, path: &Path) -> Result<Config, ConfigError> {
+    toml::from_str(text).map_err(|source| ConfigError::Toml {
         path: path.to_path_buf(),
         source,
     })
 }
 
-/// Load and parse `clients.json`.
-pub fn load_clients_file(path: &Path) -> Result<ClientsFile, ConfigError> {
-    let text = fs::read_to_string(path).map_err(|source| ConfigError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    parse_clients_file(&text, path)
-}
-
-/// Parse a `clients.json` body. Split from `load_clients_file` so the
-/// version-check branch is reachable from unit tests without touching
-/// the filesystem.
-fn parse_clients_file(text: &str, path: &Path) -> Result<ClientsFile, ConfigError> {
+/// Parse `clients.json` from a UTF-8 string. Validates schema version.
+pub fn parse_clients_file(text: &str, path: &Path) -> Result<ClientsFile, ConfigError> {
     let parsed: ClientsFile = serde_json::from_str(text).map_err(|source| ConfigError::Json {
         path: path.to_path_buf(),
         source,

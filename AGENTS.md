@@ -131,6 +131,11 @@ Pinned in `Cargo.toml`:
 - `libc` (raw syscall numbers and signal constants for the
   `seccompiler` BPF filter; transitively required by landlock and
   seccompiler anyway, so the explicit dep adds no surface.)
+- `sd-notify` (pure-Rust `sd_notify(READY=1)` so `Type=notify`
+  systemd units mark the service active when `src/ready.rs::notify`
+  fires. No-op outside systemd. Daemon code never imports this —
+  only `src/ready.rs` does, and `src/ready.rs` is called from
+  `src/main.rs`.)
 - `seccompiler` (Firecracker's pure-Rust seccomp-BPF compiler. The
   filter built in `src/sandbox.rs` returns `EPERM` for every
   `kill`/`tkill`/`tgkill`/`pidfd_send_signal`/`rt_sigqueueinfo`/
@@ -265,18 +270,27 @@ Known omissions, not oversights:
 - **Multiple instances of the same provider** (e.g. github.com +
   github.example.com on one broker). Section name `[provider.X]` is
   also the dispatch key; introduce a `kind` field if/when needed.
-- **Async DNS via `hickory-resolver` (optionally with DoH).** Today
-  the daemon uses the system resolver via libc `getaddrinfo`; the
-  sandbox allowlist therefore includes 6 nameservice files
+- **Async DNS via `hickory-resolver`.** Tokio-coupled
+  ([hickory-dns issue #2142](https://github.com/hickory-dns/hickory-dns/issues/2142)
+  + multiple users-forum threads confirm no compio/async-std
+  backend exists). AGENTS.md hard-NOTs tokio. The sandbox allowlist
+  therefore continues to include the six nameservice files
   (`/etc/resolv.conf`, `/etc/hosts`, `/etc/nsswitch.conf`,
-  `/etc/host.conf`, `/etc/gai.conf`, `/etc/services`). `cyper` 0.9
-  exposes a `hickory-dns` feature that swaps in `cyper-hickory` +
-  `hickory-resolver` for compio-native async DNS, optionally over
-  DoH. Skipped today because the win is aesthetic (drops 5 of 6
-  nameservice paths from the allowlist — `/etc/resolv.conf` is still
-  needed for the nameserver list) versus ~10 transitive deps plus a
-  0.1.0 glue crate, and the privacy / resolver-auth properties DoH
-  provides aren't part of the homelab threat model. Landlock has no
-  UDP rule type either, so DNS-over-UDP-53 is unrestricted today
-  anyway. Reopen if internal-DNS GHES or high-volume resolution
-  shows up.
+  `/etc/host.conf`, `/etc/gai.conf`, `/etc/services`) for libc
+  `getaddrinfo`. Reopen when either (a) hickory ships a runtime-
+  agnostic mode, (b) a compio-native DNS crate appears on crates.io,
+  or (c) operator need is concrete enough to justify hand-rolling a
+  tiny UDP stub resolver on `compio-net` (~150–250 LOC, A/AAAA
+  only). DoT/DoH are out of scope for our threat model regardless —
+  see PROTOCOLS.md for the rationale.
+- **Socket activation via `listen-fds` / `listenfd`.** systemd can
+  hand pre-bound sockets to the daemon; would eliminate our own
+  `UnixListener::bind` step under systemd. Real lifecycle redesign,
+  deferred.
+- **DNS re-resolution under IP rotation.** cyper's connection pool
+  caches established TLS connections; when GitHub's IPs rotate, a
+  pooled connection eventually fails, we surface `evt=provider_error`,
+  and the next mint opens a fresh connection with a fresh DNS
+  lookup. At our traffic (<<1 mint/s) the natural failure/retry
+  cycle covers IP rotation — no proactive resolver work needed.
+  High-mint-rate deployments would want a connection-lifetime cap.

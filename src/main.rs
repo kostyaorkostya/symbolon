@@ -9,7 +9,6 @@ use std::process::ExitCode;
 use argh::FromArgs;
 
 use gcb::admin::CliCommand;
-use gcb::config;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/gcb/config.toml";
 
@@ -17,14 +16,7 @@ const DEFAULT_CONFIG_PATH: &str = "/etc/gcb/config.toml";
 async fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
     let cmd_name = argv.first().map(String::as_str).unwrap_or("gcb");
-    let mut rest: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
-    // argh requires a subcommand; preserve the documented bare-`gcb`
-    // daemon contract by synthesising `daemon` when only --config (or
-    // nothing) is present. Anything else falls through to argh so it
-    // can error on unknown flags/subcommands as usual.
-    if no_subcommand_present(&rest) {
-        rest.push("daemon");
-    }
+    let rest: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
     let args = match Args::from_args(&[cmd_name], &rest) {
         Ok(a) => a,
         Err(early) => match early.status {
@@ -51,28 +43,8 @@ async fn main() -> ExitCode {
     }
 }
 
-fn no_subcommand_present(args: &[&str]) -> bool {
-    let mut i = 0;
-    while i < args.len() {
-        let a = args[i];
-        if a == "--config" {
-            // Skip the flag + its value; if missing, let argh produce
-            // the error rather than silently injecting `daemon`.
-            if i + 1 >= args.len() {
-                return false;
-            }
-            i += 2;
-        } else if a.starts_with("--config=") {
-            i += 1;
-        } else {
-            return false;
-        }
-    }
-    true
-}
-
 async fn run_daemon(config_path: PathBuf) -> ExitCode {
-    let cfg = match config::load_config(&config_path) {
+    let cfg = match gcb::loader::load_config(&config_path).await {
         Ok(c) => c,
         Err(e) => {
             eprintln!("gcb: {e}");
@@ -81,15 +53,52 @@ async fn run_daemon(config_path: PathBuf) -> ExitCode {
     };
     gcb::logging::setup_tracing(cfg.logging.level);
 
-    if let Err(e) = gcb::daemon::run(&cfg, &config_path).await {
-        tracing::error!(error = %e, "daemon exiting");
-        return ExitCode::from(1);
+    let shutdown = compio::runtime::CancelToken::new();
+    let shutdown_watcher = gcb::signals::spawn_shutdown_watcher(shutdown.clone());
+
+    let (service, listener, admin_listener) =
+        match gcb::daemon::Service::bootstrap(&cfg, &config_path, shutdown.clone()).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(error = %e, "bootstrap failed");
+                return ExitCode::from(1);
+            }
+        };
+
+    let sighup = gcb::signals::spawn_sighup_handler(
+        service.state_handle(),
+        cfg.clients.file.clone(),
+        shutdown.clone(),
+    );
+
+    service.selfcheck().await;
+
+    gcb::ready::notify(cfg.runtime.pidfile.as_deref()).await;
+    tracing::info!(evt = "ready", pid = std::process::id());
+
+    let run_result = service.run(listener, admin_listener).await;
+    let signal_name = shutdown_watcher.await.unwrap_or("SIGTERM");
+    let _ = sighup.await;
+
+    match run_result {
+        Ok(stats) => {
+            tracing::info!(
+                evt = "shutdown",
+                signal = signal_name,
+                inflight_drained = stats.inflight_drained,
+                drain_ms = stats.drain_ms,
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            tracing::error!(evt = "run_failed", signal = signal_name, error = %e);
+            ExitCode::from(1)
+        }
     }
-    ExitCode::SUCCESS
 }
 
 async fn run_cli(config_path: PathBuf, command: CliCommand) -> ExitCode {
-    let cfg = match config::load_config(&config_path) {
+    let cfg = match gcb::loader::load_config(&config_path).await {
         Ok(c) => c,
         Err(e) => {
             eprintln!("gcb: {e}");

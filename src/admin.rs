@@ -20,9 +20,7 @@
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
-use std::io::{Read, Write};
 use std::net::IpAddr;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -171,6 +169,9 @@ pub async fn run_admin_loop(
     listener: UnixListener,
     state: Rc<SharedState>,
 ) -> Result<(), AdminError> {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+
+    let mut handlers: FuturesUnordered<compio::runtime::JoinHandle<()>> = FuturesUnordered::new();
     loop {
         futures_util::select! {
             accept_res = listener.accept().fuse() => {
@@ -181,24 +182,27 @@ pub async fn run_admin_loop(
                     continue;
                 }
                 let state = state.clone();
-                // Per-connection handler: detach + DrainGuard. Same
-                // rationale as the listener-side handler in
-                // daemon.rs — bounded by PER_CONNECTION_TIMEOUT,
-                // tracked via the shared inflight counter, drained
-                // with deadline at shutdown.
-                compio::runtime::spawn(async move {
-                    let _guard = crate::daemon::DrainGuard::new(state.clone());
+                handlers.push(compio::runtime::spawn(async move {
                     let _ = compio::time::timeout(
                         PER_CONNECTION_TIMEOUT,
                         handle_admin(stream, state),
                     )
                     .await;
-                })
-                .detach();
+                }));
             }
+            // Prune completed handlers. Pending when empty.
+            _ = handlers.select_next_some() => {}
             _ = state.shutdown.clone().wait().fuse() => break,
         }
     }
+
+    // Drain in-flight admin handlers with deadline. Same shape as
+    // the listener-side drain in daemon.rs::Service::run.
+    let _ = compio::time::timeout(Duration::from_secs(5), async {
+        while handlers.next().await.is_some() {}
+    })
+    .await;
+
     Ok(())
 }
 
@@ -234,8 +238,8 @@ async fn dispatch(
             client,
             ip,
             note,
-        } => handle_enroll(state, provider, client, *ip, note.clone()),
-        Request::Revoke { provider, client } => handle_revoke(state, provider, client),
+        } => handle_enroll(state, provider, client, *ip, note.clone()).await,
+        Request::Revoke { provider, client } => handle_revoke(state, provider, client).await,
         Request::Mint {
             provider,
             client,
@@ -286,7 +290,7 @@ fn handle_list(state: &SharedState) -> serde_json::Value {
     serde_json::json!({ "ok": true, "clients": entries })
 }
 
-fn handle_enroll(
+async fn handle_enroll(
     state: &SharedState,
     provider: &str,
     client: &str,
@@ -328,22 +332,30 @@ fn handle_enroll(
         ));
     }
 
-    let key_bytes =
-        generate_psk_key().map_err(|e| error_response("internal", &format!("rng: {e}")))?;
+    let key_bytes = generate_psk_key()
+        .await
+        .map_err(|e| error_response("internal", &format!("rng: {e}")))?;
     let psk_hex = hex_encode(&key_bytes);
 
     // Update gcb.psk: read existing, append new line, atomic write.
-    let mut psk_entries =
-        read_psk_file(&state.psk_file_path).map_err(|e| error_response("internal", &e))?;
+    let mut psk_entries = read_psk_file(&state.psk_file_path)
+        .await
+        .map_err(|e| error_response("internal", &e))?;
     psk_entries.push((client.to_string(), psk_hex.clone()));
     let psk_content = render_psk_file(&psk_entries);
-    atomic_write(&state.psk_file_path, psk_content.as_bytes(), PSK_FILE_MODE)
-        .map_err(|e| error_response("internal", &format!("write psk: {e}")))?;
+    atomic_write(
+        &state.psk_file_path,
+        psk_content.into_bytes(),
+        PSK_FILE_MODE,
+    )
+    .await
+    .map_err(|e| error_response("internal", &format!("write psk: {e}")))?;
 
     // Update clients.json: read, append, atomic write.
     let enrolled_at = format_rfc3339_z(SystemTime::now());
-    let mut clients_doc =
-        read_clients_doc(&state.clients_file_path).map_err(|e| error_response("internal", &e))?;
+    let mut clients_doc = read_clients_doc(&state.clients_file_path)
+        .await
+        .map_err(|e| error_response("internal", &e))?;
     clients_doc.clients.push(StoredClient {
         name: client.to_string(),
         ip,
@@ -353,7 +365,8 @@ fn handle_enroll(
     });
     let clients_bytes = serde_json::to_vec_pretty(&clients_doc)
         .map_err(|e| error_response("internal", &format!("encode clients.json: {e}")))?;
-    atomic_write(&state.clients_file_path, &clients_bytes, CLIENTS_FILE_MODE)
+    atomic_write(&state.clients_file_path, clients_bytes, CLIENTS_FILE_MODE)
+        .await
         .map_err(|e| error_response("internal", &format!("write clients.json: {e}")))?;
 
     // Commit to in-memory state.
@@ -371,7 +384,7 @@ fn handle_enroll(
 
     // SIGHUP stunnel. A failure here is logged but does NOT undo the
     // enroll — operator notices via `gcb status` or stunnel logs.
-    if let Err(e) = sighup_stunnel(&state.stunnel_pidfile) {
+    if let Err(e) = sighup_stunnel(&state.stunnel_pidfile).await {
         warn!(evt = "stunnel_sighup_failed", error = %e);
     }
 
@@ -384,7 +397,7 @@ fn handle_enroll(
     }))
 }
 
-fn handle_revoke(
+async fn handle_revoke(
     state: &SharedState,
     provider: &str,
     client: &str,
@@ -414,25 +427,33 @@ fn handle_revoke(
     // Rewrite clients.json without the entry. (The single-provider
     // build always removes the whole entry; multi-provider revoke is
     // out of scope this session.)
-    let mut clients_doc =
-        read_clients_doc(&state.clients_file_path).map_err(|e| error_response("internal", &e))?;
+    let mut clients_doc = read_clients_doc(&state.clients_file_path)
+        .await
+        .map_err(|e| error_response("internal", &e))?;
     clients_doc.clients.retain(|c| c.name != client);
     let clients_bytes = serde_json::to_vec_pretty(&clients_doc)
         .map_err(|e| error_response("internal", &format!("encode clients.json: {e}")))?;
-    atomic_write(&state.clients_file_path, &clients_bytes, CLIENTS_FILE_MODE)
+    atomic_write(&state.clients_file_path, clients_bytes, CLIENTS_FILE_MODE)
+        .await
         .map_err(|e| error_response("internal", &format!("write clients.json: {e}")))?;
 
     // Rewrite gcb.psk without the matching identity.
-    let mut psk_entries =
-        read_psk_file(&state.psk_file_path).map_err(|e| error_response("internal", &e))?;
+    let mut psk_entries = read_psk_file(&state.psk_file_path)
+        .await
+        .map_err(|e| error_response("internal", &e))?;
     psk_entries.retain(|(ident, _)| ident != client);
     let psk_content = render_psk_file(&psk_entries);
-    atomic_write(&state.psk_file_path, psk_content.as_bytes(), PSK_FILE_MODE)
-        .map_err(|e| error_response("internal", &format!("write psk: {e}")))?;
+    atomic_write(
+        &state.psk_file_path,
+        psk_content.into_bytes(),
+        PSK_FILE_MODE,
+    )
+    .await
+    .map_err(|e| error_response("internal", &format!("write psk: {e}")))?;
 
     state.clients.borrow_mut().remove(&client_ip);
 
-    if let Err(e) = sighup_stunnel(&state.stunnel_pidfile) {
+    if let Err(e) = sighup_stunnel(&state.stunnel_pidfile).await {
         warn!(evt = "stunnel_sighup_failed", error = %e);
     }
 
@@ -708,16 +729,24 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-fn generate_psk_key() -> std::io::Result<[u8; 32]> {
-    let mut key = [0u8; 32];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut key)?;
-    Ok(key)
+async fn generate_psk_key() -> std::io::Result<[u8; 32]> {
+    use compio::io::AsyncReadAtExt;
+    let file = compio::fs::File::open("/dev/urandom").await?;
+    let buf = vec![0u8; 32];
+    let BufResult(res, buf) = file.read_exact_at(buf, 0).await;
+    res?;
+    let arr: [u8; 32] = buf
+        .try_into()
+        .map_err(|_| std::io::Error::other("short read from /dev/urandom"))?;
+    Ok(arr)
 }
 
-fn atomic_write(path: &Path, content: &[u8], mode: u32) -> std::io::Result<()> {
-    let dir = path.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
-    })?;
+async fn atomic_write(path: &Path, content: Vec<u8>, mode: u32) -> std::io::Result<()> {
+    use compio::io::AsyncWriteAtExt;
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent"))?
+        .to_path_buf();
     let base = path.file_name().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
     })?;
@@ -727,26 +756,33 @@ fn atomic_write(path: &Path, content: &[u8], mode: u32) -> std::io::Result<()> {
         ulid::Ulid::new()
     ));
     {
-        let mut f = std::fs::OpenOptions::new()
+        let mut f = compio::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(mode)
-            .open(&tmp)?;
-        f.write_all(content)?;
-        f.sync_all()?;
+            .open(&tmp)
+            .await?;
+        let BufResult(res, _) = f.write_all_at(content, 0).await;
+        res?;
+        f.sync_all().await?;
     }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = compio::fs::rename(&tmp, path).await {
+        let _ = compio::fs::remove_file(&tmp).await;
         return Err(e);
     }
-    std::fs::File::open(dir)?.sync_all()?;
+    // Parent-dir fsync: open the dir as a File and call sync_all.
+    // compio::fs::File::open defaults to O_RDONLY which is the right
+    // mode for fsync-only on a directory.
+    compio::fs::File::open(&dir).await?.sync_all().await?;
     Ok(())
 }
 
-fn read_psk_file(path: &Path) -> Result<Vec<(String, String)>, String> {
-    match std::fs::read_to_string(path) {
-        Ok(s) => {
+async fn read_psk_file(path: &Path) -> Result<Vec<(String, String)>, String> {
+    match compio::fs::read(path).await {
+        Ok(bytes) => {
+            let s = std::str::from_utf8(&bytes)
+                .map_err(|e| format!("psk file {} not utf-8: {e}", path.display()))?;
             let mut out = Vec::new();
             for line in s.lines() {
                 if line.is_empty() {
@@ -789,9 +825,11 @@ struct StoredClient {
     note: Option<String>,
 }
 
-fn read_clients_doc(path: &Path) -> Result<ClientsDoc, String> {
-    match std::fs::read_to_string(path) {
-        Ok(s) => serde_json::from_str(&s).map_err(|e| format!("parse {}: {e}", path.display())),
+async fn read_clients_doc(path: &Path) -> Result<ClientsDoc, String> {
+    match compio::fs::read(path).await {
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).map_err(|e| format!("parse {}: {e}", path.display()))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ClientsDoc {
             version: 1,
             clients: Vec::new(),
@@ -811,24 +849,17 @@ fn format_rfc3339_z(t: SystemTime) -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
-fn sighup_stunnel(pidfile: &Path) -> Result<(), AdminError> {
-    let raw = match std::fs::read_to_string(pidfile) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Tolerated for test setups and bootstrap; warn-level
-            // logging happens at the caller.
-            return Err(AdminError::StunnelPid {
-                path: pidfile.to_path_buf(),
-                source: e,
-            });
-        }
-        Err(source) => {
-            return Err(AdminError::StunnelPid {
-                path: pidfile.to_path_buf(),
-                source,
-            });
-        }
-    };
+async fn sighup_stunnel(pidfile: &Path) -> Result<(), AdminError> {
+    let bytes = compio::fs::read(pidfile)
+        .await
+        .map_err(|source| AdminError::StunnelPid {
+            path: pidfile.to_path_buf(),
+            source,
+        })?;
+    let raw = String::from_utf8(bytes).map_err(|e| AdminError::StunnelPid {
+        path: pidfile.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+    })?;
     let trimmed = raw.trim();
     let pid: i32 = trimmed.parse().map_err(|_| AdminError::StunnelPidParse {
         path: pidfile.to_path_buf(),
@@ -937,24 +968,28 @@ mod tests {
         assert!(!is_valid_client_name("över-äscii"));
     }
 
-    #[test]
-    fn atomic_write_round_trip_with_mode() {
+    #[compio::test]
+    async fn atomic_write_round_trip_with_mode() {
         let dir = std::env::temp_dir().join(format!("gcb-aw-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.bin");
-        atomic_write(&path, b"hello\n", 0o600).unwrap();
+        atomic_write(&path, b"hello\n".to_vec(), 0o600)
+            .await
+            .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"hello\n");
         let metadata = std::fs::metadata(&path).unwrap();
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
         // Overwrite.
-        atomic_write(&path, b"world\n", 0o640).unwrap();
+        atomic_write(&path, b"world\n".to_vec(), 0o640)
+            .await
+            .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"world\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn render_and_read_psk_round_trip() {
+    #[compio::test]
+    async fn render_and_read_psk_round_trip() {
         let entries = vec![
             ("vm-1".to_string(), "a1b2".to_string()),
             ("vm-2".to_string(), "ccdd".to_string()),
@@ -964,16 +999,18 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("gcb-psk-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("gcb.psk");
-        atomic_write(&path, rendered.as_bytes(), 0o600).unwrap();
-        let parsed = read_psk_file(&path).unwrap();
+        atomic_write(&path, rendered.into_bytes(), 0o600)
+            .await
+            .unwrap();
+        let parsed = read_psk_file(&path).await.unwrap();
         assert_eq!(parsed, entries);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn read_psk_file_missing_returns_empty() {
+    #[compio::test]
+    async fn read_psk_file_missing_returns_empty() {
         let path = std::env::temp_dir().join(format!("gcb-nope-{}", ulid::Ulid::new()));
-        assert!(read_psk_file(&path).unwrap().is_empty());
+        assert!(read_psk_file(&path).await.unwrap().is_empty());
     }
 
     #[test]

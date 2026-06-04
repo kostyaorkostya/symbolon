@@ -120,19 +120,20 @@ impl From<cyper::Error> for GithubError {
 }
 
 impl GitHubProvider {
-    pub fn new(cfg: &ProviderGithub) -> Result<Self, GithubError> {
-        Self::with_overrides(cfg, None, SystemTime::now)
+    pub async fn new(cfg: &ProviderGithub) -> Result<Self, GithubError> {
+        Self::with_overrides(cfg, None, SystemTime::now).await
     }
 
     /// Test-only ctor. External code should use [`new`].
     #[doc(hidden)]
-    pub fn with_overrides(
+    pub async fn with_overrides(
         cfg: &ProviderGithub,
         api_base_override: Option<String>,
         clock: fn() -> SystemTime,
     ) -> Result<Self, GithubError> {
-        let pem_bytes =
-            std::fs::read(&cfg.private_key_path).map_err(|source| GithubError::PemRead {
+        let pem_bytes = compio::fs::read(&cfg.private_key_path)
+            .await
+            .map_err(|source| GithubError::PemRead {
                 path: cfg.private_key_path.clone(),
                 source,
             })?;
@@ -401,6 +402,11 @@ fn build_claims(now: SystemTime, app_id: u64) -> JwtClaims {
 }
 
 fn sign_jwt(claims: &JwtClaims, key: &EncodingKey) -> Result<String, GithubError> {
+    // CPU: RSA-2048 signing blocks the compio runtime thread for
+    // ~1–2 ms per call. Acceptable at homelab traffic (≪ 1 mint/s).
+    // If mint throughput ever grows by orders of magnitude, wrap
+    // this in `compio::runtime::spawn_blocking` so it doesn't stall
+    // the accept loop.
     let header = Header::new(Algorithm::RS256);
     jsonwebtoken::encode(&header, claims, key).map_err(GithubError::JwtSign)
 }
@@ -625,8 +631,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn api_base_trailing_slash_stripped() {
+    #[compio::test]
+    async fn api_base_trailing_slash_stripped() {
         let cfg = ProviderGithub {
             host: "github.com".to_string(),
             api_base: "https://api.github.com/".to_string(),
@@ -634,7 +640,7 @@ mod tests {
             installation_id: 2,
             private_key_path: fixture_pem_path(),
         };
-        let p = GitHubProvider::new(&cfg).unwrap();
+        let p = GitHubProvider::new(&cfg).await.unwrap();
         assert_eq!(p.api_base, "https://api.github.com");
     }
 

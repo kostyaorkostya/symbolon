@@ -43,6 +43,18 @@ sandbox = "best_effort"
 # typically also need /etc/pki/tls/certs for OpenSSL CA roots.
 extra_read_dirs = []
 
+[runtime]
+# Optional pidfile. When set, the daemon writes its PID here once
+# it's ready to serve. Required for OpenRC's `command_background=yes`
+# + `pidfile=...` convention. Leave unset under systemd —
+# `Type=notify` + READY=1 covers readiness without a pidfile, and
+# modern systemd man pages discourage pidfiles when notify is
+# available.
+#
+# The parent directory of this path is added to the sandbox
+# write-allowlist automatically.
+pidfile = "/run/gcb/gcb.pid"
+
 [provider.github]
 # For github.com, keep defaults below.
 # For GitHub Enterprise Server, set:
@@ -376,6 +388,10 @@ line.
 | `cache_invalidated` | `provider`, `repo`, `cause` (`404` \| `ttl_expired`) |
 | `sandbox_applied` | `policy` (`required` \| `best_effort` \| `off`), `abi` (landlock ABI requested; `0` if off), `status` (`fully_enforced` \| `partially_enforced` \| `not_enforced` \| `off`), `fs`, `tcp`, `scope`, `seccomp` (bool per subsystem actually engaged) |
 | `sandbox_path_skipped` | `path`, `reason` (`enoent` \| `open_failed`), `error` (when applicable) — emitted at `debug` for nameservice / CA-bundle paths absent on this host |
+| `bootstrap` | `version`, `config_path`, `listen_socket`, `admin_socket` — emitted by `Service::bootstrap` once config is loaded and sockets are bound (before selfcheck and readiness) |
+| `ready` | `pid` — emitted by `main` after `service.selfcheck()` returns and `ready::notify` has sent `READY=1` to systemd (if applicable) and written the pidfile (if configured) |
+| `run_failed` | `signal`, `error` — emitted at `error` lvl by `main` when `Service::run` returns `Err`. Mutually exclusive with `shutdown` (one or the other fires) |
+| `ready_pidfile_write_failed` | `path`, `error` — emitted at `warn` lvl by `ready::notify` if the configured pidfile can't be written (typically a sandbox or permission issue) |
 
 `reason` values for `mint_denied`:
 `client_unknown | unknown_host | repo_not_accessible | provider_4xx | malformed_request`.

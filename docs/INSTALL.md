@@ -246,6 +246,7 @@ Persist via your distro's nftables service.
 #!/sbin/openrc-run
 name="gcb"
 command="/usr/local/bin/gcb"
+command_args="daemon"
 command_user="gcb:gcb"
 command_background=yes
 pidfile="/run/gcb/gcb.pid"
@@ -282,6 +283,33 @@ d /run/gcb 0750 gcb gcb -
 systemd-tmpfiles creates the directory at boot and on demand. Without
 this entry, the daemon will fail to start after a reboot with a
 permission error when binding its socket.
+
+A minimal systemd unit (`/etc/systemd/system/gcb.service`):
+
+```ini
+[Unit]
+Description=git credentials broker
+After=network-online.target stunnel.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/gcb daemon
+User=gcb
+Group=gcb
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`Type=notify` makes systemd wait for the daemon's `sd_notify(READY=1)`
+call before marking the service active. **Leave `[runtime] pidfile`
+unset in `config.toml` under systemd** — `Type=notify` covers
+readiness; modern systemd man pages discourage pidfiles when notify
+is available.
+
+OpenRC operators, by contrast, **must** set `[runtime] pidfile` to
+match the init script's `pidfile=` (see §3.9).
 
 ### 3.11 Verify
 

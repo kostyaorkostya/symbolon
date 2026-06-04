@@ -26,7 +26,7 @@ fn fixture_pem_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test_app_key.pem")
 }
 
-fn build_provider(api_base: String) -> GitHubProvider {
+async fn build_provider(api_base: String) -> GitHubProvider {
     let cfg = ProviderGithub {
         host: "github.com".to_string(),
         api_base,
@@ -34,7 +34,9 @@ fn build_provider(api_base: String) -> GitHubProvider {
         installation_id: INSTALLATION_ID,
         private_key_path: fixture_pem_path(),
     };
-    GitHubProvider::with_overrides(&cfg, None, SystemTime::now).unwrap()
+    GitHubProvider::with_overrides(&cfg, None, SystemTime::now)
+        .await
+        .unwrap()
 }
 
 fn repo_path() -> String {
@@ -77,7 +79,7 @@ async fn mint_happy_path() {
     mount_repo_ok(&server).await;
     mount_mint_ok(&server).await;
 
-    let provider = build_provider(server.uri());
+    let provider = build_provider(server.uri()).await;
     let outcome = provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
 
     assert_eq!(outcome.response.username, "x-access-token");
@@ -112,7 +114,7 @@ async fn mint_uses_cached_repo_id() {
         .mount(&server)
         .await;
 
-    let provider = build_provider(server.uri());
+    let provider = build_provider(server.uri()).await;
     provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
     provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
     // MockServer's drop verifies `.expect(N)` counts.
@@ -140,7 +142,7 @@ async fn mint_request_headers_and_body_exact() {
         .mount(&server)
         .await;
 
-    let provider = build_provider(server.uri());
+    let provider = build_provider(server.uri()).await;
     provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
 }
 
@@ -153,7 +155,7 @@ async fn resolve_returns_404() {
         .mount(&server)
         .await;
 
-    let provider = build_provider(server.uri());
+    let provider = build_provider(server.uri()).await;
     let err = provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap_err();
     assert!(
         matches!(err, GithubError::RepoNotFound { ref path } if path == &format!("{OWNER}/{REPO}"))
@@ -170,7 +172,7 @@ async fn mint_returns_401() {
         .mount(&server)
         .await;
 
-    let provider = build_provider(server.uri());
+    let provider = build_provider(server.uri()).await;
     assert!(matches!(
         provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap_err(),
         GithubError::Unauthorized
@@ -187,7 +189,7 @@ async fn mint_returns_403() {
         .mount(&server)
         .await;
 
-    let provider = build_provider(server.uri());
+    let provider = build_provider(server.uri()).await;
     assert!(matches!(
         provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap_err(),
         GithubError::Forbidden
@@ -204,7 +206,7 @@ async fn mint_returns_429() {
         .mount(&server)
         .await;
 
-    let provider = build_provider(server.uri());
+    let provider = build_provider(server.uri()).await;
     assert!(matches!(
         provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap_err(),
         GithubError::RateLimited
@@ -221,7 +223,7 @@ async fn mint_returns_500() {
         .mount(&server)
         .await;
 
-    let provider = build_provider(server.uri());
+    let provider = build_provider(server.uri()).await;
     assert!(matches!(
         provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap_err(),
         GithubError::ServerError(500)
@@ -253,7 +255,7 @@ async fn mint_invalidates_on_404() {
         .mount_as_scoped(&server)
         .await;
 
-    let provider = build_provider(server.uri());
+    let provider = build_provider(server.uri()).await;
     provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
 
     drop(first_post);
@@ -303,7 +305,7 @@ mod daemon_e2e {
     use compio::net::UnixStream;
     use gcb::config::{
         AdminConfig, ClientsConfig, Config, ListenConfig, LogLevel, LoggingConfig, Providers,
-        SandboxMode, SecurityConfig, StunnelConfig,
+        RuntimeConfig, SandboxMode, SecurityConfig, StunnelConfig,
     };
 
     const PROXY_V2_SIGNATURE: [u8; 12] = [
@@ -388,6 +390,7 @@ mod daemon_e2e {
                 sandbox: SandboxMode::Off,
                 extra_read_dirs: vec![],
             },
+            runtime: RuntimeConfig::default(),
             provider: Providers {
                 github: Some(ProviderGithub {
                     host: "github.com".to_string(),
@@ -558,7 +561,7 @@ mod admin_e2e {
     use compio::net::UnixStream;
     use gcb::config::{
         AdminConfig, ClientsConfig, Config, ListenConfig, LogLevel, LoggingConfig, Providers,
-        SandboxMode, SecurityConfig, StunnelConfig,
+        RuntimeConfig, SandboxMode, SecurityConfig, StunnelConfig,
     };
     use serde_json::Value;
 
@@ -584,6 +587,7 @@ mod admin_e2e {
                 sandbox: SandboxMode::Off,
                 extra_read_dirs: vec![],
             },
+            runtime: RuntimeConfig::default(),
             provider: Providers {
                 github: Some(ProviderGithub {
                     host: "github.com".to_string(),

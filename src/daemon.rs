@@ -28,7 +28,7 @@
 //! `evt=shutdown` event is then logged. `SIGHUP` re-reads
 //! `clients.json` and swaps the in-memory table.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -36,6 +36,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::FutureExt;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 
 use compio::BufResult;
 use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -98,233 +99,254 @@ pub struct SharedState {
     pub psk_file_path: PathBuf,
     pub clients_file_path: PathBuf,
     pub stunnel_pidfile: PathBuf,
+    pub listen_socket_path: PathBuf,
+    pub admin_socket_path: PathBuf,
     pub start_time: SystemTime,
-    pub inflight: Cell<usize>,
-    /// Cancelled by the signal-watcher task on SIGTERM/SIGINT. The
-    /// main accept loop and the admin loop both race `wait()` on
-    /// it; the SIGHUP loop does too. Loops exit cleanly on cancel,
-    /// letting their `JoinHandle`s be joined from `run`.
+    /// Cancelled by `crate::signals` watchers on SIGTERM/SIGINT. The
+    /// main accept loop and the admin loop both race `wait()` on it;
+    /// the SIGHUP loop does too. Loops exit cleanly on cancel,
+    /// letting their `JoinHandle`s be joined.
     pub shutdown: CancelToken,
 }
 
-/// RAII increment of `state.inflight`. Drop decrements. Wrapping a
-/// per-connection handler in one lets the shutdown coordinator wait
-/// for in-flight handlers to finish (up to a deadline) before
-/// unlinking sockets. Effectively a hand-rolled WaitGroup over the
-/// unbounded stream of per-connection tasks — compio does not ship
-/// a `JoinSet`-style primitive. A future refactor could replace
-/// this counter with `futures::stream::FuturesUnordered<JoinHandle<()>>`
-/// for true structured concurrency on the per-connection layer; the
-/// counter + drain deadline already satisfies the
-/// "must return or have a timeout" rule, so the swap is deferred.
-pub struct DrainGuard(Rc<SharedState>);
-
-impl DrainGuard {
-    pub fn new(state: Rc<SharedState>) -> Self {
-        state.inflight.set(state.inflight.get() + 1);
-        Self(state)
-    }
+/// Statistics returned from `Service::run` so main can log the
+/// final `evt=shutdown` event.
+pub struct RunStats {
+    pub drain_ms: u64,
+    pub inflight_drained: usize,
 }
 
-impl Drop for DrainGuard {
-    fn drop(&mut self) {
-        self.0.inflight.set(self.0.inflight.get().saturating_sub(1));
-    }
+/// The running daemon: business logic only. Knows nothing about
+/// signals, sd_notify, or pidfiles — main wires those.
+pub struct Service {
+    state: Rc<SharedState>,
 }
 
-pub async fn run(cfg: &Config, config_path: &Path) -> Result<(), DaemonError> {
-    let clients_file = crate::config::load_clients_file(&cfg.clients.file)?;
-    let clients_table = build_clients_table(clients_file)?;
+impl Service {
+    /// Bootstrap: load clients.json, build providers (reads PEM),
+    /// bind both Unix sockets, apply the sandbox. Returns the
+    /// service plus the two bound listeners; main owns and passes
+    /// them back into `run`.
+    pub async fn bootstrap(
+        cfg: &Config,
+        config_path: &Path,
+        shutdown: CancelToken,
+    ) -> Result<(Self, UnixListener, UnixListener), DaemonError> {
+        let clients_file = crate::loader::load_clients_file(&cfg.clients.file).await?;
+        let clients_table = build_clients_table(clients_file)?;
 
-    let mut providers: HashMap<String, GitHubProvider> = HashMap::new();
-    if let Some(gh) = &cfg.provider.github {
-        let provider = GitHubProvider::new(gh)?;
-        providers.insert(gh.host.clone(), provider);
+        let mut providers: HashMap<String, GitHubProvider> = HashMap::new();
+        if let Some(gh) = &cfg.provider.github {
+            let provider = GitHubProvider::new(gh).await?;
+            providers.insert(gh.host.clone(), provider);
+        }
+
+        let state = Rc::new(SharedState {
+            clients: RefCell::new(clients_table),
+            providers,
+            psk_file_path: cfg.stunnel.psk_file.clone(),
+            clients_file_path: cfg.clients.file.clone(),
+            stunnel_pidfile: cfg.stunnel.pidfile.clone(),
+            listen_socket_path: cfg.listen.socket.clone(),
+            admin_socket_path: cfg.admin.socket_path.clone(),
+            start_time: SystemTime::now(),
+            shutdown,
+        });
+
+        let listen_path = &cfg.listen.socket;
+        unlink_stale(listen_path).await?;
+        let listener =
+            UnixListener::bind(listen_path)
+                .await
+                .map_err(|source| DaemonError::Bind {
+                    path: listen_path.clone(),
+                    source,
+                })?;
+
+        let admin_path = &cfg.admin.socket_path;
+        unlink_stale(admin_path).await?;
+        let admin_listener =
+            UnixListener::bind(admin_path)
+                .await
+                .map_err(|source| DaemonError::Bind {
+                    path: admin_path.clone(),
+                    source,
+                })?;
+
+        apply_sandbox(cfg)?;
+
+        info!(
+            evt = "bootstrap",
+            version = env!("CARGO_PKG_VERSION"),
+            config_path = %config_path.display(),
+            listen_socket = %listen_path.display(),
+            admin_socket = %admin_path.display(),
+        );
+
+        Ok((Self { state }, listener, admin_listener))
     }
 
-    let state = Rc::new(SharedState {
-        clients: RefCell::new(clients_table),
-        providers,
-        psk_file_path: cfg.stunnel.psk_file.clone(),
-        clients_file_path: cfg.clients.file.clone(),
-        stunnel_pidfile: cfg.stunnel.pidfile.clone(),
-        start_time: SystemTime::now(),
-        inflight: Cell::new(0),
-        shutdown: CancelToken::new(),
-    });
+    /// Clone the SharedState handle for use by external tasks
+    /// (e.g. the SIGHUP handler in `crate::signals`).
+    pub fn state_handle(&self) -> Rc<SharedState> {
+        self.state.clone()
+    }
 
-    let listen_path = &cfg.listen.socket;
-    unlink_stale(listen_path)?;
-    let listener = UnixListener::bind(listen_path)
-        .await
-        .map_err(|source| DaemonError::Bind {
-            path: listen_path.clone(),
-            source,
-        })?;
+    /// The cancel token shared across daemon loops. Main triggers
+    /// it via signals.
+    pub fn shutdown_token(&self) -> CancelToken {
+        self.state.shutdown.clone()
+    }
 
-    let admin_path = &cfg.admin.socket_path;
-    unlink_stale(admin_path)?;
-    let admin_listener =
-        UnixListener::bind(admin_path)
-            .await
-            .map_err(|source| DaemonError::Bind {
-                path: admin_path.clone(),
-                source,
-            })?;
-
-    apply_sandbox(cfg)?;
-
-    let provider_names: Vec<&str> = state.providers.keys().map(String::as_str).collect();
-    info!(
-        evt = "startup",
-        version = env!("CARGO_PKG_VERSION"),
-        config_path = %config_path.display(),
-        listen_socket = %listen_path.display(),
-        admin_socket = %admin_path.display(),
-        providers = ?provider_names,
-        "daemon started"
-    );
-
-    // Admin loop: held as a JoinHandle and awaited after the
-    // accept loop exits. The admin loop itself selects on
-    // `state.shutdown.wait()` so it terminates cleanly.
-    let admin_state = state.clone();
-    let admin_handle = compio::runtime::spawn(async move {
-        if let Err(e) = crate::admin::run_admin_loop(admin_listener, admin_state).await {
-            tracing::error!(error = %e, "admin loop exited");
-        }
-    });
-
-    // Startup selfcheck — soft fail per PROTOCOLS.md step 6.
-    for (host, provider) in &state.providers {
-        match provider.selfcheck().await {
-            Ok(outcome) => {
-                info!(
-                    evt = "selfcheck",
-                    provider = %host,
-                    ok = true,
-                    clock_skew_sec = outcome.clock_skew_sec,
-                );
-            }
-            Err(e) => {
-                warn!(
-                    evt = "selfcheck",
-                    provider = %host,
-                    ok = false,
-                    error = %e,
-                );
+    /// Per-provider startup selfcheck. Logs `evt=selfcheck` once per
+    /// provider and never returns Err (soft-fail per PROTOCOLS.md).
+    pub async fn selfcheck(&self) {
+        for (host, provider) in &self.state.providers {
+            match provider.selfcheck().await {
+                Ok(outcome) => {
+                    info!(
+                        evt = "selfcheck",
+                        provider = %host,
+                        ok = true,
+                        clock_skew_sec = outcome.clock_skew_sec,
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        evt = "selfcheck",
+                        provider = %host,
+                        ok = false,
+                        error = %e,
+                    );
+                }
             }
         }
     }
 
-    // SIGHUP handler: held as a JoinHandle, also race-aware so
-    // shutdown lets it exit. compio::signal::unix::signal is
-    // one-shot, so we call it inside the loop.
-    let hup_state = state.clone();
-    let hup_path = cfg.clients.file.clone();
-    let hup_shutdown = state.shutdown.clone();
-    let sighup_handle = compio::runtime::spawn(async move {
-        let sig = rustix::process::Signal::HUP.as_raw();
+    /// Run the accept loops until `shutdown` is cancelled, drain
+    /// per-connection handlers, unlink sockets. Returns RunStats.
+    pub async fn run(
+        self,
+        listener: UnixListener,
+        admin_listener: UnixListener,
+    ) -> Result<RunStats, DaemonError> {
+        let state = self.state;
+        let provider_names: Vec<&str> = state.providers.keys().map(String::as_str).collect();
+        info!(evt = "startup", providers = ?provider_names, "daemon started");
+
+        // Admin loop: held as a JoinHandle and awaited after the
+        // accept loop exits. The admin loop itself selects on
+        // `state.shutdown.wait()` so it terminates cleanly.
+        let admin_state = state.clone();
+        let admin_handle = compio::runtime::spawn(async move {
+            if let Err(e) = crate::admin::run_admin_loop(admin_listener, admin_state).await {
+                tracing::error!(error = %e, "admin loop exited");
+            }
+        });
+
+        // Main accept loop, racing accept against the shutdown token.
+        // Per-connection JoinHandles live in a FuturesUnordered;
+        // select_next_some prunes completed ones in-loop so memory
+        // stays bounded. Shape matches Apache iggy's tcp_listener.rs.
+        let mut handlers: FuturesUnordered<compio::runtime::JoinHandle<()>> =
+            FuturesUnordered::new();
         loop {
             futures_util::select! {
-                res = compio::signal::unix::signal(sig).fuse() => {
-                    if res.is_err() {
-                        break;
+                accept_res = listener.accept().fuse() => {
+                    let (stream, _peer) = accept_res.map_err(DaemonError::Accept)?;
+                    // Race: accept can become ready at the same instant
+                    // shutdown fires. Drop the connection rather than
+                    // start a handler we won't drain.
+                    if state.shutdown.is_cancelled() {
+                        drop(stream);
+                        continue;
                     }
-                    reload_clients(&hup_state, &hup_path);
+                    let req_id = ulid::Ulid::new().to_string();
+                    let state = state.clone();
+                    handlers.push(compio::runtime::spawn(async move {
+                        let _ = compio::time::timeout(
+                            PER_CONNECTION_TIMEOUT,
+                            handle_connection(stream, req_id, state),
+                        )
+                        .await;
+                    }));
                 }
-                _ = hup_shutdown.clone().wait().fuse() => break,
+                // Prune completed handlers in-loop. select_next_some
+                // yields Pending when the stream is empty, so this
+                // arm doesn't fire-spin.
+                _ = handlers.select_next_some() => {}
+                _ = state.shutdown.clone().wait().fuse() => break,
             }
         }
-    });
 
-    // SIGTERM / SIGINT watcher: races the two, cancels shutdown,
-    // and returns the signal name back to `run` via its JoinHandle.
-    // No side-channel needed.
-    let watcher_shutdown = state.shutdown.clone();
-    let signal_watcher = compio::runtime::spawn(async move {
-        let term_fut = compio::signal::unix::signal(rustix::process::Signal::TERM.as_raw());
-        let int_fut = compio::signal::unix::signal(rustix::process::Signal::INT.as_raw());
-        futures_util::pin_mut!(term_fut, int_fut);
-        let sig: &'static str = futures_util::select! {
-            _ = term_fut.as_mut().fuse() => "SIGTERM",
-            _ = int_fut.as_mut().fuse() => "SIGINT",
-        };
-        watcher_shutdown.cancel();
-        sig
-    });
-
-    // Main accept loop, racing accept against the shutdown token.
-    // Shape matches Apache iggy's tcp_listener.rs.
-    loop {
-        futures_util::select! {
-            accept_res = listener.accept().fuse() => {
-                let (stream, _peer) = accept_res.map_err(DaemonError::Accept)?;
-                // Race: accept can become ready at the same instant
-                // shutdown fires. Drop the connection rather than
-                // start a handler we won't drain. iggy does the same
-                // defensive check (`shard.is_shutting_down()`).
-                if state.shutdown.is_cancelled() {
-                    drop(stream);
-                    continue;
-                }
-                let req_id = ulid::Ulid::new().to_string();
-                let state = state.clone();
-                // Per-connection handler. Detach + DrainGuard is
-                // the deliberate exception to join-everything:
-                // the work is bounded by PER_CONNECTION_TIMEOUT (5 s),
-                // shutdown waits via the drain loop below (also 5 s),
-                // and compio doesn't ship a JoinSet. See DrainGuard
-                // docs for the deferred FuturesUnordered swap.
-                compio::runtime::spawn(async move {
-                    let _guard = DrainGuard::new(state.clone());
-                    let _ = compio::time::timeout(
-                        PER_CONNECTION_TIMEOUT,
-                        handle_connection(stream, req_id, state),
-                    )
-                    .await;
-                })
-                .detach();
+        // Drain in-flight per-connection handlers with a deadline.
+        // On timeout, dropping `handlers` cancels the still-in-flight
+        // tasks via compio's JoinHandle drop=cancel semantics.
+        let drain_start = Instant::now();
+        let mut drained = 0usize;
+        let _ = compio::time::timeout(Duration::from_secs(5), async {
+            while handlers.next().await.is_some() {
+                drained += 1;
             }
-            _ = state.shutdown.clone().wait().fuse() => break,
+        })
+        .await;
+        let drain_ms = drain_start.elapsed().as_millis() as u64;
+        let inflight_drained = drained;
+        // `handlers` dropped at end of scope; remaining tasks cancelled.
+
+        // Join admin loop. By this point shutdown is cancelled so
+        // its inner select! will break.
+        let _ = admin_handle.await;
+
+        // PROTOCOLS.md step 3: "Close the admin socket and the listen
+        // socket (unlinking them)." — admin first, then listen.
+        let _ = compio::fs::remove_file(&state.admin_socket_path).await;
+        let _ = compio::fs::remove_file(&state.listen_socket_path).await;
+
+        Ok(RunStats {
+            drain_ms,
+            inflight_drained,
+        })
+    }
+}
+
+/// Convenience wrapper: bootstrap the service with a fresh
+/// `CancelToken`, then run until the token fires. The daemon itself
+/// does NOT install signal handlers — production code (main) wires
+/// signals into the token via `crate::signals`. This wrapper is for
+/// tests and other callers that want to drive the lifecycle by
+/// dropping the spawned task.
+pub async fn run(cfg: &Config, config_path: &Path) -> Result<RunStats, DaemonError> {
+    let shutdown = CancelToken::new();
+    let (service, listener, admin_listener) =
+        Service::bootstrap(cfg, config_path, shutdown).await?;
+    service.run(listener, admin_listener).await
+}
+
+/// Reload `clients.json` and atomically swap the in-memory table.
+/// Public so `crate::signals` can call it on SIGHUP.
+pub async fn reload_clients(state: &Rc<SharedState>, path: &Path) {
+    let file = match crate::loader::load_clients_file(path).await {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(evt = "config_reload", triggered_by = "sighup", ok = false, error = %e);
+            return;
         }
-    }
-
-    // Drain in-flight per-connection handlers (listen-side and
-    // admin-side share the same counter). Bounded by deadline.
-    let initial_inflight = state.inflight.get();
-    let drain_start = Instant::now();
-    let drain_deadline = drain_start + Duration::from_secs(5);
-    while state.inflight.get() > 0 && Instant::now() < drain_deadline {
-        compio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let drain_ms = drain_start.elapsed().as_millis() as u64;
-    let remaining = state.inflight.get();
-    let inflight_drained = initial_inflight.saturating_sub(remaining);
-
-    // Join the three long-lived tasks. By this point
-    // `state.shutdown` has been cancelled, so admin and sighup
-    // will exit at their next select! poll; the watcher already
-    // returned the signal name. JoinHandle::await returns
-    // `Result<T, JoinError>`; the only way the watcher's
-    // JoinError fires is a runtime panic, which would have killed
-    // us already — fall back to "SIGTERM" defensively.
-    let signal_name: &'static str = signal_watcher.await.unwrap_or("SIGTERM");
-    let _ = admin_handle.await;
-    let _ = sighup_handle.await;
-
-    // PROTOCOLS.md step 3: "Close the admin socket and the listen
-    // socket (unlinking them)." — admin first, then listen.
-    let _ = std::fs::remove_file(&cfg.admin.socket_path);
-    let _ = std::fs::remove_file(&cfg.listen.socket);
-
+    };
+    let new_table = match build_clients_table(file) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(evt = "config_reload", triggered_by = "sighup", ok = false, error = %e);
+            return;
+        }
+    };
+    let count = new_table.len();
+    *state.clients.borrow_mut() = new_table;
     info!(
-        evt = "shutdown",
-        signal = signal_name,
-        inflight_drained = inflight_drained,
-        drain_ms = drain_ms,
+        evt = "config_reload",
+        triggered_by = "sighup",
+        client_count = count
     );
-    Ok(())
 }
 
 fn apply_sandbox(cfg: &Config) -> Result<(), DaemonError> {
@@ -353,18 +375,31 @@ fn apply_sandbox(cfg: &Config) -> Result<(), DaemonError> {
         .iter()
         .map(PathBuf::from)
         .collect(),
-        write_parent_dirs: vec![
-            cfg.clients
-                .file
-                .parent()
-                .ok_or(DaemonError::NoParentDir("clients.file"))?
-                .to_path_buf(),
-            cfg.stunnel
-                .psk_file
-                .parent()
-                .ok_or(DaemonError::NoParentDir("stunnel.psk_file"))?
-                .to_path_buf(),
-        ],
+        write_parent_dirs: {
+            let mut v = vec![
+                cfg.clients
+                    .file
+                    .parent()
+                    .ok_or(DaemonError::NoParentDir("clients.file"))?
+                    .to_path_buf(),
+                cfg.stunnel
+                    .psk_file
+                    .parent()
+                    .ok_or(DaemonError::NoParentDir("stunnel.psk_file"))?
+                    .to_path_buf(),
+            ];
+            // ready::notify writes the pidfile post-sandbox; its
+            // parent dir must be in the write-allowlist.
+            if let Some(pidfile) = cfg.runtime.pidfile.as_ref() {
+                v.push(
+                    pidfile
+                        .parent()
+                        .ok_or(DaemonError::NoParentDir("runtime.pidfile"))?
+                        .to_path_buf(),
+                );
+            }
+            v
+        },
     };
     let outcome = sandbox::apply(level, &paths)?;
     let degraded = !matches!(outcome.status, "fully_enforced" | "off");
@@ -394,32 +429,8 @@ fn apply_sandbox(cfg: &Config) -> Result<(), DaemonError> {
     Ok(())
 }
 
-fn reload_clients(state: &Rc<SharedState>, path: &Path) {
-    let file = match crate::config::load_clients_file(path) {
-        Ok(f) => f,
-        Err(e) => {
-            warn!(evt = "config_reload", triggered_by = "sighup", ok = false, error = %e);
-            return;
-        }
-    };
-    let new_table = match build_clients_table(file) {
-        Ok(t) => t,
-        Err(e) => {
-            warn!(evt = "config_reload", triggered_by = "sighup", ok = false, error = %e);
-            return;
-        }
-    };
-    let count = new_table.len();
-    *state.clients.borrow_mut() = new_table;
-    info!(
-        evt = "config_reload",
-        triggered_by = "sighup",
-        client_count = count
-    );
-}
-
-fn unlink_stale(path: &Path) -> Result<(), DaemonError> {
-    match std::fs::remove_file(path) {
+async fn unlink_stale(path: &Path) -> Result<(), DaemonError> {
+    match compio::fs::remove_file(path).await {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(source) => Err(DaemonError::Unlink {
@@ -687,8 +698,9 @@ mod tests {
             psk_file_path: PathBuf::new(),
             clients_file_path: PathBuf::new(),
             stunnel_pidfile: PathBuf::new(),
+            listen_socket_path: PathBuf::new(),
+            admin_socket_path: PathBuf::new(),
             start_time: SystemTime::now(),
-            inflight: Cell::new(0),
             shutdown: CancelToken::new(),
         })
     }
@@ -697,20 +709,6 @@ mod tests {
     // CancelToken; CancelToken::new() panics outside a compio
     // runtime context. Tests that touch SharedState therefore run
     // under #[compio::test] even when their bodies do no I/O.
-
-    #[compio::test]
-    async fn drain_guard_increments_and_decrements() {
-        let state = empty_state();
-        assert_eq!(state.inflight.get(), 0);
-        let g1 = DrainGuard::new(state.clone());
-        assert_eq!(state.inflight.get(), 1);
-        let g2 = DrainGuard::new(state.clone());
-        assert_eq!(state.inflight.get(), 2);
-        drop(g1);
-        assert_eq!(state.inflight.get(), 1);
-        drop(g2);
-        assert_eq!(state.inflight.get(), 0);
-    }
 
     #[compio::test]
     async fn reload_clients_swaps_in_place() {
@@ -732,7 +730,7 @@ mod tests {
             r#"{"version":1,"clients":[{"name":"new","ip":"10.0.0.2","providers":["github"],"enrolled_at":"y","note":null}]}"#,
         )
         .unwrap();
-        reload_clients(&state, &path);
+        reload_clients(&state, &path).await;
         let borrow = state.clients.borrow();
         assert_eq!(borrow.len(), 1);
         assert!(borrow.get(&"10.0.0.2".parse().unwrap()).is_some());

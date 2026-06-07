@@ -11,10 +11,14 @@ compio = { version = "0.19", features = [
   "io-uring",
   "macros",
   "net",
+  "ring",
   "runtime",
   "time",
 ] }
-cyper = { version = "0.9", default-features = false, features = ["rustls", "http2"] }
+cyper = { version = "0.9", default-features = false, features = [
+  "rustls",
+  "http2",
+] }
 futures-channel = "0.3"
 futures-util = "0.3.32"
 humantime-serde = "1.1.1"
@@ -36,7 +40,7 @@ time = { version = "0.3.47", default-features = false, features = [
   "formatting",
 ] }
 toml = "1.1.2"
-tracing = "0.1.44"
+tracing = { version = "0.1.44", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "0.3.23", features = ["json"] }
 ulid = "1.2.1"
 url = { version = "2.5.8", default-features = false }
@@ -47,6 +51,12 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+# RFC 3127 `trim-paths` would be the cleaner mechanism but is
+# unstable as of Cargo 1.96. Path remapping is configured via
+# `.cargo/config.toml` (RUSTFLAGS --remap-path-prefix) instead;
+# Cargo excludes that flag from the metadata hash so it doesn't
+# cause rebuild churn. Move to `trim-paths = "all"` once it
+# stabilises.
 
 [dev-dependencies]
 wiremock = "0.6.5"

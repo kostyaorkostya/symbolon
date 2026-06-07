@@ -34,7 +34,33 @@ cargo zigbuild --release --locked --target aarch64-unknown-linux-musl
 
 Release: `git tag v0.1.0 && git push --tags` triggers
 `.github/workflows/release.yml`, which builds both musl targets and
-publishes binaries with sha256 attestations.
+publishes binaries with sha256 attestations. The workflow:
+
+1. Sets `CARGO_BUILD_RUSTFLAGS` with `--remap-path-scope=all` +
+   `--remap-path-prefix` entries derived from `$HOME` and
+   `$GITHUB_WORKSPACE`, so released binaries carry no runner
+   filesystem paths in their tracing callsite metadata.
+2. Builds via `cargo zigbuild` (zig provides the cross C
+   toolchain for musl).
+3. Post-strips `.eh_frame` / `.eh_frame_hdr` /
+   `.gcc_except_table` (safe with `panic = "abort"`; saves
+   ~390 KB).
+
+To reproduce a shipping-shaped local artefact (with the same
+path-trim and post-strip applied), use the in-tree helper:
+
+```
+./scripts/release-build.sh                            # x86_64-musl
+./scripts/release-build.sh aarch64-unknown-linux-musl
+```
+
+The script uses `$HOME` + `git rev-parse --show-toplevel`, so it
+works for any user with no hardcoded paths in the repo.
+
+Bare `cargo zigbuild --release --locked --target <triple>` (no
+script) also works and is what AGENTS expects you to be able to
+invoke; the resulting binary just won't have the path-trim
+applied. Dev binaries aren't shipped, so this is fine.
 
 ## Threat model
 
@@ -95,9 +121,11 @@ accessible to the App.
 - No `tokio`, `async-std`, `smol`. `compio` only.
 - No HTTP server framework (`axum`, `cyper-axum`). Plain TCP via
   `compio-net`.
-- No direct use of TLS crates. `rustls` enters our binary
-  transitively via `cyper` for HTTPS to provider APIs; we never
-  `use rustls::...`.
+- No direct use of TLS crates. `rustls` enters our binary via
+  `cyper`'s `rustls` feature (which we explicitly enable; see
+  Dependencies) and the crypto provider (`ring`) via `compio`'s
+  `ring` feature. We never `use rustls::...` or `use ring::...`
+  in our own code.
 - No database. State is files.
 - No in-repo policy files (no Octo-STS, no `.github/*.yaml` trust).
 - No SSH transport for clients.
@@ -112,17 +140,23 @@ Pinned in `Cargo.toml`:
   `clap` for code-size and over hand-rolled parsing for maintainability.
   Daemon mode is preserved on bare `gcb` by synthesising a hidden
   `daemon` subcommand in `main`; everything else is regular argh.)
-- `compio` with features `runtime,macros,net,fs,time,io-uring` (async
-  runtime; `macros` for `#[compio::main]`; `net`+`fs`+`time` for the
-  daemon surface; `io-uring` listed explicitly so a future change to
-  compio's default features can't silently disable it. The `signal`
-  feature is intentionally NOT enabled — we use signal-hook-registry
-  directly for permanent signal handlers; see `src/signals.rs`.)
-- `cyper` with feature `http2` (HTTPS client for provider APIs;
-  ALPN auto-negotiates h2 over TLS when the server advertises it
-  — api.github.com does — so an idle keep-alive connection from a
-  preceding resolve call is reused for the follow-up mint
-  without a fresh TLS handshake).
+- `compio` with features `runtime,macros,net,fs,time,io-uring,ring`
+  (async runtime; `macros` for `#[compio::main]`; `net`+`fs`+`time`
+  for the daemon surface; `io-uring` listed explicitly so a future
+  change to compio's default features can't silently disable it.
+  `ring` selects the rustls crypto provider via `compio-tls/ring`
+  — without it `cyper`'s `rustls` feature alone leaves rustls
+  unable to pick a provider at runtime and the first HTTPS call
+  panics. The `signal` feature is intentionally NOT enabled — we
+  use signal-hook-registry directly for permanent signal handlers;
+  see `src/signals.rs`.)
+- `cyper` with `default-features = false, features = ["rustls",
+  "http2"]` (HTTPS client for provider APIs. We turn off cyper's
+  `native-tls` default to keep the binary OpenSSL-free under musl,
+  and explicitly opt in to rustls — pure Rust, ALPN-driven h2 over
+  TLS so a keep-alive connection from a preceding resolve call is
+  reused for the follow-up mint without a fresh handshake. The
+  crypto provider (`ring`) is enabled via the `compio` dep above.)
 - `jsonwebtoken` with feature `rust_crypto` (App JWT; `rust_crypto`
   is mandatory in 10.x — without a crypto-provider feature the
   crate panics at sign-time. `rust_crypto` over `aws_lc_rs` keeps
@@ -155,11 +189,16 @@ Pinned in `Cargo.toml`:
   RFC2822 for the HTTP `Date` header in selfcheck, and RFC3339
   rendering of `enrolled_at` on enroll). Defaults disabled to
   strip the surface we don't use.
-- `tracing`, `tracing-subscriber` with `features = ["json"]`
-  (structured JSON logging via the built-in `fmt::Json`
-  formatter; configured in `src/logging.rs` with
-  `flatten_event(true)` so user-added fields like `evt` and
-  `req_id` appear as top-level JSON keys).
+- `tracing` with `features = ["release_max_level_info"]`,
+  `tracing-subscriber` with `features = ["json"]` (structured JSON
+  logging via the built-in `fmt::Json` formatter; configured in
+  `src/logging.rs` with `flatten_event(true)` so user-added fields
+  like `evt` and `req_id` appear as top-level JSON keys.
+  `release_max_level_info` compiles out every `debug!` / `trace!`
+  callsite in our code and our deps from release builds — h2 and
+  rustls in particular are heavily instrumented at those levels;
+  gating them saves measurable `.rodata` + `.text` weight at no
+  functional cost since we never log below info in production.)
 - `futures-util` (`select!` and `FutureExt::fuse()` for the
   accept-vs-signal race in `daemon::run`; compio's own examples
   pull it in the same way — see compio-0.18 `examples/tick.rs`).

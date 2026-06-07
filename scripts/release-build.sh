@@ -41,10 +41,31 @@ fi
 # Mirrors the CI workflow's Build step. --remap-path-scope=all is
 # required to cover macro-expanded paths (rust-lang/rust#83635);
 # without it the tracing callsite metadata keeps the full path.
+#
+# F2 size levers (all stable; safe to drop individually if a
+# future rustc/LLVM upgrade renames or removes them):
+#   --enable-machine-outliner           : hoist common instruction
+#       sequences into shared mini-functions.
+#   --enable-linkonceodr-outlining      : extend outliner to
+#       linkonceodr functions (where generic monomorphisations
+#       land — our biggest .text contributor per cargo bloat).
+#   --enable-global-merge-func          : LLVM 21 hash-based
+#       function deduplication (modern -mergefunc successor).
+#   --inline-threshold=50               : lower inline budget
+#       (default 225). HTTPS-RTT-bound daemon absorbs the tiny
+#       runtime cost invisibly.
+#   -Wl,--icf=safe                      : LLD identical-code-folding,
+#       safe variant (skips functions with significant address per
+#       rustc's unnamed_addr emission).
 export CARGO_BUILD_RUSTFLAGS="--remap-path-scope=all \
 ${CRATES_REMAP} \
 --remap-path-prefix=${HOME}/.rustup/toolchains/=tc/ \
---remap-path-prefix=${REPO}/=./"
+--remap-path-prefix=${REPO}/=./ \
+-C llvm-args=--enable-machine-outliner \
+-C llvm-args=--enable-linkonceodr-outlining \
+-C llvm-args=--enable-global-merge-func \
+-C llvm-args=--inline-threshold=50 \
+-C link-arg=-Wl,--icf=safe"
 
 cd "${REPO}"
 cargo zigbuild --release --locked --target "${TARGET}"

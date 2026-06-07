@@ -51,7 +51,26 @@ jobs:
       - name: Build
         run: |
           set -euo pipefail
-          export CARGO_BUILD_RUSTFLAGS="--remap-path-scope=all --remap-path-prefix=${HOME}/.cargo/registry/src/=cr/ --remap-path-prefix=${HOME}/.rustup/toolchains/=tc/ --remap-path-prefix=${GITHUB_WORKSPACE}/=./"
+          # Auto-discover the active crates.io registry-source
+          # directory. The `index.crates.io-<hash>/` segment is
+          # unstable (Cargo recently switched the hash algorithm
+          # to rustc-stable-hash and the dir name changed once
+          # already), so we glob it instead of hardcoding. ls -td
+          # picks the most recently used dir if multiple linger.
+          # Cargo must have been invoked at least once on this
+          # runner for this dir to exist — `actions/checkout`
+          # then `rustup target add` populates enough for the
+          # registry index to be created by the next cargo step;
+          # if not, fall back to a partial trim leaving the hash
+          # visible.
+          CARGO_REG_SRC="${CARGO_HOME:-${HOME}/.cargo}/registry/src"
+          INDEX_DIR="$(ls -td "${CARGO_REG_SRC}"/index.crates.io-* 2>/dev/null | head -1)"
+          if [ -n "${INDEX_DIR}" ] && [ -d "${INDEX_DIR}" ]; then
+            CRATES_REMAP="--remap-path-prefix=${INDEX_DIR}/=cr/"
+          else
+            CRATES_REMAP="--remap-path-prefix=${CARGO_REG_SRC}/="
+          fi
+          export CARGO_BUILD_RUSTFLAGS="--remap-path-scope=all ${CRATES_REMAP} --remap-path-prefix=${HOME}/.rustup/toolchains/=tc/ --remap-path-prefix=${GITHUB_WORKSPACE}/=./"
           cargo zigbuild --release --locked --target ${{ matrix.target }}
       # Drop stack-unwind tables. `panic = "abort"` in the release
       # profile means we never unwind, but rustc still emits

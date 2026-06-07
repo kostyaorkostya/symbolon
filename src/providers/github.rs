@@ -20,10 +20,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tracing::info;
 
+use crate::providers::jwt_rs256::{self, JwtSigningKey};
 use compio::runtime::CancelToken;
 use cyper::redirect;
 use futures_util::FutureExt;
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::Serialize;
 use time::OffsetDateTime;
@@ -93,10 +93,10 @@ pub enum GithubError {
     PemParse {
         path: PathBuf,
         #[source]
-        source: jsonwebtoken::errors::Error,
+        source: jwt_rs256::JwtError,
     },
     #[error("failed to sign JWT")]
-    JwtSign(#[source] jsonwebtoken::errors::Error),
+    JwtSign(#[source] jwt_rs256::JwtError),
     #[error("failed to spawn JWT signer thread")]
     SignerSpawn(#[source] std::io::Error),
     #[error("JWT signer thread is no longer running")]
@@ -173,28 +173,27 @@ impl From<cyper::Error> for GithubError {
 }
 
 impl GitHubProvider {
-    /// Load the App private key from disk and parse it into an
-    /// `EncodingKey`. Must run BEFORE the sandbox closes filesystem
-    /// access; the resulting `Arc` is then handed to [`new`] post-
-    /// sandbox along with the shared CpuWorker.
-    pub async fn load_key(cfg: &ProviderGithub) -> Result<Arc<EncodingKey>, GithubError> {
+    /// Load the App private key from disk and parse it into a
+    /// `JwtSigningKey`. Must run BEFORE the sandbox closes
+    /// filesystem access; the resulting `Arc` is then handed to
+    /// [`new`] post-sandbox along with the shared CpuWorker.
+    pub async fn load_key(cfg: &ProviderGithub) -> Result<Arc<JwtSigningKey>, GithubError> {
         let pem_bytes = compio::fs::read(&cfg.private_key_path)
             .await
             .map_err(|source| GithubError::PemRead {
                 path: cfg.private_key_path.clone(),
                 source,
             })?;
-        let key =
-            EncodingKey::from_rsa_pem(&pem_bytes).map_err(|source| GithubError::PemParse {
-                path: cfg.private_key_path.clone(),
-                source,
-            })?;
+        let key = JwtSigningKey::from_pem(&pem_bytes).map_err(|source| GithubError::PemParse {
+            path: cfg.private_key_path.clone(),
+            source,
+        })?;
         Ok(Arc::new(key))
     }
 
     pub fn new(
         cfg: &ProviderGithub,
-        key: Arc<EncodingKey>,
+        key: Arc<JwtSigningKey>,
         cpu_worker: Rc<CpuWorker>,
         cancel: CancelToken,
     ) -> Result<Self, GithubError> {
@@ -204,7 +203,7 @@ impl GitHubProvider {
     #[doc(hidden)]
     pub fn with_overrides(
         cfg: &ProviderGithub,
-        key: Arc<EncodingKey>,
+        key: Arc<JwtSigningKey>,
         cpu_worker: Rc<CpuWorker>,
         cancel: CancelToken,
         api_base_override: Option<String>,
@@ -887,20 +886,20 @@ fn build_claims(now: SystemTime, client_id: &str) -> JwtClaims {
 /// ~1-2 ms per call on commodity hardware. NEVER call from the
 /// compio runtime thread directly; the `JwtSigner` worker thread
 /// is the only caller (plus a unit test).
-fn sign_jwt_blocking(claims: &JwtClaims, key: &EncodingKey) -> Result<String, GithubError> {
-    let header = Header::new(Algorithm::RS256);
-    jsonwebtoken::encode(&header, claims, key).map_err(GithubError::JwtSign)
+fn sign_jwt_blocking(claims: &JwtClaims, key: &JwtSigningKey) -> Result<String, GithubError> {
+    key.sign_rs256(claims).map_err(GithubError::JwtSign)
 }
 
-/// Holds a shared [`CpuWorker`] handle and the App's `EncodingKey`,
-/// dispatching `sign_jwt_blocking` jobs to the worker thread. The
-/// worker is shared across all providers in the daemon and spawned
-/// once at Service init, after the sandbox is in place.
+/// Holds a shared [`CpuWorker`] handle and the App's
+/// `JwtSigningKey`, dispatching `sign_jwt_blocking` jobs to the
+/// worker thread. The worker is shared across all providers in
+/// the daemon and spawned once at Service init, after the sandbox
+/// is in place.
 struct JwtSigner {
     worker: Rc<CpuWorker>,
     // Arc so each sign call clones a handle into the closure shipped
     // to the worker thread without copying the key bytes.
-    key: Arc<EncodingKey>,
+    key: Arc<JwtSigningKey>,
 }
 
 impl JwtSigner {
@@ -1027,11 +1026,27 @@ mod tests {
 
     #[test]
     fn sign_jwt_produces_three_parts() {
-        let key = EncodingKey::from_rsa_pem(FIXTURE_PEM.as_bytes()).unwrap();
+        let key = JwtSigningKey::from_pem(FIXTURE_PEM.as_bytes()).unwrap();
         let claims = build_claims(t(1_700_000_000), "Iv1.test42");
         let token = sign_jwt_blocking(&claims, &key).unwrap();
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3);
+    }
+
+    /// Pin byte-equivalence with jsonwebtoken's prior output for
+    /// the same (claims, key). The post-swap implementation lives
+    /// in `crate::providers::jwt_rs256` and has its own copy of
+    /// this assertion; this one belongs to the github.rs path so
+    /// `sign_jwt_blocking` itself is exercised.
+    #[test]
+    fn sign_jwt_blocking_matches_jsonwebtoken_baseline() {
+        let key = JwtSigningKey::from_pem(FIXTURE_PEM.as_bytes()).unwrap();
+        let claims = build_claims(t(1_700_000_000), "Iv1.test42");
+        let token = sign_jwt_blocking(&claims, &key).unwrap();
+        assert_eq!(
+            token,
+            "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJJdjEudGVzdDQyIiwiaWF0IjoxNjk5OTk5OTQwLCJleHAiOjE3MDAwMDA1NDB9.yPTDonwO4souVu_3nk7Aq8ZbiAq3PBVLHRJ5J6B67JHmUxVh-yvIoXdQ8O_EAqj-H57GKRAo_b0nu6hQT_keD9-wB_ah8DC_ZqtV42S3jHACWAdEG066W1XdKUftU82QkdSM5hrpdg9OvFN6i7m0ObCJi3uJMWXYb8lY1LYJew0SWajBzLKQjw47Qmbq-AYiTgkdBoRfK5TrD64u6wd0aQCathxELkaiEacilUtU6ZH8jOQ_W5hYjjwxjTF7wbNWdx-v7M3yUSUn_01Sn9w2bTLeimsP4e81ydchLhIeJED4iF-j-QG_uBlhp0auwTPYqPaG6Zh-qhbkE0DJaV-log",
+        );
     }
 
     #[test]

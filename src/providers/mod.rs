@@ -7,3 +7,4 @@
 //! #1: one identity per (broker, provider).
 
 pub mod github;
+pub mod jwt_rs256;

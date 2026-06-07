@@ -20,11 +20,29 @@ TARGET="${1:-x86_64-unknown-linux-musl}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(dirname "${SCRIPT_DIR}")"
 
+# Auto-discover the active crates.io registry-source directory.
+# Cargo recently switched the hash algorithm to `rustc-stable-hash`
+# (per the Cargo changelog) and the
+# `index.crates.io-<hash>/` directory name changed once already;
+# globbing avoids hardcoding the current hash and breaking on the
+# next algorithm bump. `ls -td` picks the most recently used one
+# in case stale dirs from older cargo versions linger.
+CARGO_REG_SRC="${CARGO_HOME:-${HOME}/.cargo}/registry/src"
+INDEX_DIR="$(ls -td "${CARGO_REG_SRC}"/index.crates.io-* 2>/dev/null | head -1)"
+if [ -n "${INDEX_DIR}" ] && [ -d "${INDEX_DIR}" ]; then
+	CRATES_REMAP="--remap-path-prefix=${INDEX_DIR}/=cr/"
+else
+	# Registry not populated yet (fresh checkout). Fall back to
+	# trimming what we know about; the hash will remain visible
+	# but no usernames leak.
+	CRATES_REMAP="--remap-path-prefix=${CARGO_REG_SRC}/="
+fi
+
 # Mirrors the CI workflow's Build step. --remap-path-scope=all is
 # required to cover macro-expanded paths (rust-lang/rust#83635);
 # without it the tracing callsite metadata keeps the full path.
 export CARGO_BUILD_RUSTFLAGS="--remap-path-scope=all \
---remap-path-prefix=${HOME}/.cargo/registry/src/=cr/ \
+${CRATES_REMAP} \
 --remap-path-prefix=${HOME}/.rustup/toolchains/=tc/ \
 --remap-path-prefix=${REPO}/=./"
 

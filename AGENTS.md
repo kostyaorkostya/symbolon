@@ -157,10 +157,17 @@ Pinned in `Cargo.toml`:
   TLS so a keep-alive connection from a preceding resolve call is
   reused for the follow-up mint without a fresh handshake. The
   crypto provider (`ring`) is enabled via the `compio` dep above.)
-- `jsonwebtoken` with feature `rust_crypto` (App JWT; `rust_crypto`
-  is mandatory in 10.x — without a crypto-provider feature the
-  crate panics at sign-time. `rust_crypto` over `aws_lc_rs` keeps
-  the musl build pure-Rust with no C FFI.)
+- `rsa` + `sha2` (with `oid` feature) + `base64` — the trio
+  underneath `src/providers/jwt_rs256.rs`, our minimal RS256
+  signer. Replaces `jsonwebtoken`, whose monolithic `Algorithm`
+  enum kept ed25519-dalek / curve25519-dalek / p256 / p384 / hmac
+  in the binary even though we only call RS256; the linker can't
+  prove the unused enum arms unreachable. Byte-equivalence with
+  the prior jsonwebtoken output is pinned by
+  `tests::known_vector_matches_jsonwebtoken_baseline`. RSASSA-
+  PKCS1-v1_5 with SHA-256 is one of the most thoroughly specified
+  JOSE algorithms; the actual signing is a single `rsa::SigningKey`
+  call.
 - `landlock` (Linux LSM sandboxing for FS + TCP-connect + abstract-UDS
   scope at ABI 6. Applied in `src/sandbox.rs` after both Unix-domain
   sockets are bound and before the accept loop; gated by `[security]
@@ -189,16 +196,23 @@ Pinned in `Cargo.toml`:
   RFC2822 for the HTTP `Date` header in selfcheck, and RFC3339
   rendering of `enrolled_at` on enroll). Defaults disabled to
   strip the surface we don't use.
-- `tracing` with `features = ["release_max_level_info"]`,
-  `tracing-subscriber` with `features = ["json"]` (structured JSON
-  logging via the built-in `fmt::Json` formatter; configured in
+- `tracing` with `default-features = false, features = ["std",
+  "release_max_level_info"]`. `release_max_level_info` compiles
+  out every `debug!` / `trace!` callsite in our code and our
+  deps from release builds — h2 and rustls in particular are
+  heavily instrumented at those levels; gating them saves
+  measurable `.rodata` + `.text` weight at no functional cost
+  since we never log below info in production. `attributes` is
+  dropped because we don't use `#[instrument]` anywhere.
+- `tracing-subscriber` with `default-features = false, features =
+  ["fmt", "json", "registry", "std"]` (structured JSON logging
+  via the built-in `fmt::Json` formatter; configured in
   `src/logging.rs` with `flatten_event(true)` so user-added fields
-  like `evt` and `req_id` appear as top-level JSON keys.
-  `release_max_level_info` compiles out every `debug!` / `trace!`
-  callsite in our code and our deps from release builds — h2 and
-  rustls in particular are heavily instrumented at those levels;
-  gating them saves measurable `.rodata` + `.text` weight at no
-  functional cost since we never log below info in production.)
+  like `evt` and `req_id` appear as top-level JSON keys. The
+  defaults `ansi` (terminal colours we don't use) + `tracing-log`
+  (log→tracing bridge — no dep emits `log::` events for us
+  because rustls's `logging` feature is off) + `smallvec` are
+  trimmed.)
 - `futures-util` (`select!` and `FutureExt::fuse()` for the
   accept-vs-signal race in `daemon::run`; compio's own examples
   pull it in the same way — see compio-0.18 `examples/tick.rs`).

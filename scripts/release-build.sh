@@ -54,9 +54,13 @@ fi
 #   --inline-threshold=50               : lower inline budget
 #       (default 225). HTTPS-RTT-bound daemon absorbs the tiny
 #       runtime cost invisibly.
-#   -Wl,--icf=safe                      : LLD identical-code-folding,
-#       safe variant (skips functions with significant address per
-#       rustc's unnamed_addr emission).
+#
+# Not included: LLD's `-Wl,--icf=safe`. zigbuild wraps `zig cc` as
+# the linker driver, and zigcc has an arg-allowlist that rejects
+# `--icf` outright (`error: unsupported linker arg: --icf`). The
+# underlying LLD would support it; there's no clean passthrough
+# today — tracked in rust-cross/cargo-zigbuild#162 and
+# rust-lang/rust#108392. Re-add once zigbuild grows the passthrough.
 export CARGO_BUILD_RUSTFLAGS="--remap-path-scope=all \
 ${CRATES_REMAP} \
 --remap-path-prefix=${HOME}/.rustup/toolchains/=tc/ \
@@ -64,8 +68,7 @@ ${CRATES_REMAP} \
 -C llvm-args=--enable-machine-outliner \
 -C llvm-args=--enable-linkonceodr-outlining \
 -C llvm-args=--enable-global-merge-func \
--C llvm-args=--inline-threshold=50 \
--C link-arg=-Wl,--icf=safe"
+-C llvm-args=--inline-threshold=50"
 
 cd "${REPO}"
 cargo zigbuild --release --locked --target "${TARGET}"

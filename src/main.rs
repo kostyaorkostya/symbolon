@@ -54,7 +54,13 @@ async fn run_daemon(config_path: PathBuf) -> ExitCode {
     gcb::setup_tracing(cfg.logging.level);
 
     let shutdown = compio::runtime::CancelToken::new();
-    let shutdown_watcher = gcb::spawn_shutdown_watcher(shutdown.clone());
+    let shutdown_watcher = match gcb::spawn_shutdown_watcher(shutdown.clone()) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(evt = "signal_registration_failed", signal = "SIGTERM/SIGINT", error = %e);
+            return ExitCode::from(1);
+        }
+    };
 
     let service = match gcb::Service::prepare(&cfg, &config_path, shutdown.clone()).await {
         Ok(v) => v,
@@ -64,11 +70,17 @@ async fn run_daemon(config_path: PathBuf) -> ExitCode {
         }
     };
 
-    let sighup = gcb::spawn_sighup_handler(
+    let sighup = match gcb::spawn_sighup_handler(
         service.state_handle(),
         cfg.clients.file.clone(),
         shutdown.clone(),
-    );
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(evt = "signal_registration_failed", signal = "SIGHUP", error = %e);
+            return ExitCode::from(1);
+        }
+    };
 
     service.selfcheck().await;
 

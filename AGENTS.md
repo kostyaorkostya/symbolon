@@ -112,10 +112,12 @@ Pinned in `Cargo.toml`:
   `clap` for code-size and over hand-rolled parsing for maintainability.
   Daemon mode is preserved on bare `gcb` by synthesising a hidden
   `daemon` subcommand in `main`; everything else is regular argh.)
-- `compio` with features `runtime,macros,net,fs,signal,time,io-uring`
-  (async runtime; `macros` for `#[compio::main]`; `net`+`fs`+`signal`+
-  `time` for the daemon surface; `io-uring` listed explicitly so a
-  future change to compio's default features can't silently disable it)
+- `compio` with features `runtime,macros,net,fs,time,io-uring` (async
+  runtime; `macros` for `#[compio::main]`; `net`+`fs`+`time` for the
+  daemon surface; `io-uring` listed explicitly so a future change to
+  compio's default features can't silently disable it. The `signal`
+  feature is intentionally NOT enabled — we use signal-hook-registry
+  directly for permanent signal handlers; see `src/signals.rs`.)
 - `cyper` (HTTPS client for provider APIs)
 - `jsonwebtoken` with feature `rust_crypto` (App JWT; `rust_crypto`
   is mandatory in 10.x — without a crypto-provider feature the
@@ -137,11 +139,12 @@ Pinned in `Cargo.toml`:
   only `src/ready.rs` does, and `src/ready.rs` is called from
   `src/main.rs`.)
 - `seccompiler` (Firecracker's pure-Rust seccomp-BPF compiler. The
-  filter built in `src/sandbox.rs` returns `EPERM` for every
-  `kill`/`tkill`/`tgkill`/`pidfd_send_signal`/`rt_sigqueueinfo`/
-  `rt_tgsigqueueinfo` whose signum argument isn't `SIGHUP`.
-  Substitutes for landlock's `Scope::Signal` while preserving
-  the legitimate SIGHUP-to-stunnel path.)
+  filter built in `src/sandbox.rs` denies `kill`/`tkill`/`tgkill`/
+  `rt_sigqueueinfo`/`rt_tgsigqueueinfo` outright and constrains
+  `pidfd_send_signal` to `SIGHUP`; `pidfd_open` is left allowed so
+  `StunnelController` can rebind to stunnel across restarts.
+  Substitutes for landlock's `Scope::Signal` while preserving the
+  legitimate SIGHUP-to-stunnel path.)
 - `serde`, `serde_json`, `toml` (config + provider responses)
 - `time` with `default-features = false, features = ["parsing",
   "formatting"]` (RFC3339 → `SystemTime` for GitHub's `expires_at`,
@@ -158,27 +161,33 @@ Pinned in `Cargo.toml`:
   pull it in the same way — see compio-0.18 `examples/tick.rs`).
 - `ulid` (request IDs)
 - `thiserror` (errors)
-- `rustix` with features `net,process`. `process` for signal
-  delivery to stunnel via `kill(2)` after enroll/revoke rewrites
-  `gcb.psk`. `net` for `socket_peercred` on the admin UDS — the
-  SO_PEERCRED check that rejects connections from UIDs other than
-  root or the daemon's own (defense in depth against a loose
-  `/run/gcb/` ACL).
+- `rustix` with features `net,process`. `process` for the pidfd
+  dance in `src/stunnel.rs` (`pidfd_open` + `pidfd_send_signal`
+  with SIGHUP after enroll/revoke rewrites `gcb.psk`) — closes the
+  PID-reuse TOCTOU window vs. the older `kill(2)` form. `net` for
+  `socket_peercred` on the admin UDS — the SO_PEERCRED check that
+  rejects connections from UIDs other than root or the daemon's
+  own (defense in depth against a loose `/run/gcb/` ACL).
 - `signal-hook-registry` (long-lived OS-level signal handler
   installed once at startup. Replaces `compio::signal::unix::signal`
   which is one-shot and reverts the kernel disposition to `SigDfl`
   on listener drop — a SIGHUP delivered in that gap would kill the
   daemon. We register synchronous handlers per signal that set an
-  AtomicBool + notify an `event_listener::Event`; the compio task
-  loop awaits the Event re-armably. Same pattern compio-signal uses
-  internally, just with a permanent handler.)
+  AtomicBool + call `AtomicWaker::wake` on a `SignalNotifier` struct;
+  the compio task loop awaits a re-armable `Notified` future. Both
+  the AtomicBool store and the AtomicWaker wake are lock-free,
+  alloc-free, reentrant — async-signal-safe, matching compio-signal's
+  internal handler at `compio/compio-signal/src/unix/mod.rs:15-26`
+  but with a permanent rather than per-call registration.)
 - `synchrony` with features `async_flag,event` (sync primitives for
-  `compio`. `unsync::async_flag::AsyncFlag` backs
-  `ConnectionTracker`'s "drain empty" notification;
-  `sync::event::Event` is the re-armable wakeup for signal handlers
-  and for the singleflight cache in `providers::github`. Already a
-  transitive dep via `compio-signal`; promoted to direct so the
-  version is pinned independently.)
+  `compio`. `sync::event::Event` is the re-armable wakeup used by
+  `ConnectionTracker`'s "drain empty" notification and by the
+  singleflight cache in `providers::github`. The signal-handler
+  notifier uses raw `AtomicBool` + `futures_util::task::AtomicWaker`
+  directly rather than `AsyncFlag` because `AsyncFlag::wait` is
+  consume-on-wait, which doesn't fit the permanent handler loop.
+  `async_flag` feature stays enabled because synchrony co-builds
+  the two primitives.)
 - `percent-encoding` (URL component encoding for the owner/repo
   segments of GitHub API paths. The path parser already rejects
   any byte outside `[A-Za-z0-9._-]`; the encoding is defense in
@@ -274,6 +283,7 @@ src/
   daemon.rs            # accept loop, per-connection handler, Service shape
   admin.rs             # Unix socket + CLI dispatch
   signals.rs           # signal-hook-registry handlers → CancelToken
+  stunnel.rs           # pidfd-based SIGHUP to stunnel
   ready.rs             # sd_notify + pidfile (atomic) at startup
   loader.rs            # async config/clients.json file reads
   logging.rs           # tracing-subscriber JSON setup (stdout/stderr split)

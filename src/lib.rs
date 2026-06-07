@@ -32,6 +32,7 @@ pub(crate) mod proxy_protocol;
 pub(crate) mod ready;
 pub(crate) mod sandbox;
 pub(crate) mod signals;
+pub(crate) mod stunnel;
 
 // Curated in-package surface. Cargo forces these to be `pub` because
 // main.rs / tests / fuzz are separate crates from the lib, even

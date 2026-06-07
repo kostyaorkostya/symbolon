@@ -12,7 +12,6 @@ compio = { version = "0.19", features = [
   "macros",
   "net",
   "runtime",
-  "signal",
   "time",
 ] }
 cyper = "0.9"

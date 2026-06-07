@@ -16,6 +16,21 @@
 //! Per-call overhead: one boxed-closure allocation, one `mpsc::send`,
 //! one oneshot reply. ~5-10 µs on commodity hardware; negligible
 //! for any millisecond-scale CPU work.
+//!
+//! # Invariant (cyclic-ownership ban)
+//!
+//! The closure passed to [`CpuWorker::run`] MUST NOT capture any
+//! handle (Rc/Arc/oneshot::Sender of larger scope) whose drop blocks
+//! on this worker. Violating this invariant makes the worker
+//! thread's recv loop never return when the channel is closed, and
+//! `Drop::drop()` then deadlocks the process on `thread.join()`.
+//!
+//! Today's only caller is `JwtSigner` (`src/providers/github.rs`),
+//! which captures only `Arc<EncodingKey>` — the key has no back-
+//! reference to the worker. Code review remains the gate; no
+//! runtime safety net intentionally, so a regression here would
+//! show up as a hung daemon-exit rather than silently leaking a
+//! thread.
 
 use std::sync::mpsc;
 use std::thread::JoinHandle;

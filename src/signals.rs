@@ -5,10 +5,15 @@
 //! Implementation: a single long-lived OS signal handler is
 //! installed once at startup via `signal-hook-registry`, and stays
 //! installed for the process lifetime. The handler is restricted to
-//! async-signal-safe operations (AtomicBool store + Event::notify,
-//! the same shape compio-signal uses internally). A compio task
-//! awaits the Event and translates wakeups into shutdown-token
-//! cancellation or clients.json reloads.
+//! async-signal-safe operations (`AtomicBool::store` +
+//! `AtomicWaker::wake` — both lock-free, no allocation, reentrant).
+//! Same shape compio-signal uses internally
+//! (`compio/compio-signal/src/unix/mod.rs:15-26`), unbundled here so
+//! the notifier survives multiple deliveries (compio-signal's
+//! AsyncFlag is consume-on-wait).
+//!
+//! A compio task awaits the notifier and translates wakeups into
+//! shutdown-token cancellation or clients.json reloads.
 //!
 //! Why not `compio-signal`: its `signal()` future re-registers the
 //! handler per call and unregisters on drop, reverting the kernel
@@ -17,66 +22,94 @@
 //! See `compio/compio-signal/src/unix/mod.rs:39-52` for the
 //! unregister path.
 
+use std::future::Future;
+use std::io;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 
 use compio::runtime::{CancelToken, JoinHandle};
 use futures_util::FutureExt;
-use synchrony::sync::event::Event;
+use futures_util::task::AtomicWaker;
 
 use crate::daemon::{self, SharedState};
+
+/// Long-lived signal notifier: signal handler calls `notify()`,
+/// async waiters call `notified().await`. Cleared on each take, so
+/// the same instance handles an arbitrary number of deliveries.
+///
+/// Both `notify` and the swap+register inside `Notified::poll` are
+/// lock-free CAS operations on top of `AtomicBool` and
+/// `AtomicWaker`. No allocation, no mutex, fully reentrant — safe to
+/// call from a signal handler.
+#[derive(Default)]
+struct SignalNotifier {
+    set: AtomicBool,
+    waker: AtomicWaker,
+}
+
+impl SignalNotifier {
+    fn notify(&self) {
+        self.set.store(true, Ordering::Release);
+        self.waker.wake();
+    }
+
+    fn notified(self: Arc<Self>) -> Notified {
+        Notified { n: self }
+    }
+}
+
+struct Notified {
+    n: Arc<SignalNotifier>,
+}
+
+impl Future for Notified {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.n.set.swap(false, Ordering::AcqRel) {
+            return Poll::Ready(());
+        }
+        self.n.waker.register(cx.waker());
+        if self.n.set.swap(false, Ordering::AcqRel) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
 
 /// Install long-lived handlers for SIGTERM + SIGINT, spawn the task
 /// that waits on either and cancels `shutdown`. Returns the task's
 /// JoinHandle, whose Output is the signal name.
-pub fn spawn_shutdown_watcher(shutdown: CancelToken) -> JoinHandle<&'static str> {
-    let event = Arc::new(Event::new());
+///
+/// Errors from `signal-hook-registry::register` are propagated;
+/// failing here means we cannot honour SIGTERM/SIGINT and the
+/// caller should treat it as fatal.
+pub fn spawn_shutdown_watcher(shutdown: CancelToken) -> io::Result<JoinHandle<&'static str>> {
+    let notifier = Arc::new(SignalNotifier::default());
     let term_pending = Arc::new(AtomicBool::new(false));
     let int_pending = Arc::new(AtomicBool::new(false));
 
-    // SAFETY: closures only touch AtomicBool (lock-free) and
-    // event_listener::Event::notify (lock-free atomic ops in the
-    // hot path). Both are async-signal-safe per the precedent set
-    // by compio-signal's own handler.
-    unsafe {
-        let pending = term_pending.clone();
-        let ev = event.clone();
-        let _ = signal_hook_registry::register(libc::SIGTERM, move || {
-            pending.store(true, Ordering::Relaxed);
-            ev.notify(usize::MAX);
-        });
-        let pending = int_pending.clone();
-        let ev = event.clone();
-        let _ = signal_hook_registry::register(libc::SIGINT, move || {
-            pending.store(true, Ordering::Relaxed);
-            ev.notify(usize::MAX);
-        });
-    }
+    register_async_signal(libc::SIGTERM, term_pending.clone(), notifier.clone())?;
+    register_async_signal(libc::SIGINT, int_pending.clone(), notifier.clone())?;
 
-    compio::runtime::spawn(async move {
+    Ok(compio::runtime::spawn(async move {
         loop {
-            // Register listener BEFORE checking flags. This closes
-            // the race where a signal handler fires between our
-            // flag-check and our listen() call.
-            let listener = event.listen();
-            if term_pending.load(Ordering::Relaxed) || int_pending.load(Ordering::Relaxed) {
-                drop(listener);
-            } else {
-                listener.await;
+            if term_pending.swap(false, Ordering::Acquire) {
+                shutdown.cancel();
+                return "SIGTERM";
             }
-            let sig = if term_pending.swap(false, Ordering::Relaxed) {
-                "SIGTERM"
-            } else if int_pending.swap(false, Ordering::Relaxed) {
-                "SIGINT"
-            } else {
-                continue;
-            };
-            shutdown.cancel();
-            return sig;
+            if int_pending.swap(false, Ordering::Acquire) {
+                shutdown.cancel();
+                return "SIGINT";
+            }
+            notifier.clone().notified().await;
         }
-    })
+    }))
 }
 
 /// Install a long-lived handler for SIGHUP, spawn the task that
@@ -86,33 +119,44 @@ pub fn spawn_sighup_handler(
     state: Rc<SharedState>,
     clients_path: PathBuf,
     shutdown: CancelToken,
-) -> JoinHandle<()> {
-    let event = Arc::new(Event::new());
+) -> io::Result<JoinHandle<()>> {
+    let notifier = Arc::new(SignalNotifier::default());
     let pending = Arc::new(AtomicBool::new(false));
 
-    // SAFETY: same as spawn_shutdown_watcher above.
-    unsafe {
-        let pending = pending.clone();
-        let ev = event.clone();
-        let _ = signal_hook_registry::register(libc::SIGHUP, move || {
-            pending.store(true, Ordering::Relaxed);
-            ev.notify(usize::MAX);
-        });
-    }
+    register_async_signal(libc::SIGHUP, pending.clone(), notifier.clone())?;
 
-    compio::runtime::spawn(async move {
+    Ok(compio::runtime::spawn(async move {
         loop {
-            let listener = event.listen();
-            let already_pending = pending.load(Ordering::Relaxed);
-            if !already_pending {
-                futures_util::select! {
-                    _ = listener.fuse() => {}
-                    _ = shutdown.clone().wait().fuse() => return,
-                }
-            }
-            if pending.swap(false, Ordering::Relaxed) {
+            if pending.swap(false, Ordering::Acquire) {
                 daemon::reload_clients(&state, &clients_path).await;
+                continue;
+            }
+            futures_util::select_biased! {
+                _ = notifier.clone().notified().fuse() => {}
+                _ = shutdown.clone().wait().fuse() => return,
             }
         }
-    })
+    }))
+}
+
+/// Install an async-signal-safe handler that sets `pending=true` and
+/// notifies the shared notifier. The handler is permanent
+/// (registered once, never unregistered) and only performs lock-free
+/// atomic operations.
+fn register_async_signal(
+    sig: i32,
+    pending: Arc<AtomicBool>,
+    notifier: Arc<SignalNotifier>,
+) -> io::Result<()> {
+    // SAFETY: closure only touches AtomicBool::store (lock-free) and
+    // SignalNotifier::notify (AtomicBool::store + AtomicWaker::wake,
+    // both lock-free and alloc-free). Matches compio-signal's own
+    // handler at compio/compio-signal/src/unix/mod.rs:15-26.
+    unsafe {
+        signal_hook_registry::register(sig, move || {
+            pending.store(true, Ordering::Release);
+            notifier.notify();
+        })?;
+    }
+    Ok(())
 }

@@ -1,7 +1,19 @@
 //! Linux sandboxing layer: applies landlock (FS + TCP + abstract-UDS
-//! scope at ABI 6) and a seccomp-BPF filter that confines the signal-
-//! sending syscalls (`kill` / `tgkill` / `tkill` / `pidfd_send_signal`
-//! / `rt_sigqueueinfo` / `rt_tgsigqueueinfo`) to `SIGHUP` only.
+//! scope at ABI 6) and a seccomp-BPF filter that **denies** every
+//! PID-targeted signal syscall (`kill` / `tkill` / `tgkill` /
+//! `rt_sigqueueinfo` / `rt_tgsigqueueinfo`) and **constrains**
+//! `pidfd_send_signal` to `SIGHUP`. `pidfd_open` is allowed (any
+//! args) because `StunnelController` opens a fresh pidfd per
+//! enroll/revoke as stunnel's PID changes over restarts.
+//!
+//! Why the tightening matters: signal-sending syscalls' first arg
+//! is a `pid_t` that BPF cannot bind to a runtime value (stunnel's
+//! PID is dynamic). Moving SIGHUP delivery to `pidfd_send_signal`
+//! lets us delete the broad sig-arg-only filter and replace it
+//! with: "pidfd_send_signal allowed iff sig==SIGHUP, everything
+//! else EPERM." Knowing PIDs to target would require `/proc`
+//! enumeration, which landlock blocks; the residual capability is
+//! a SIGHUP to whichever pid lives in the stunnel pidfile.
 //!
 //! The seccomp filter substitutes for landlock's `Scope::Signal`, which
 //! cannot be enabled here: stunnel lives in a separate process tree
@@ -13,7 +25,6 @@
 //! `/var/lib/gcb/`; the parent-dir rule there is required by the
 //! tempfile-then-rename atomic-write pattern.
 
-use std::convert::TryInto;
 use std::io;
 use std::path::PathBuf;
 
@@ -27,16 +38,7 @@ use seccompiler::{
     SeccompFilter, SeccompRule, TargetArch,
 };
 
-/// Operator-selected enforcement policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SandboxLevel {
-    /// Refuse to start if the kernel cannot enforce ABI 6 features.
-    Required,
-    /// Apply what the kernel supports; report degradation.
-    BestEffort,
-    /// Skip sandboxing entirely (tests, debugging).
-    Off,
-}
+use crate::config::SandboxMode;
 
 /// Filesystem paths the daemon needs after restriction. Anything not
 /// listed here becomes unreachable.
@@ -104,10 +106,10 @@ pub enum SandboxError {
 /// for the lifetime of the thread and propagate to descendants. Only
 /// call once per process.
 pub(crate) fn apply(
-    level: SandboxLevel,
+    level: SandboxMode,
     paths: &SandboxPaths,
 ) -> Result<SandboxOutcome, SandboxError> {
-    if level == SandboxLevel::Off {
+    if level == SandboxMode::Off {
         return Ok(SandboxOutcome {
             requested_abi: 0,
             status: "off",
@@ -128,13 +130,13 @@ pub(crate) fn apply(
 }
 
 fn apply_landlock(
-    level: SandboxLevel,
+    level: SandboxMode,
     paths: &SandboxPaths,
 ) -> Result<SandboxOutcome, SandboxError> {
     let compat = match level {
-        SandboxLevel::Required => CompatLevel::HardRequirement,
-        SandboxLevel::BestEffort => CompatLevel::BestEffort,
-        SandboxLevel::Off => unreachable!("Off short-circuited in apply"),
+        SandboxMode::Required => CompatLevel::HardRequirement,
+        SandboxMode::BestEffort => CompatLevel::BestEffort,
+        SandboxMode::Off => unreachable!("Off short-circuited in apply"),
     };
     let abi = ABI::V6;
     let fs_bits = AccessFs::from_all(abi);
@@ -233,10 +235,10 @@ fn apply_landlock(
     })
 }
 
-fn classify_ruleset_err(level: SandboxLevel, e: RulesetError) -> SandboxError {
+fn classify_ruleset_err(level: SandboxMode, e: RulesetError) -> SandboxError {
     match level {
-        SandboxLevel::Required => SandboxError::AbiUnavailable(e),
-        SandboxLevel::BestEffort | SandboxLevel::Off => SandboxError::Ruleset(e),
+        SandboxMode::Required => SandboxError::AbiUnavailable(e),
+        SandboxMode::BestEffort | SandboxMode::Off => SandboxError::Ruleset(e),
     }
 }
 
@@ -253,29 +255,34 @@ fn apply_seccomp() -> Result<(), SandboxError> {
 }
 
 fn build_signal_filter(arch: TargetArch) -> Result<SeccompFilter, SandboxError> {
-    // (syscall_nr, sig_argument_index)
-    let signal_syscalls: &[(i64, u8)] = &[
-        (libc::SYS_kill, 1),
-        (libc::SYS_tkill, 1),
-        (libc::SYS_tgkill, 2),
-        (libc::SYS_pidfd_send_signal, 1),
-        (libc::SYS_rt_sigqueueinfo, 1),
-        (libc::SYS_rt_tgsigqueueinfo, 2),
-    ];
     let mut rules: std::collections::BTreeMap<i64, Vec<SeccompRule>> =
         std::collections::BTreeMap::new();
-    let sighup = libc::SIGHUP as u64;
-    for (nr, sig_idx) in signal_syscalls {
-        // Rule fires only when sig != SIGHUP, returning EPERM via
-        // `match_action`. Calls with sig == SIGHUP fall through to
-        // `mismatch_action = Allow`.
-        let cond =
-            SeccompCondition::new(*sig_idx, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, sighup)
-                .map_err(|e| SandboxError::SeccompBuild(seccompiler::Error::Backend(e)))?;
-        let rule = SeccompRule::new(vec![cond])
-            .map_err(|e| SandboxError::SeccompBuild(seccompiler::Error::Backend(e)))?;
-        rules.insert(*nr, vec![rule]);
+
+    // Unconditional deny. The daemon never calls these — SIGHUP to
+    // stunnel goes through `pidfd_send_signal` (see
+    // `src/stunnel.rs`). An empty rule chain matches every call,
+    // routing it to `match_action = EPERM`.
+    for nr in [
+        libc::SYS_kill,
+        libc::SYS_tkill,
+        libc::SYS_tgkill,
+        libc::SYS_rt_sigqueueinfo,
+        libc::SYS_rt_tgsigqueueinfo,
+    ] {
+        rules.insert(nr, Vec::new());
     }
+
+    // Conditional allow: `pidfd_send_signal(pidfd, sig, ...)` is
+    // EPERM'd unless sig == SIGHUP. `pidfd_open` is not listed at
+    // all, so it falls through `mismatch_action = Allow` (needed
+    // because stunnel's PID is dynamic across restarts).
+    let sighup = libc::SIGHUP as u64;
+    let cond = SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, sighup)
+        .map_err(|e| SandboxError::SeccompBuild(seccompiler::Error::Backend(e)))?;
+    let rule = SeccompRule::new(vec![cond])
+        .map_err(|e| SandboxError::SeccompBuild(seccompiler::Error::Backend(e)))?;
+    rules.insert(libc::SYS_pidfd_send_signal, vec![rule]);
+
     SeccompFilter::new(
         rules,
         SeccompAction::Allow,
@@ -317,7 +324,7 @@ mod tests {
     fn apply_off_is_noop() {
         let out = run_isolated(|| {
             let paths = make_paths(vec![], vec![]);
-            apply(SandboxLevel::Off, &paths).unwrap()
+            apply(SandboxMode::Off, &paths).unwrap()
         });
         assert_eq!(out.status, "off");
         assert!(!out.fs && !out.tcp && !out.scope && !out.seccomp);
@@ -337,7 +344,7 @@ mod tests {
             fs::write(&other, b"secret").unwrap();
 
             let paths = make_paths(vec![allowed.clone()], vec![]);
-            let out = apply(SandboxLevel::BestEffort, &paths).unwrap();
+            let out = apply(SandboxMode::BestEffort, &paths).unwrap();
 
             // Allowed path still readable.
             let allowed_data = fs::read(&allowed).unwrap();
@@ -360,6 +367,32 @@ mod tests {
     }
 
     #[test]
+    fn seccomp_blocks_kill_even_with_sighup() {
+        // After the Q3 tightening, SYS_kill is denied unconditionally
+        // — even kill(getpid(), SIGHUP). The legitimate SIGHUP path
+        // goes through pidfd_send_signal in src/stunnel.rs. This test
+        // asserts that the legacy kill(2) entry-point is fully
+        // closed.
+        let blocked = run_isolated(|| {
+            let paths = make_paths(vec![], vec![]);
+            let _ = apply(SandboxMode::BestEffort, &paths).expect("sandbox apply");
+            unsafe {
+                let pid = libc::getpid();
+                let rc = libc::kill(pid, libc::SIGHUP);
+                if rc == 0 {
+                    return Ok(());
+                }
+                let errno = *libc::__errno_location();
+                Err(errno)
+            }
+        });
+        match blocked {
+            Ok(()) => panic!("expected kill(SIGHUP) to be blocked by seccomp filter"),
+            Err(errno) => assert_eq!(errno, libc::EPERM, "expected EPERM, got {errno}"),
+        }
+    }
+
+    #[test]
     fn seccomp_blocks_non_sighup_self_signal() {
         // Send SIGHUP first (a child receives it harmlessly when
         // running under cargo, since `kill` to self with SIGHUP is
@@ -371,7 +404,7 @@ mod tests {
             // need NO_NEW_PRIVS set; landlock's restrict_self does
             // that even when the ruleset is empty, so go through it.
             let paths = make_paths(vec![], vec![]);
-            let _ = apply(SandboxLevel::BestEffort, &paths).expect("sandbox apply");
+            let _ = apply(SandboxMode::BestEffort, &paths).expect("sandbox apply");
 
             // SIGUSR1: should be EPERM under the filter.
             unsafe {
@@ -400,14 +433,14 @@ mod tests {
                 write_parent_dirs: vec![],
             };
             // Should not error on the missing resolv file.
-            let _ = apply(SandboxLevel::BestEffort, &paths).expect("apply with missing resolv ok");
+            let _ = apply(SandboxMode::BestEffort, &paths).expect("apply with missing resolv ok");
         });
     }
 
     #[test]
     fn off_mode_returns_off_status() {
         let paths = make_paths(vec![], vec![]);
-        let out = apply(SandboxLevel::Off, &paths).unwrap();
+        let out = apply(SandboxMode::Off, &paths).unwrap();
         assert_eq!(out.status, "off");
     }
 }

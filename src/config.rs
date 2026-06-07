@@ -9,7 +9,7 @@
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Top-level parsed `config.toml`.
 #[derive(Debug, Deserialize)]
@@ -172,8 +172,11 @@ fn default_request_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(10)
 }
 
-/// Top-level parsed `clients.json`.
-#[derive(Debug, Deserialize)]
+/// Top-level parsed `clients.json`. Serialize side is used by
+/// `admin::handle_enroll` / `handle_revoke` when rewriting the
+/// file; the round-trip uses the same struct on both ends so the
+/// schema can only drift in one place.
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientsFile {
     /// Schema version. Only `1` is supported today.
@@ -182,7 +185,7 @@ pub struct ClientsFile {
 }
 
 /// One enrolled client.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientEntry {
     pub name: String,

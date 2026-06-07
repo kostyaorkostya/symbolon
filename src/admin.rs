@@ -36,7 +36,11 @@ use crate::providers::github::GithubError;
 
 const CLIENTS_FILE_MODE: u32 = 0o640;
 const PSK_FILE_MODE: u32 = 0o600;
-const MAX_REQUEST_BYTES: usize = 64 * 1024;
+/// Admin requests are operator-driven JSON, not adversarial
+/// throughput; the budget stays at 64 KiB to comfortably fit
+/// human-typed enroll/revoke payloads. The daemon's wire path
+/// uses a tighter 8 KiB budget for its slow-loris exposure.
+const WIRE_READ_BUDGET: usize = 64 * 1024;
 const PER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const PROVIDER_GITHUB: &str = "github";
 
@@ -144,14 +148,6 @@ pub enum AdminError {
     ResponseParse(#[source] serde_json::Error),
     #[error("admin response carried an error: {0}")]
     RemoteError(String),
-    #[error("stunnel pidfile {} is unreadable or malformed", path.display())]
-    StunnelPid {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("stunnel pidfile {} contained {raw:?} (not a valid PID)", path.display())]
-    StunnelPidParse { path: PathBuf, raw: String },
     #[error("atomic write of {} failed", path.display())]
     AtomicWrite {
         path: PathBuf,
@@ -293,6 +289,11 @@ async fn handle_enroll(
     ip: IpAddr,
     note: Option<String>,
 ) -> Result<serde_json::Value, serde_json::Value> {
+    // Collapse IPv4-mapped IPv6 (::ffff:a.b.c.d) → IPv4 so an
+    // operator enrolling the dual-stack form for an IPv4 host hits
+    // the same bucket the daemon's accept-loop canonicalizes into.
+    // Mirrors daemon::canonicalize_ip on the accept path.
+    let ip = crate::daemon::canonicalize_ip(ip);
     if provider != PROVIDER_GITHUB {
         return Err(error_response(
             "unknown_provider",
@@ -363,7 +364,7 @@ async fn handle_enroll(
     let mut clients_doc = read_clients_doc(&state.clients_file_path)
         .await
         .map_err(|e| error_response("internal", &e))?;
-    clients_doc.clients.push(StoredClient {
+    clients_doc.clients.push(crate::config::ClientEntry {
         name: client.to_string(),
         ip,
         providers: vec![PROVIDER_GITHUB.to_string()],
@@ -389,7 +390,7 @@ async fn handle_enroll(
 
     // SIGHUP stunnel. A failure here is logged but does NOT undo the
     // enroll — operator notices via `gcb status` or stunnel logs.
-    if let Err(e) = sighup_stunnel(&state.stunnel_pidfile).await {
+    if let Err(e) = state.stunnel.sighup().await {
         warn!(evt = "stunnel_sighup_failed", error = %e);
     }
 
@@ -458,7 +459,7 @@ async fn handle_revoke(
 
     state.clients.borrow_mut().remove(&client_ip);
 
-    if let Err(e) = sighup_stunnel(&state.stunnel_pidfile).await {
+    if let Err(e) = state.stunnel.sighup().await {
         warn!(evt = "stunnel_sighup_failed", error = %e);
     }
 
@@ -818,27 +819,12 @@ fn render_psk_file(entries: &[(String, String)]) -> String {
     s
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct ClientsDoc {
-    version: u32,
-    clients: Vec<StoredClient>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct StoredClient {
-    name: String,
-    ip: IpAddr,
-    providers: Vec<String>,
-    enrolled_at: String,
-    note: Option<String>,
-}
-
-async fn read_clients_doc(path: &Path) -> Result<ClientsDoc, String> {
+async fn read_clients_doc(path: &Path) -> Result<crate::config::ClientsFile, String> {
     match compio::fs::read(path).await {
         Ok(bytes) => {
             serde_json::from_slice(&bytes).map_err(|e| format!("parse {}: {e}", path.display()))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ClientsDoc {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(crate::config::ClientsFile {
             version: 1,
             clients: Vec::new(),
         }),
@@ -893,64 +879,6 @@ fn check_peer_uid(stream: &UnixStream, my_uid: u32) -> bool {
     }
 }
 
-async fn sighup_stunnel(pidfile: &Path) -> Result<(), AdminError> {
-    let bytes = compio::fs::read(pidfile)
-        .await
-        .map_err(|source| AdminError::StunnelPid {
-            path: pidfile.to_path_buf(),
-            source,
-        })?;
-    let raw = String::from_utf8(bytes).map_err(|e| AdminError::StunnelPid {
-        path: pidfile.to_path_buf(),
-        source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
-    })?;
-    let trimmed = raw.trim();
-    let pid_int: i32 = trimmed.parse().map_err(|_| AdminError::StunnelPidParse {
-        path: pidfile.to_path_buf(),
-        raw: raw.clone(),
-    })?;
-    let pid =
-        rustix::process::Pid::from_raw(pid_int).ok_or_else(|| AdminError::StunnelPidParse {
-            path: pidfile.to_path_buf(),
-            raw,
-        })?;
-
-    // PID-reuse defence: confirm /proc/<pid>/comm is stunnel before
-    // signalling. Without this check, a SIGHUP could land on an
-    // unrelated process that inherited the PID after stunnel exited.
-    let comm_path = format!("/proc/{pid_int}/comm");
-    let comm_bytes =
-        compio::fs::read(&comm_path)
-            .await
-            .map_err(|source| AdminError::StunnelPid {
-                path: pidfile.to_path_buf(),
-                source,
-            })?;
-    let comm = std::str::from_utf8(&comm_bytes)
-        .map(str::trim)
-        .unwrap_or("");
-    if comm != "stunnel" {
-        tracing::warn!(
-            evt = "stunnel_pid_mismatch",
-            pidfile = %pidfile.display(),
-            pid = pid_int,
-            comm = comm,
-        );
-        return Err(AdminError::StunnelPidParse {
-            path: pidfile.to_path_buf(),
-            raw: format!("comm={comm}, expected stunnel"),
-        });
-    }
-
-    rustix::process::kill_process(pid, rustix::process::Signal::HUP).map_err(|e| {
-        AdminError::StunnelPid {
-            path: pidfile.to_path_buf(),
-            source: std::io::Error::from(e),
-        }
-    })?;
-    Ok(())
-}
-
 // Per-iteration `Vec` allocation. For the admin protocol's tiny
 // JSON requests this is invisible; iggy's `BytesMut::with_capacity`
 // + `.clear()` (or compio's `BufferPool` + `AsyncReadManaged`) is
@@ -969,7 +897,7 @@ async fn read_line(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
             accumulated.truncate(pos);
             return Ok(accumulated);
         }
-        if accumulated.len() >= MAX_REQUEST_BYTES {
+        if accumulated.len() >= WIRE_READ_BUDGET {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "admin request exceeds size cap",

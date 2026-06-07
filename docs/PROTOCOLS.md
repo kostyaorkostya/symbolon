@@ -281,7 +281,9 @@ References: [REST API for App installations][gh-installs],
 
 **App JWT signing (RS256):**
 
-- `iss`: App ID (numeric string).
+- `iss`: App client ID (e.g. `Iv23liABCDEFGHIJklmn`). GitHub
+  accepts either the numeric App ID or the client ID here; we use
+  the client ID because it is stable across App ownership transfers.
 - `iat`: now − 60 s (clock-skew tolerance).
 - `exp`: now + 540 s (9 minutes; GitHub max is 10).
 - Signing key: PEM at `provider.github.private_key_path`, loaded once
@@ -356,7 +358,7 @@ On any other signal except SIGHUP: terminate fast; do not drain.
 | File | Reload mechanism |
 |---|---|
 | `clients.json` | SIGHUP re-reads from disk. |
-| `gcb.psk` | Not read by daemon; `gcb github enroll`/`revoke` update it and SIGHUP stunnel. |
+| `gcb.psk` | Read AND written by daemon: `gcb github enroll`/`revoke` route through the admin socket; the daemon parses, appends/removes, atomically rewrites, then SIGHUPs stunnel. The file is the daemon's serialization target, not a notification surface. |
 | `config.toml` | Restart required. |
 | App private key | Restart required. |
 
@@ -384,7 +386,7 @@ top-level keys.
 | `startup` | `version`, `config_path`, `providers` |
 | `shutdown` | `signal`, `inflight_drained`, `drain_ms` |
 | `accept` | `src_ip` (from PROXY v2), `client` (resolved name) |
-| `mint` | `provider`, `repo`, `repo_id`, `client`, `ttl_sec`, `expires_at`, `provider_ms` |
+| `mint` | `provider`, `repo`, `repo_id`, `client`, `ttl_sec`, `expires_at_unix`, `provider_ms` |
 | `mint_denied` | `provider`, `client`, `repo`, `reason`, `provider_status` |
 | `proxy_header_invalid` | `bytes_read` |
 | `provider_error` | `provider`, `endpoint`, `status`, `body_snippet` |
@@ -395,10 +397,15 @@ top-level keys.
 | `cache_invalidated` | `provider`, `repo`, `cause` (`404` \| `ttl_expired`) |
 | `sandbox_applied` | `policy` (`required` \| `best_effort` \| `off`), `abi` (landlock ABI requested; `0` if off), `status` (`fully_enforced` \| `partially_enforced` \| `not_enforced` \| `off`), `fs`, `tcp`, `scope`, `seccomp` (bool per subsystem actually engaged) |
 | `sandbox_path_skipped` | `path`, `reason` (`enoent` \| `open_failed`), `error` (when applicable) — emitted at `debug` for nameservice / CA-bundle paths absent on this host |
-| `bootstrap` | `version`, `config_path`, `listen_socket`, `admin_socket` — emitted by `Service::bootstrap` once config is loaded and sockets are bound (before selfcheck and readiness) |
+| `prepare` | `version`, `config_path`, `listen_socket`, `admin_socket` — emitted by `Service::prepare` once config is loaded and sockets are bound (before selfcheck and readiness) |
 | `ready` | `pid` — emitted by `main` after `service.selfcheck()` returns and `ready::notify` has sent `READY=1` to systemd (if applicable) and written the pidfile (if configured) |
 | `run_failed` | `signal`, `error` — emitted at `error` lvl by `main` when `Service::run` returns `Err`. Mutually exclusive with `shutdown` (one or the other fires) |
 | `ready_pidfile_write_failed` | `path`, `error` — emitted at `warn` lvl by `ready::notify` if the configured pidfile can't be written (typically a sandbox or permission issue) |
+| `admin_denied` | `peer_uid`, `peer_pid` — emitted at `warn` lvl when SO_PEERCRED on the admin socket shows a UID that is neither root nor the daemon's own |
+| `admin_peercred_failed` | `error` — emitted at `warn` lvl when SO_PEERCRED itself fails; the connection is still admitted (refusing on a transient kernel error would be a self-DoS) |
+| `stunnel_sighup_failed` | `error` — emitted at `warn` lvl when `StunnelController::sighup` fails after an enroll/revoke rewrote `gcb.psk`. The state mutation is NOT rolled back; operator notices via `gcb status` or stunnel logs |
+| `drain_incomplete` | `inflight_drained`, `drain_ms` — emitted at `warn` lvl when the per-connection drain deadline elapses with handlers still in flight at shutdown |
+| `signal_registration_failed` | `signal`, `error` — emitted at `error` lvl by `main` when `signal-hook-registry::register` fails at startup. Treated as fatal (exit 1) — without it the daemon cannot honour SIGTERM/SIGINT/SIGHUP |
 
 `reason` values for `mint_denied`:
 `client_unknown | unknown_host | repo_not_accessible | provider_4xx | malformed_request`.

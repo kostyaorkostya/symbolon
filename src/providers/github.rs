@@ -101,12 +101,13 @@ pub enum GithubError {
     JwtSignerDead,
     #[error("HTTP transport error")]
     Http(#[source] cyper::Error),
+    // `source` deliberately omitted. serde_json::Error's Display can
+    // include a fragment of the input ("expected … at line X column Y
+    // near {bytes}"); for the mint response, that fragment can be
+    // the access token. The context string is enough for triage; the
+    // raw error never reaches a log line.
     #[error("malformed response from {context}")]
-    JsonParse {
-        context: &'static str,
-        #[source]
-        source: serde_json::Error,
-    },
+    JsonParse { context: &'static str },
     #[error("missing field '{field}' in {context} response")]
     MissingField {
         context: &'static str,
@@ -296,9 +297,8 @@ impl GitHubProvider {
             .unwrap_or(0);
         let body = resp.bytes().await?;
         let v: serde_json::Value =
-            serde_json::from_slice(&body).map_err(|source| GithubError::JsonParse {
+            serde_json::from_slice(&body).map_err(|_| GithubError::JsonParse {
                 context: "selfcheck",
-                source,
             })?;
         let reported =
             v.get("client_id")
@@ -373,12 +373,18 @@ impl GitHubProvider {
                     // raced ahead leaving Done expired.
                 }
                 CacheAction::Resolve(ev) => {
+                    // RAII: if the resolve future is dropped (shutdown,
+                    // caller cancel), the guard invalidates the
+                    // InFlight entry and wakes any waiters so they
+                    // retry rather than block forever on a notify
+                    // that will never come.
+                    let mut guard = InFlightGuard::new(&self.repo_ids, key, ev);
                     let result = self.resolve_repo_id(owner, repo).await;
                     match &result {
                         Ok(id) => self.repo_ids.put_done(key, *id, now + CACHE_TTL),
                         Err(_) => self.repo_ids.invalidate(key),
                     }
-                    ev.notify(usize::MAX);
+                    guard.disarm_and_notify();
                     return result;
                 }
             }
@@ -489,6 +495,44 @@ enum CacheAction {
     Resolve(Rc<synchrony::sync::event::Event>),
 }
 
+/// Holds the InFlight claim for the resolver task. On `Drop` (i.e.
+/// the resolver future was cancelled mid-flight) the guard
+/// invalidates the cache entry and notifies waiters so they retry
+/// the lookup. The resolver disarms the guard via
+/// `disarm_and_notify` once it has explicitly committed put_done or
+/// invalidate.
+struct InFlightGuard<'a> {
+    cache: &'a RepoIdCache,
+    key: String,
+    event: Rc<synchrony::sync::event::Event>,
+    armed: bool,
+}
+
+impl<'a> InFlightGuard<'a> {
+    fn new(cache: &'a RepoIdCache, key: &str, event: Rc<synchrony::sync::event::Event>) -> Self {
+        Self {
+            cache,
+            key: key.to_string(),
+            event,
+            armed: true,
+        }
+    }
+
+    fn disarm_and_notify(&mut self) {
+        self.armed = false;
+        self.event.notify(usize::MAX);
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cache.invalidate(&self.key);
+            self.event.notify(usize::MAX);
+        }
+    }
+}
+
 impl RepoIdCache {
     /// Atomic test-and-set. Returns Hit on fresh Done entry, Wait
     /// when another task is already resolving (with that resolver's
@@ -594,10 +638,7 @@ fn build_mint_body(repo_id: u64) -> Vec<u8> {
 
 fn parse_mint_response(bytes: &[u8]) -> Result<(String, SystemTime), GithubError> {
     let v: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|source| GithubError::JsonParse {
-            context: "mint",
-            source,
-        })?;
+        serde_json::from_slice(bytes).map_err(|_| GithubError::JsonParse { context: "mint" })?;
     let token = v
         .get("token")
         .and_then(|t| t.as_str())
@@ -619,10 +660,7 @@ fn parse_mint_response(bytes: &[u8]) -> Result<(String, SystemTime), GithubError
 
 fn parse_repo_response(bytes: &[u8]) -> Result<u64, GithubError> {
     let v: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|source| GithubError::JsonParse {
-            context: "repo",
-            source,
-        })?;
+        serde_json::from_slice(bytes).map_err(|_| GithubError::JsonParse { context: "repo" })?;
     v.get("id")
         .and_then(|i| i.as_u64())
         .ok_or(GithubError::MissingField {
@@ -754,6 +792,34 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // Defence against accidental log leaks. The mint response body
+    // contains the access token; any error variant constructed from
+    // it must NOT carry response bytes that could surface via
+    // `tracing::warn!(error = %err)` or `error = ?err`. Drop tests
+    // here for every JSON-parse / token-adjacent error path.
+    #[test]
+    fn json_parse_error_does_not_leak_response_bytes() {
+        let token_like = "ghs_secretSECRETsecret1234567890";
+        let body = format!(r#"{{"token":"{token_like}", broken json"#).into_bytes();
+        let err = parse_mint_response(&body).unwrap_err();
+        let display = format!("{err}");
+        let debug = format!("{err:?}");
+        assert!(
+            !display.contains(token_like),
+            "Display leaks token: {display}"
+        );
+        assert!(!debug.contains(token_like), "Debug leaks token: {debug}");
+        // Walk the error chain too (some logging frameworks chase
+        // source()).
+        use std::error::Error;
+        let mut cur: Option<&dyn Error> = Some(&err);
+        while let Some(e) = cur {
+            let s = format!("{e}");
+            assert!(!s.contains(token_like), "chain leaks token: {s}");
+            cur = e.source();
+        }
     }
 
     #[test]
@@ -894,5 +960,40 @@ mod tests {
             CacheAction::Hit(_) => panic!("expected Wait, got Hit"),
             CacheAction::Resolve(_) => panic!("expected Wait, got Resolve"),
         }
+    }
+
+    #[test]
+    fn inflight_guard_drop_invalidates_and_notifies() {
+        let cache = RepoIdCache::default();
+        let now = t(1_000_000);
+        let ev = match cache.get_or_claim("foo/bar", now) {
+            CacheAction::Resolve(ev) => ev,
+            _ => panic!("expected initial Resolve"),
+        };
+        // Simulate the resolver future being dropped mid-flight: the
+        // guard goes out of scope without being disarmed.
+        {
+            let _guard = InFlightGuard::new(&cache, "foo/bar", ev);
+        }
+        // Cache must be empty and a new caller must get Resolve.
+        assert_resolve(cache.get_or_claim("foo/bar", now));
+    }
+
+    #[test]
+    fn inflight_guard_disarm_does_not_invalidate() {
+        let cache = RepoIdCache::default();
+        let now = t(1_000_000);
+        let ev = match cache.get_or_claim("foo/bar", now) {
+            CacheAction::Resolve(ev) => ev,
+            _ => panic!("expected initial Resolve"),
+        };
+        {
+            let mut guard = InFlightGuard::new(&cache, "foo/bar", ev);
+            // Resolver committed put_done; then disarm.
+            cache.put_done("foo/bar", 42, now + Duration::from_secs(600));
+            guard.disarm_and_notify();
+        }
+        // Cache must show the committed entry; subsequent callers Hit.
+        assert_hit(cache.get_or_claim("foo/bar", now), 42);
     }
 }

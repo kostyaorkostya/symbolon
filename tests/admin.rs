@@ -164,6 +164,33 @@ async fn admin_enroll_rejects_duplicate_ip() {
 }
 
 #[compio::test]
+async fn admin_enroll_canonicalizes_v4_mapped_v6() {
+    // An operator enrolling ::ffff:192.168.122.10 must collide with
+    // an existing IPv4 entry for 192.168.122.10. Without
+    // canonicalization, the two would coexist and the accept-loop's
+    // own canonicalize would route to the wrong (or no) entry.
+    let paths = unique_paths_full();
+    write_clients_json(&paths.clients, &[("vm-1", "192.168.122.10")]);
+    let server = MockServer::start().await;
+    spawn_daemon(&paths, server.uri()).await;
+
+    let resp = admin_request(
+        &paths.admin,
+        serde_json::json!({
+            "op": "enroll",
+            "provider": "github",
+            "client": "vm-2",
+            "ip": "::ffff:192.168.122.10",
+            "note": null,
+        }),
+    )
+    .await;
+    assert_eq!(resp["ok"], serde_json::json!(false));
+    assert_eq!(resp["code"], "client_ip_collision");
+    paths.cleanup();
+}
+
+#[compio::test]
 async fn admin_revoke_removes_psk_entry_and_updates_clients() {
     let paths = unique_paths_full();
     write_clients_json(&paths.clients, &[]);

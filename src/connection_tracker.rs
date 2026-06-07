@@ -33,8 +33,39 @@ pub(crate) struct ConnectionTracker {
     drain_deadline: Duration,
 }
 
+/// RAII increment/decrement of the active-handler counter.
+/// `Token::new` increments; `Drop` decrements and notifies `empty`
+/// when the count returns to zero. Living inside the spawned future
+/// makes the decrement panic-safe — a handler panic still runs
+/// local `Drop`s, so `drain` is not stuck waiting for a notification
+/// that will never come. (Mirror of tokio-util's `TaskTrackerToken`.)
+struct Token {
+    active: ThinCell<usize>,
+    empty: Rc<Event>,
+}
+
+impl Token {
+    fn new(active: ThinCell<usize>, empty: Rc<Event>) -> Self {
+        *active.borrow() += 1;
+        Self { active, empty }
+    }
+}
+
+impl Drop for Token {
+    fn drop(&mut self) {
+        let mut a = self.active.borrow();
+        *a -= 1;
+        if *a == 0 {
+            self.empty.notify(usize::MAX);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DrainStats {
+    /// Per-tracker drain time. Only read by tests; the daemon
+    /// reports a wider shutdown window measured by the caller.
+    #[allow(dead_code)]
     pub drain_ms: u64,
     pub inflight_drained: usize,
     pub drain_complete: bool,
@@ -57,17 +88,13 @@ impl ConnectionTracker {
     where
         F: AsyncFnOnce() + 'static,
     {
-        *self.active.borrow() += 1;
-        let active = self.active.clone();
-        let empty = self.empty.clone();
+        let token = Token::new(self.active.clone(), self.empty.clone());
         let timeout = self.per_handler_timeout;
         compio::runtime::spawn(async move {
+            // Move token into the future so its Drop fires on
+            // normal exit, on timeout, AND on panic.
+            let _token = token;
             let _ = compio::time::timeout(timeout, handler()).await;
-            let mut a = active.borrow();
-            *a -= 1;
-            if *a == 0 {
-                empty.notify(usize::MAX);
-            }
         })
         .detach();
     }
@@ -137,5 +164,21 @@ mod tests {
         });
         let stats = tracker.drain().await;
         assert!(!stats.drain_complete, "drain should have timed out");
+    }
+
+    // Without the RAII Token, a panicking handler would leave the
+    // active counter inflated and `drain` would hang waiting for an
+    // empty notification that never fires. With the Token, the
+    // decrement runs in the handler future's local Drop chain.
+    #[compio::test]
+    async fn drain_completes_after_handler_panic() {
+        let tracker = ConnectionTracker::new(Duration::from_secs(5), Duration::from_secs(2));
+        tracker.spawn(async || {
+            panic!("handler boom");
+        });
+        // Give the spawned task a chance to run and panic.
+        compio::time::sleep(Duration::from_millis(50)).await;
+        let stats = tracker.drain().await;
+        assert!(stats.drain_complete, "drain should complete after panic");
     }
 }

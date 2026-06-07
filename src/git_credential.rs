@@ -68,8 +68,13 @@ pub enum GitCredentialError {
 /// inputs are tens of bytes; legitimate hosts/paths run hundreds at
 /// most. Bounded to defend against pathological inputs (e.g. a
 /// runaway value buffer) without restricting any plausible repo URL.
+///
+/// `PARSER_HARD_MAX` is the absolute parser ceiling for direct
+/// callers (fuzz harnesses, in-process tests). The daemon enforces
+/// a tighter per-connection `WIRE_READ_BUDGET` on the read loop
+/// before bytes even reach this parser; see `src/daemon.rs`.
 pub const MAX_VALUE_BYTES: usize = 4 * 1024;
-pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
+pub const PARSER_HARD_MAX: usize = 64 * 1024;
 
 /// Parse a git-credential request block.
 ///
@@ -85,9 +90,9 @@ pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 /// Returns `Err` on any deviation; the daemon closes the connection
 /// without a response on any error from this function.
 pub fn parse(input: &[u8]) -> Result<Request, GitCredentialError> {
-    if input.len() > MAX_REQUEST_BYTES {
+    if input.len() > PARSER_HARD_MAX {
         return Err(GitCredentialError::RequestTooLarge {
-            max: MAX_REQUEST_BYTES,
+            max: PARSER_HARD_MAX,
         });
     }
     let term_pos = input
@@ -544,7 +549,7 @@ mod tests {
         // Build a block one byte past the request cap. The cap is
         // checked before any line scanning, so we don't need a
         // well-formed inner shape.
-        let input = vec![b'x'; MAX_REQUEST_BYTES + 1];
+        let input = vec![b'x'; PARSER_HARD_MAX + 1];
         let err = parse(&input).unwrap_err();
         assert!(matches!(err, GitCredentialError::RequestTooLarge { .. }));
     }

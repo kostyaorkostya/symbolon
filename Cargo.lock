@@ -195,7 +195,6 @@ dependencies = [
  "compio-macros",
  "compio-net",
  "compio-runtime",
- "compio-signal",
  "compio-tls",
  "compio-ws",
 ]
@@ -360,19 +359,6 @@ checksum = "4f1ef3947d751725afe49ab18ce447d819cd8f4ea9b58ae94b8498eb8ad1f864"
 dependencies = [
  "cfg-if",
  "loom",
-]
-
-[[package]]
-name = "compio-signal"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1748b284601a5a267824b36894c7fc5e488b503f14a0a508f3b457ae018a451"
-dependencies = [
- "nix",
- "once_cell",
- "slab",
- "synchrony",
- "windows-sys",
 ]
 
 [[package]]
@@ -1555,18 +1541,6 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "tempfile",
-]
-
-[[package]]
-name = "nix"
-version = "0.31.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
-dependencies = [
- "bitflags",
- "cfg-if",
- "cfg_aliases",
- "libc",
 ]
 
 [[package]]

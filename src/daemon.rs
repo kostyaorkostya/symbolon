@@ -43,15 +43,22 @@ use compio::net::{UnixListener, UnixStream};
 use compio::runtime::CancelToken;
 use tracing::{info, warn};
 
-use crate::config::{ClientsFile, Config, SandboxMode};
+use crate::config::{ClientsFile, Config};
 use crate::connection_tracker::ConnectionTracker;
 use crate::cpu_worker::CpuWorker;
 use crate::git_credential::{self, GitCredentialError};
 use crate::providers::github::{GitHubProvider, GithubError};
 use crate::proxy_protocol::{self, ProxyProtocolError};
-use crate::sandbox::{self, SandboxError, SandboxLevel, SandboxPaths};
+use crate::sandbox::{self, SandboxError, SandboxPaths};
+use crate::stunnel::StunnelController;
 
-const MAX_REQUEST_BYTES: usize = 8 * 1024;
+/// Per-connection read budget enforced at the daemon's read loop.
+/// Tighter than `git_credential::PARSER_HARD_MAX` (which is the
+/// parser's absolute ceiling for direct callers) — at 8 KiB it caps
+/// slow-loris connections well below the parser limit.
+const WIRE_READ_BUDGET: usize = 8 * 1024;
+
+const _WIRE_BUDGET_FITS_PARSER: () = assert!(WIRE_READ_BUDGET <= git_credential::PARSER_HARD_MAX);
 const PER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_CHUNK_BYTES: usize = 1024;
 
@@ -106,7 +113,7 @@ pub struct SharedState {
     pub(crate) providers: HashMap<String, GitHubProvider>,
     pub(crate) psk_file_path: PathBuf,
     pub(crate) clients_file_path: PathBuf,
-    pub(crate) stunnel_pidfile: PathBuf,
+    pub(crate) stunnel: Rc<StunnelController>,
     pub(crate) listen_socket_path: PathBuf,
     pub(crate) admin_socket_path: PathBuf,
     pub(crate) start_time: SystemTime,
@@ -174,6 +181,17 @@ impl Service {
         };
 
         // Pre-sandbox: bind both UDS.
+        //
+        // There is a microsecond-scale race between bind(2) and
+        // chmod() where the socket inode briefly carries umask-
+        // default perms. Per INSTALL.md the parent directories
+        // (/run/gcb, /etc/gcb) are 0o750 owned by group `gcb`, so a
+        // world-mode socket inside them is still unreachable from
+        // outside that group — the race has no observer in our
+        // deployment. A process-wide umask(0o077) would close even
+        // the theoretical window but contaminates atomic_write
+        // throughout the process; see commit log for the trial and
+        // rationale.
         let listen_path = &cfg.listen.socket;
         unlink_stale(listen_path).await?;
         let listener =
@@ -217,12 +235,13 @@ impl Service {
             providers.insert(gh.host.clone(), provider);
         }
 
+        let stunnel = Rc::new(StunnelController::new(cfg.stunnel.pidfile.clone()));
         let state = Rc::new(SharedState {
             clients: RefCell::new(clients_table),
             providers,
             psk_file_path: cfg.stunnel.psk_file.clone(),
             clients_file_path: cfg.clients.file.clone(),
-            stunnel_pidfile: cfg.stunnel.pidfile.clone(),
+            stunnel,
             listen_socket_path: cfg.listen.socket.clone(),
             admin_socket_path: cfg.admin.socket_path.clone(),
             start_time: SystemTime::now(),
@@ -331,10 +350,23 @@ impl Service {
             }
         }
 
+        // Measure the full shutdown window: drain + admin-join + any
+        // straggler cleanup. The previous accounting only covered
+        // listen-side drain; admin-side drain happens inside
+        // `admin_handle`'s loop, and unbounded admin handlers could
+        // hide latency from the JSON log line.
+        let shutdown_start = Instant::now();
         let drain_stats = tracker.drain().await;
-        let drain_ms = drain_stats.drain_ms;
         let inflight_drained = drain_stats.inflight_drained;
         let drain_complete = drain_stats.drain_complete;
+
+        // Join admin loop. By this point shutdown is cancelled so
+        // its inner select! will break; it then runs its own internal
+        // drain on its tracker. Time spent here is also part of the
+        // shutdown latency budget.
+        let _ = admin_handle.await;
+
+        let drain_ms = shutdown_start.elapsed().as_millis() as u64;
         if !drain_complete {
             tracing::warn!(
                 evt = "drain_incomplete",
@@ -343,10 +375,6 @@ impl Service {
                 "drain deadline expired with handlers still in flight",
             );
         }
-
-        // Join admin loop. By this point shutdown is cancelled so
-        // its inner select! will break.
-        let _ = admin_handle.await;
 
         // PROTOCOLS.md step 3: "Close the admin socket and the listen
         // socket (unlinking them)." — admin first, then listen.
@@ -399,7 +427,7 @@ pub(crate) async fn reload_clients(state: &Rc<SharedState>, path: &Path) {
     );
 }
 
-fn canonicalize_ip(ip: IpAddr) -> IpAddr {
+pub(crate) fn canonicalize_ip(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
             Some(v4) => IpAddr::V4(v4),
@@ -434,11 +462,7 @@ const fn nameservice_files() -> &'static [&'static str] {
 }
 
 fn apply_sandbox(cfg: &Config) -> Result<(), DaemonError> {
-    let level = match cfg.security.sandbox {
-        SandboxMode::Required => SandboxLevel::Required,
-        SandboxMode::BestEffort => SandboxLevel::BestEffort,
-        SandboxMode::Off => SandboxLevel::Off,
-    };
+    let level = cfg.security.sandbox;
     let mut read_dirs = vec![PathBuf::from("/etc/ssl/certs")];
     read_dirs.extend(cfg.security.extra_read_dirs.iter().cloned());
     let paths = SandboxPaths {
@@ -546,12 +570,12 @@ fn build_clients_table(file: ClientsFile) -> Result<HashMap<IpAddr, ResolvedClie
 async fn handle_connection(mut stream: UnixStream, req_id: String, state: Rc<SharedState>) {
     let mut chunk: Vec<u8> = Vec::with_capacity(READ_CHUNK_BYTES);
     // ------ Phase 1: PROXY v2 header ------
-    let mut buf: Vec<u8> = Vec::with_capacity(MAX_REQUEST_BYTES);
+    let mut buf: Vec<u8> = Vec::with_capacity(WIRE_READ_BUDGET);
     let parsed = loop {
         match proxy_protocol::parse(&buf) {
             Ok(p) => break p,
             Err(ProxyProtocolError::Incomplete { need_total, .. }) => {
-                if need_total > MAX_REQUEST_BYTES {
+                if need_total > WIRE_READ_BUDGET {
                     warn!(
                         req_id = %req_id,
                         evt = "proxy_header_invalid",
@@ -601,13 +625,13 @@ async fn handle_connection(mut stream: UnixStream, req_id: String, state: Rc<Sha
     info!(req_id = %req_id, evt = "accept", src_ip = %parsed.source_ip, client = %client.name);
 
     // ------ Phase 3: git-credential block ------
-    let mut block: Vec<u8> = Vec::with_capacity(MAX_REQUEST_BYTES - parsed.header_len);
+    let mut block: Vec<u8> = Vec::with_capacity(WIRE_READ_BUDGET - parsed.header_len);
     block.extend_from_slice(&buf[parsed.header_len..]);
     let request = loop {
         match git_credential::parse(&block) {
             Ok(r) => break r,
             Err(GitCredentialError::UnterminatedBlock) => {
-                if block.len() >= MAX_REQUEST_BYTES - parsed.header_len {
+                if block.len() >= WIRE_READ_BUDGET - parsed.header_len {
                     warn!(
                         req_id = %req_id,
                         evt = "mint_denied",
@@ -925,7 +949,7 @@ mod tests {
             providers: HashMap::new(),
             psk_file_path: PathBuf::new(),
             clients_file_path: PathBuf::new(),
-            stunnel_pidfile: PathBuf::new(),
+            stunnel: Rc::new(StunnelController::new(PathBuf::new())),
             listen_socket_path: PathBuf::new(),
             admin_socket_path: PathBuf::new(),
             start_time: SystemTime::now(),

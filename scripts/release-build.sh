@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
 # Reproduce the CI release build locally with the same path-trim
 # and post-strip pass. Works for any user — `$HOME` and the repo
-# root from `git rev-parse` are resolved per machine, so no
-# usernames or local paths end up in the resulting binary.
+# root from the script's own location are resolved per machine,
+# so no usernames or local paths end up in the resulting binary.
 #
 # Usage:
 #   ./scripts/release-build.sh                            # x86_64-musl
 #   ./scripts/release-build.sh aarch64-unknown-linux-musl
 #
-# Requires `cargo-zigbuild` and `zig` on $PATH.
+# Requires `cargo-zigbuild` and `zig` on $PATH. No git checkout
+# required — the script anchors off its own filesystem location.
 
 set -euo pipefail
 
 TARGET="${1:-x86_64-unknown-linux-musl}"
-REPO="$(git rev-parse --show-toplevel)"
+# Anchor off this script's own path: scripts/release-build.sh sits
+# one level below the repo root, regardless of CWD or whether `.git`
+# exists. Works from any caller and from extracted tarballs.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(dirname "${SCRIPT_DIR}")"
 
 # Mirrors the CI workflow's Build step. --remap-path-scope=all is
 # required to cover macro-expanded paths (rust-lang/rust#83635);

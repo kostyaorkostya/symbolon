@@ -65,7 +65,7 @@ tail -f /var/log/gcb.log | jq -c .
 
 jq -c 'select(.evt == "mint" and .client == "dev-vm-1")' < /var/log/gcb.log
 
-jq -c 'select(.evt == "mint_denied") | {ts, client, repo, reason}' \
+jq -c 'select(.evt == "mint_denied") | {timestamp, client, repo, reason}' \
   < /var/log/gcb.log
 
 jq -c 'select(.evt == "provider_error")' < /var/log/gcb.log | tail -100

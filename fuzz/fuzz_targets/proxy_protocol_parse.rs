@@ -7,5 +7,5 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let _ = gcb::proxy_protocol::parse(data);
+    let _ = gcb::parse_proxy_protocol(data);
 });

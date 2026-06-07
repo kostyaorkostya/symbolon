@@ -363,14 +363,19 @@ On any other signal except SIGHUP: terminate fast; do not drain.
 ## Logging schema
 
 Structured JSON to stdout (warn/error to stderr), one record per
-line.
+line. Produced by `tracing-subscriber`'s built-in JSON formatter
+with `flatten_event(true)`, so user-added fields appear as
+top-level keys.
 
 **Required fields on every record:**
 
-- `ts` — RFC 3339 UTC, millisecond precision.
-- `lvl` — `trace | debug | info | warn | error`.
-- `evt` — event name (closed set, below).
+- `timestamp` — RFC 3339 UTC, subsecond precision. Emitted by
+  `tracing-subscriber`'s default JSON timer.
+- `level` — `TRACE | DEBUG | INFO | WARN | ERROR` (uppercase,
+  per the built-in formatter).
+- `evt` — event name (closed set, below). User-added field.
 - `req_id` — ULID generated at TCP accept, threaded through.
+  User-added field.
 
 **Per-event additional fields:**
 

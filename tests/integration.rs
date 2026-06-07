@@ -8,9 +8,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use gcb::config::ProviderGithub;
-use gcb::cpu_worker::CpuWorker;
-use gcb::providers::github::{GitHubProvider, GithubError};
+use gcb::CpuWorker;
+use gcb::ProviderGithub;
+use gcb::{GitHubProvider, GithubError};
 
 use serde_json::json;
 use wiremock::matchers::{body_bytes, header, method, path};
@@ -308,7 +308,7 @@ mod daemon_e2e {
     use compio::BufResult;
     use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
     use compio::net::UnixStream;
-    use gcb::config::{
+    use gcb::{
         AdminConfig, ClientsConfig, Config, ListenConfig, LogLevel, LoggingConfig, Providers,
         RuntimeConfig, SandboxMode, SecurityConfig, StunnelConfig,
     };
@@ -460,7 +460,7 @@ mod daemon_e2e {
         let cfg = build_config(socket_path.clone(), clients_path.clone(), server.uri());
 
         compio::runtime::spawn(async move {
-            let _ = gcb::daemon::run(&cfg, std::path::Path::new("/test/config.toml")).await;
+            let _ = gcb::run_daemon(&cfg, std::path::Path::new("/test/config.toml")).await;
         })
         .detach();
         wait_for_socket(&socket_path).await;
@@ -489,7 +489,7 @@ mod daemon_e2e {
         let cfg = build_config(socket_path.clone(), clients_path.clone(), server.uri());
 
         compio::runtime::spawn(async move {
-            let _ = gcb::daemon::run(&cfg, std::path::Path::new("/test/config.toml")).await;
+            let _ = gcb::run_daemon(&cfg, std::path::Path::new("/test/config.toml")).await;
         })
         .detach();
         wait_for_socket(&socket_path).await;
@@ -513,7 +513,7 @@ mod daemon_e2e {
         let cfg = build_config(socket_path.clone(), clients_path.clone(), server.uri());
 
         compio::runtime::spawn(async move {
-            let _ = gcb::daemon::run(&cfg, std::path::Path::new("/test/config.toml")).await;
+            let _ = gcb::run_daemon(&cfg, std::path::Path::new("/test/config.toml")).await;
         })
         .detach();
         wait_for_socket(&socket_path).await;
@@ -535,7 +535,7 @@ mod daemon_e2e {
         let cfg = build_config(socket_path.clone(), clients_path.clone(), server.uri());
 
         compio::runtime::spawn(async move {
-            let _ = gcb::daemon::run(&cfg, std::path::Path::new("/test/config.toml")).await;
+            let _ = gcb::run_daemon(&cfg, std::path::Path::new("/test/config.toml")).await;
         })
         .detach();
         wait_for_socket(&socket_path).await;
@@ -561,7 +561,7 @@ mod daemon_e2e {
         let cfg = build_config(socket_path.clone(), clients_path.clone(), server.uri());
 
         compio::runtime::spawn(async move {
-            let _ = gcb::daemon::run(&cfg, std::path::Path::new("/test/config.toml")).await;
+            let _ = gcb::run_daemon(&cfg, std::path::Path::new("/test/config.toml")).await;
         })
         .detach();
         wait_for_socket(&socket_path).await;
@@ -594,7 +594,7 @@ mod admin_e2e {
     use compio::BufResult;
     use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
     use compio::net::UnixStream;
-    use gcb::config::{
+    use gcb::{
         AdminConfig, ClientsConfig, Config, ListenConfig, LogLevel, LoggingConfig, Providers,
         RuntimeConfig, SandboxMode, SecurityConfig, StunnelConfig,
     };
@@ -683,7 +683,7 @@ mod admin_e2e {
     async fn spawn_daemon(paths: &TempPaths, api_base: String) {
         let cfg = build_full_config(paths, api_base);
         compio::runtime::spawn(async move {
-            let _ = gcb::daemon::run(&cfg, std::path::Path::new("/test/config.toml")).await;
+            let _ = gcb::run_daemon(&cfg, std::path::Path::new("/test/config.toml")).await;
         })
         .detach();
         wait_for_socket(&paths.admin).await;

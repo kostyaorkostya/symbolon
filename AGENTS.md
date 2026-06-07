@@ -146,11 +146,13 @@ Pinned in `Cargo.toml`:
 - `time` with `default-features = false, features = ["parsing",
   "formatting"]` (RFC3339 → `SystemTime` for GitHub's `expires_at`,
   RFC2822 for the HTTP `Date` header in selfcheck, and RFC3339
-  rendering of `enrolled_at` on enroll plus the `ts` field in JSON
-  log lines). Defaults disabled to strip the surface we don't use.
-- `tracing`, `tracing-subscriber` (JSON logging; custom
-  `FormatEvent` in `src/main.rs` renames `timestamp`/`level` to
-  `ts`/`lvl` per PROTOCOLS.md).
+  rendering of `enrolled_at` on enroll). Defaults disabled to
+  strip the surface we don't use.
+- `tracing`, `tracing-subscriber` with `features = ["json"]`
+  (structured JSON logging via the built-in `fmt::Json`
+  formatter; configured in `src/logging.rs` with
+  `flatten_event(true)` so user-added fields like `evt` and
+  `req_id` appear as top-level JSON keys).
 - `futures-util` (`select!` and `FutureExt::fuse()` for the
   accept-vs-signal race in `daemon::run`; compio's own examples
   pull it in the same way — see compio-0.18 `examples/tick.rs`).
@@ -274,7 +276,7 @@ src/
   signals.rs           # signal-hook-registry handlers → CancelToken
   ready.rs             # sd_notify + pidfile (atomic) at startup
   loader.rs            # async config/clients.json file reads
-  logging.rs           # GcbJsonFormatter (ts/lvl/evt field renames)
+  logging.rs           # tracing-subscriber JSON setup (stdout/stderr split)
   sandbox.rs           # landlock + seccomp
   providers/
     mod.rs             # Provider abstraction (lightweight)

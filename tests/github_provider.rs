@@ -1,0 +1,235 @@
+//! GitHub provider tests: `GitHubProvider` against a `wiremock` server.
+//!
+//! wiremock runs a tokio runtime in a sidecar thread; the cyper
+//! request loops in compio on the test thread; they meet over a
+//! localhost TCP port.
+
+mod common;
+
+use std::time::UNIX_EPOCH;
+
+use gcb::GithubError;
+use serde_json::json;
+use wiremock::matchers::{body_bytes, header, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+use common::{
+    EXPIRES_AT, OWNER, REPO, REPO_ID, TOKEN, build_provider, canonical_mint_body, mint_path,
+    mount_mint_ok, mount_repo_ok, repo_path,
+};
+
+#[compio::test]
+async fn mint_happy_path() {
+    let server = MockServer::start().await;
+    mount_repo_ok(&server).await;
+    mount_mint_ok(&server).await;
+
+    let provider = build_provider(server.uri()).await;
+    let outcome = provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
+
+    assert_eq!(outcome.response.username, "x-access-token");
+    assert_eq!(outcome.response.password, TOKEN);
+    assert_eq!(outcome.repo_id, REPO_ID);
+    let secs = outcome
+        .response
+        .password_expiry_utc
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // 2026-05-31T13:00:00Z = 1780232400
+    assert_eq!(secs, 1_780_232_400);
+}
+
+#[compio::test]
+async fn mint_uses_cached_repo_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(repo_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": REPO_ID})))
+        .expect(1) // GET must be called exactly once across both mints
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(mint_path()))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(json!({"token": TOKEN, "expires_at": EXPIRES_AT})),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let provider = build_provider(server.uri()).await;
+    provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
+    provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
+    // MockServer's drop verifies `.expect(N)` counts.
+}
+
+#[compio::test]
+async fn mint_request_headers_and_body_exact() {
+    let server = MockServer::start().await;
+    mount_repo_ok(&server).await;
+    Mock::given(method("POST"))
+        .and(path(mint_path()))
+        .and(header("Accept", "application/vnd.github+json"))
+        .and(header("X-GitHub-Api-Version", "2022-11-28"))
+        .and(header(
+            "User-Agent",
+            concat!("gcb/", env!("CARGO_PKG_VERSION")),
+        ))
+        .and(header("Content-Type", "application/json"))
+        .and(body_bytes(canonical_mint_body()))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(json!({"token": TOKEN, "expires_at": EXPIRES_AT})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let provider = build_provider(server.uri()).await;
+    provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
+}
+
+#[compio::test]
+async fn resolve_returns_404() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(repo_path()))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let provider = build_provider(server.uri()).await;
+    let err = provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap_err();
+    assert!(
+        matches!(err, GithubError::RepoNotFound { ref path } if path == &format!("{OWNER}/{REPO}"))
+    );
+}
+
+#[compio::test]
+async fn mint_returns_401() {
+    let server = MockServer::start().await;
+    mount_repo_ok(&server).await;
+    Mock::given(method("POST"))
+        .and(path(mint_path()))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+
+    let provider = build_provider(server.uri()).await;
+    assert!(matches!(
+        provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap_err(),
+        GithubError::Unauthorized
+    ));
+}
+
+#[compio::test]
+async fn mint_returns_403() {
+    let server = MockServer::start().await;
+    mount_repo_ok(&server).await;
+    Mock::given(method("POST"))
+        .and(path(mint_path()))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+
+    let provider = build_provider(server.uri()).await;
+    assert!(matches!(
+        provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap_err(),
+        GithubError::Forbidden
+    ));
+}
+
+#[compio::test]
+async fn mint_returns_429() {
+    let server = MockServer::start().await;
+    mount_repo_ok(&server).await;
+    Mock::given(method("POST"))
+        .and(path(mint_path()))
+        .respond_with(ResponseTemplate::new(429))
+        .mount(&server)
+        .await;
+
+    let provider = build_provider(server.uri()).await;
+    assert!(matches!(
+        provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap_err(),
+        GithubError::RateLimited
+    ));
+}
+
+#[compio::test]
+async fn mint_returns_500() {
+    let server = MockServer::start().await;
+    mount_repo_ok(&server).await;
+    Mock::given(method("POST"))
+        .and(path(mint_path()))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let provider = build_provider(server.uri()).await;
+    assert!(matches!(
+        provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap_err(),
+        GithubError::ServerError(500)
+    ));
+}
+
+#[compio::test]
+async fn mint_invalidates_on_404() {
+    let server = MockServer::start().await;
+
+    // The GET resolver is always available — we expect it to be hit
+    // exactly twice (once for the first successful mint, once again
+    // after the 404-driven cache invalidation forces a re-resolve).
+    Mock::given(method("GET"))
+        .and(path(repo_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": REPO_ID})))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    // First POST: success. Use a scoped mock so we can remove it.
+    let first_post = Mock::given(method("POST"))
+        .and(path(mint_path()))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(json!({"token": TOKEN, "expires_at": EXPIRES_AT})),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let provider = build_provider(server.uri()).await;
+    provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
+
+    drop(first_post);
+
+    // Second POST: 404 (repo deleted/recreated).
+    let second_post = Mock::given(method("POST"))
+        .and(path(mint_path()))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let err = provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap_err();
+    assert!(matches!(err, GithubError::RepoNotFound { .. }));
+
+    drop(second_post);
+
+    // Third POST: succeeds again; GET must fire again because the
+    // 404 invalidated the cached repo-id.
+    Mock::given(method("POST"))
+        .and(path(mint_path()))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(json!({"token": TOKEN, "expires_at": EXPIRES_AT})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
+    // Drop of `server` at end of test verifies all `.expect(N)` counts.
+}

@@ -306,11 +306,7 @@ impl Service {
         // spawn is wrapped with PER_CONNECTION_TIMEOUT; drain on
         // shutdown waits up to 5 s for handlers to finish, after
         // which the spawned tasks are left to time out on their own.
-        let tracker = ConnectionTracker::new(
-            state.shutdown.clone(),
-            PER_CONNECTION_TIMEOUT,
-            Duration::from_secs(5),
-        );
+        let tracker = ConnectionTracker::new(PER_CONNECTION_TIMEOUT, Duration::from_secs(5));
         loop {
             futures_util::select! {
                 accept_res = listener.accept().fuse() => {
@@ -327,7 +323,7 @@ impl Service {
                     }
                     let req_id = ulid::Ulid::new().to_string();
                     let state = state.clone();
-                    tracker.spawn(move |_cancel| async move {
+                    tracker.spawn(async move || {
                         handle_connection(stream, req_id, state).await;
                     });
                 }

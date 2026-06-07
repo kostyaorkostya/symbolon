@@ -175,7 +175,6 @@ pub(crate) async fn run_admin_loop(
     let my_uid = rustix::process::geteuid().as_raw();
 
     let tracker = crate::connection_tracker::ConnectionTracker::new(
-        state.shutdown.clone(),
         PER_CONNECTION_TIMEOUT,
         Duration::from_secs(5),
     );
@@ -192,7 +191,7 @@ pub(crate) async fn run_admin_loop(
                     continue;
                 }
                 let state = state.clone();
-                tracker.spawn(move |_cancel| async move {
+                tracker.spawn(async move || {
                     handle_admin(stream, state).await;
                 });
             }

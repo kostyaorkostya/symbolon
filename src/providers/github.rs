@@ -71,7 +71,11 @@ enum CacheEntry {
     // await `listen()` instead of issuing a duplicate resolve. The
     // resolver `notify`s on completion (success or failure), and
     // waiters retry the lookup — Done(id) by then, or evicted on
-    // failure.
+    // failure. `event_listener::Event` (re-exported by synchrony)
+    // is the multi-listener primitive needed here:
+    // `synchrony::AsyncFlag::wait` consumes the flag and only
+    // supports one waiter, which doesn't fit N concurrent mints
+    // for the same uncached repo.
     InFlight(Rc<synchrony::sync::event::Event>),
 }
 

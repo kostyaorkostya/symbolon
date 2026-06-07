@@ -9,20 +9,24 @@
 //! multi-thread variant — `notify` is `&self`).
 //!
 //! Usage: build with `new(cancel, per_handler_timeout, drain_deadline)`,
-//! `spawn(handler)` to launch a connection handler that gets a clone
-//! of the cancel token, then `drain(self)` on shutdown to wait for
-//! handlers to finish (bounded by `drain_deadline`).
+//! `spawn(handler)` to launch a connection handler, then
+//! `drain(self)` on shutdown to wait for handlers to finish
+//! (bounded by `drain_deadline`).
+//!
+//! Per-handler shutdown observation is NOT delivered through this
+//! tracker — handlers reach into `GitHubProvider.cancel` (a clone
+//! of the same shutdown token) for the HTTPS calls that dominate
+//! their wall-clock time. Short-running UDS reads are bounded by
+//! `per_handler_timeout` and by stunnel closing the upstream
+//! connection on its own shutdown.
 
-use std::future::Future;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use compio::runtime::CancelToken;
 use synchrony::sync::event::Event;
 use thin_cell::unsync::ThinCell;
 
 pub(crate) struct ConnectionTracker {
-    cancel: CancelToken,
     active: ThinCell<usize>,
     empty: Rc<Event>,
     per_handler_timeout: Duration,
@@ -37,13 +41,8 @@ pub(crate) struct DrainStats {
 }
 
 impl ConnectionTracker {
-    pub(crate) fn new(
-        cancel: CancelToken,
-        per_handler_timeout: Duration,
-        drain_deadline: Duration,
-    ) -> Self {
+    pub(crate) fn new(per_handler_timeout: Duration, drain_deadline: Duration) -> Self {
         Self {
-            cancel,
             active: ThinCell::new(0),
             empty: Rc::new(Event::new()),
             per_handler_timeout,
@@ -51,22 +50,19 @@ impl ConnectionTracker {
         }
     }
 
-    /// Spawn a connection handler. The handler receives a clone of
-    /// the cancel token; it may use that to race per-operation
-    /// awaits against shutdown. The handler is also wrapped in a
-    /// hard `per_handler_timeout` to bound stuck connections.
-    pub(crate) fn spawn<F, Fut>(&self, handler: F)
+    /// Spawn a connection handler bounded by `per_handler_timeout`.
+    /// The handler is detached; the tracker counts in-flight
+    /// handlers and notifies `drain` when the count returns to zero.
+    pub(crate) fn spawn<F>(&self, handler: F)
     where
-        F: FnOnce(CancelToken) -> Fut + 'static,
-        Fut: Future<Output = ()> + 'static,
+        F: AsyncFnOnce() + 'static,
     {
         *self.active.borrow() += 1;
         let active = self.active.clone();
         let empty = self.empty.clone();
-        let cancel = self.cancel.clone();
         let timeout = self.per_handler_timeout;
         compio::runtime::spawn(async move {
-            let _ = compio::time::timeout(timeout, handler(cancel)).await;
+            let _ = compio::time::timeout(timeout, handler()).await;
             let mut a = active.borrow();
             *a -= 1;
             if *a == 0 {
@@ -115,9 +111,7 @@ mod tests {
 
     #[compio::test]
     async fn drain_returns_immediately_when_no_handlers_spawned() {
-        let cancel = CancelToken::new();
-        let tracker =
-            ConnectionTracker::new(cancel, Duration::from_secs(1), Duration::from_secs(1));
+        let tracker = ConnectionTracker::new(Duration::from_secs(1), Duration::from_secs(1));
         let stats = tracker.drain().await;
         assert_eq!(stats.inflight_drained, 0);
         assert!(stats.drain_complete);
@@ -125,10 +119,8 @@ mod tests {
 
     #[compio::test]
     async fn drain_waits_for_handlers_to_finish() {
-        let cancel = CancelToken::new();
-        let tracker =
-            ConnectionTracker::new(cancel, Duration::from_secs(5), Duration::from_secs(5));
-        tracker.spawn(|_| async {
+        let tracker = ConnectionTracker::new(Duration::from_secs(5), Duration::from_secs(5));
+        tracker.spawn(async || {
             compio::time::sleep(Duration::from_millis(50)).await;
         });
         let stats = tracker.drain().await;
@@ -139,10 +131,8 @@ mod tests {
 
     #[compio::test]
     async fn drain_deadline_expires_with_incomplete_status() {
-        let cancel = CancelToken::new();
-        let tracker =
-            ConnectionTracker::new(cancel, Duration::from_secs(60), Duration::from_millis(50));
-        tracker.spawn(|_| async {
+        let tracker = ConnectionTracker::new(Duration::from_secs(60), Duration::from_millis(50));
+        tracker.spawn(async || {
             compio::time::sleep(Duration::from_secs(60)).await;
         });
         let stats = tracker.drain().await;

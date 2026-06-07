@@ -1,38 +1,20 @@
 //! stunnel control surface: send SIGHUP to the running stunnel
 //! process after we rewrite `gcb.psk`.
 //!
-//! Why a dedicated module: the dance is non-trivial — read pidfile,
-//! open pidfd, verify comm, send signal — and it carries a load-
-//! bearing security property (no signal lands on a PID-reused
-//! process). Pulling it out of `admin.rs` lets us test it against a
-//! real child process and gives the daemon one place to grow if we
-//! ever stop signalling via PID at all (e.g. systemd
-//! ExecReload=kill -HUP $MAINPID stunnel.service).
+//! Sequence (Linux 5.1+):
 //!
-//! ## TOCTOU defence (vs. the previous `kill_process(pid)` form)
+//! 1. read pidfile → pid.
+//! 2. `pidfd_open(pid)` — returns an `OwnedFd` that pins the
+//!    process. While the pidfd is held the kernel will not
+//!    recycle that PID; the task_struct is reference-counted by
+//!    the fd.
+//! 3. read `/proc/<pid>/comm`, verify it is `"stunnel"`.
+//! 4. `pidfd_send_signal(&pidfd, SIGHUP)` — atomic; returns ESRCH
+//!    if the bound process has exited.
 //!
-//! Old shape:
-//! 1. read pidfile → pid
-//! 2. open `/proc/<pid>/comm`, compare to "stunnel"
-//! 3. `kill_process(pid, SIGHUP)`
-//!
-//! Between steps 2 and 3 the original stunnel could exit and the
-//! kernel could recycle its PID into an unrelated process; SIGHUP
-//! would then land on the wrong target.
-//!
-//! New shape:
-//! 1. read pidfile → pid
-//! 2. `pidfd_open(pid)` — returns an `OwnedFd` that **pins** the
-//!    process. While the pidfd is held, the kernel won't recycle
-//!    that PID (the task_struct is reference-counted by the pidfd).
-//! 3. read `/proc/<pid>/comm` — guaranteed to be the same process
-//!    the pidfd is bound to.
-//! 4. `pidfd_send_signal(&pidfd, SIGHUP)` — targets the pidfd-bound
-//!    process atomically (returns ESRCH if it has exited; no chance
-//!    of landing on a recycled PID).
-//!
-//! See `docs/REFERENCES.md` for the kernel man pages; requires Linux
-//! 5.1+ (well within our musl deployment baseline).
+//! Invariant: the signal cannot land on a PID-reused process.
+//! The pidfd pin keeps the comm verification race-free until the
+//! signal is delivered.
 
 use std::path::PathBuf;
 

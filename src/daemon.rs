@@ -401,9 +401,17 @@ pub async fn run(cfg: &Config, config_path: &Path) -> Result<RunStats, DaemonErr
     service.run().await
 }
 
-/// Reload `clients.json` and atomically swap the in-memory table.
-/// Public so `crate::signals` can call it on SIGHUP.
-pub(crate) async fn reload_clients(state: &Rc<SharedState>, path: &Path) {
+impl SharedState {
+    /// Reload `clients.json` and atomically swap the in-memory
+    /// table. Public so the SIGHUP handler installed by `main` can
+    /// drive a reload through the state handle without importing
+    /// daemon-internal helpers.
+    pub async fn reload_clients(&self, path: &Path) {
+        reload_clients_inner(self, path).await
+    }
+}
+
+async fn reload_clients_inner(state: &SharedState, path: &Path) {
     let file = match crate::loader::load_clients_file(path).await {
         Ok(f) => f,
         Err(e) => {
@@ -982,7 +990,7 @@ mod tests {
             r#"{"version":1,"clients":[{"name":"new","ip":"10.0.0.2","providers":["github"],"enrolled_at":"y","note":null}]}"#,
         )
         .unwrap();
-        reload_clients(&state, &path).await;
+        state.reload_clients(&path).await;
         let borrow = state.clients.borrow();
         assert_eq!(borrow.len(), 1);
         assert!(borrow.get(&"10.0.0.2".parse().unwrap()).is_some());

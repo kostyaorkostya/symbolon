@@ -1,6 +1,7 @@
-//! Signal-to-cancellation glue. Sits between the kernel signal
-//! delivery and the daemon, which knows only about
-//! `CancelToken::wait()` and `daemon::reload_clients`.
+//! Signal-to-cancellation glue. Demuxes kernel signal deliveries
+//! to async-friendly outputs: SIGTERM/SIGINT cancel a
+//! `CancelToken`; SIGHUP invokes a caller-supplied async closure.
+//! The module is intentionally ignorant of what the closure does.
 //!
 //! Implementation: a single long-lived OS signal handler is
 //! installed once at startup via `signal-hook-registry`, and stays
@@ -24,9 +25,7 @@
 
 use std::future::Future;
 use std::io;
-use std::path::PathBuf;
 use std::pin::Pin;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
@@ -34,8 +33,6 @@ use std::task::{Context, Poll};
 use compio::runtime::{CancelToken, JoinHandle};
 use futures_util::FutureExt;
 use futures_util::task::AtomicWaker;
-
-use crate::daemon::{self, SharedState};
 
 /// Long-lived signal notifier: signal handler calls `notify()`,
 /// async waiters call `notified().await`. Cleared on each take, so
@@ -113,13 +110,21 @@ pub fn spawn_shutdown_watcher(shutdown: CancelToken) -> io::Result<JoinHandle<&'
 }
 
 /// Install a long-lived handler for SIGHUP, spawn the task that
-/// reloads `clients.json` on each delivery. Exits cleanly when
+/// calls `on_sighup` on each delivery. Exits cleanly when
 /// `shutdown` fires.
-pub fn spawn_sighup_handler(
-    state: Rc<SharedState>,
-    clients_path: PathBuf,
+///
+/// The handler body is supplied by the caller, so this module
+/// doesn't depend on what SIGHUP means in any given binary. To
+/// drive multiple reload-targets, compose them inside the closure
+/// (`async move { reload_a().await; reload_b().await; }`).
+pub fn spawn_sighup_handler<F, Fut>(
+    on_sighup: F,
     shutdown: CancelToken,
-) -> io::Result<JoinHandle<()>> {
+) -> io::Result<JoinHandle<()>>
+where
+    F: Fn() -> Fut + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
     let notifier = Arc::new(SignalNotifier::default());
     let pending = Arc::new(AtomicBool::new(false));
 
@@ -128,7 +133,7 @@ pub fn spawn_sighup_handler(
     Ok(compio::runtime::spawn(async move {
         loop {
             if pending.swap(false, Ordering::Acquire) {
-                daemon::reload_clients(&state, &clients_path).await;
+                on_sighup().await;
                 continue;
             }
             futures_util::select_biased! {

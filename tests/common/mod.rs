@@ -104,6 +104,7 @@ pub async fn build_provider(api_base: String) -> GitHubProvider {
         private_key_path: fixture_pem_path(),
         selfcheck_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(10),
+        user_agent: "gcb".to_string(),
     };
     let key = GitHubProvider::load_key(&cfg).await.unwrap();
     let worker = Rc::new(CpuWorker::new("gcb-test-jwt-signer").unwrap());
@@ -163,6 +164,7 @@ pub fn build_config(socket_path: PathBuf, clients_path: PathBuf, api_base: Strin
                 private_key_path: fixture_pem_path(),
                 selfcheck_timeout: Duration::from_secs(5),
                 request_timeout: Duration::from_secs(10),
+                user_agent: "gcb".to_string(),
             }),
         },
     }
@@ -200,6 +202,7 @@ pub fn build_full_config(paths: &TempPaths, api_base: String) -> Config {
                 private_key_path: fixture_pem_path(),
                 selfcheck_timeout: Duration::from_secs(5),
                 request_timeout: Duration::from_secs(10),
+                user_agent: "gcb".to_string(),
             }),
         },
     }

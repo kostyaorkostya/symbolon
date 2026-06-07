@@ -166,10 +166,21 @@ pub struct ProviderGithub {
     /// (e.g. `"10s"`). Defaults to 10s if omitted.
     #[serde(with = "humantime_serde", default = "default_request_timeout")]
     pub request_timeout: std::time::Duration,
+    /// HTTP `User-Agent` sent to the provider API. GitHub rejects
+    /// requests without one (403). Default `"gcb"` — no version
+    /// number is appended, since leaking the patch level narrows
+    /// the CVE list applicable to this binary. Operators can
+    /// override to e.g. their org name.
+    #[serde(default = "default_user_agent")]
+    pub user_agent: String,
 }
 
 fn default_request_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(10)
+}
+
+fn default_user_agent() -> String {
+    "gcb".to_string()
 }
 
 /// Top-level parsed `clients.json`. Serialize side is used by

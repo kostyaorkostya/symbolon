@@ -298,7 +298,10 @@ References: [REST API for App installations][gh-installs],
   - `Authorization: Bearer <jwt>`
   - `Accept: application/vnd.github+json`
   - `X-GitHub-Api-Version: <current>`
-  - `User-Agent: gcb/<version>` (required by GitHub; missing UA → 403)
+  - `User-Agent: <provider.github.user_agent>` — defaults to `gcb` if
+    unset; configurable by the operator. Required by GitHub (missing
+    UA → 403). Intentionally carries no version number so an
+    attacker can't narrow the applicable CVE list.
 - Body:
   ```json
   {

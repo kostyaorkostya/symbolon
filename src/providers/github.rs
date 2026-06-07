@@ -229,7 +229,7 @@ impl GitHubProvider {
             installation_id: cfg.installation_id,
             signer,
             client,
-            user_agent: format!("gcb/{}", env!("CARGO_PKG_VERSION")),
+            user_agent: cfg.user_agent.clone(),
             clock,
             repo_ids: RepoIdCache::default(),
             selfcheck_timeout: cfg.selfcheck_timeout,
@@ -887,6 +887,7 @@ mod tests {
             private_key_path: fixture_pem_path(),
             selfcheck_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(10),
+            user_agent: "gcb".to_string(),
         };
         let key = GitHubProvider::load_key(&cfg).await.unwrap();
         let worker = Rc::new(CpuWorker::new("gcb-test-jwt").unwrap());

@@ -70,9 +70,14 @@ async fn run_daemon(config_path: PathBuf) -> ExitCode {
         }
     };
 
+    let state_handle = service.state_handle();
+    let clients_path = cfg.clients.file.clone();
     let sighup = match gcb::spawn_sighup_handler(
-        service.state_handle(),
-        cfg.clients.file.clone(),
+        move || {
+            let state = state_handle.clone();
+            let path = clients_path.clone();
+            async move { state.reload_clients(&path).await }
+        },
         shutdown.clone(),
     ) {
         Ok(h) => h,

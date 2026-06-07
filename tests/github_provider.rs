@@ -73,10 +73,7 @@ async fn mint_request_headers_and_body_exact() {
         .and(path(mint_path()))
         .and(header("Accept", "application/vnd.github+json"))
         .and(header("X-GitHub-Api-Version", "2022-11-28"))
-        .and(header(
-            "User-Agent",
-            concat!("gcb/", env!("CARGO_PKG_VERSION")),
-        ))
+        .and(header("User-Agent", "gcb"))
         .and(header("Content-Type", "application/json"))
         .and(body_bytes(canonical_mint_body()))
         .respond_with(

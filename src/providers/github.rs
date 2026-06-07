@@ -16,7 +16,9 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use tracing::info;
 
 use compio::runtime::CancelToken;
 use cyper::redirect;
@@ -146,12 +148,22 @@ pub struct SelfcheckOutcome {
     pub(crate) installation_id: u64,
     pub(crate) api_base: String,
     pub(crate) clock_skew_sec: i64,
+    /// ULID of the outbound HTTPS call. Pairs with the
+    /// `provider_call` / `provider_call_done` breadcrumbs.
+    pub(crate) out_req_id: String,
+    /// `X-GitHub-Request-Id` returned by the API, if any.
+    pub(crate) gh_req_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct MintOutcome {
     pub response: git_credential::Response,
     pub repo_id: u64,
+    /// ULID of the outbound `mint_token` HTTPS call. Pairs with
+    /// the `provider_call` / `provider_call_done` breadcrumbs.
+    pub out_req_id: String,
+    /// `X-GitHub-Request-Id` returned by the mint endpoint, if any.
+    pub gh_req_id: Option<String>,
 }
 
 impl From<cyper::Error> for GithubError {
@@ -238,18 +250,71 @@ impl GitHubProvider {
         })
     }
 
-    /// Wrap an async operation with (1) shutdown-cancel race and
-    /// (2) bounded timeout. Returns `Cancelled` on cancel-first,
-    /// `Timeout` on deadline, or the inner result otherwise.
-    async fn timed<F, T>(&self, timeout: Duration, work: F) -> Result<T, GithubError>
+    /// Wrap one outbound HTTPS call: emits the `provider_call`
+    /// breadcrumb before, races shutdown + timeout around the
+    /// inner future, then emits `provider_call_done` with status +
+    /// `gh_req_id` + elapsed_ms.
+    ///
+    /// Returns the inner `T` together with the outbound `out_req_id`
+    /// (the ULID we minted for this call) and the response's
+    /// `X-GitHub-Request-Id` if present. On timeout/cancel/
+    /// transport-error a `provider_call_done` is still emitted
+    /// with `status = 0`.
+    async fn with_breadcrumbs<T, F, Fut>(
+        &self,
+        req_id: &str,
+        endpoint: &'static str,
+        timeout: Duration,
+        mk_inner: F,
+    ) -> Result<(T, String, Option<String>), GithubError>
     where
-        F: Future<Output = Result<T, GithubError>>,
+        F: FnOnce(String) -> Fut,
+        Fut: Future<Output = ProviderCall<T>>,
     {
-        futures_util::select_biased! {
+        let out_req_id = ulid::Ulid::new().to_string();
+        info!(
+            evt = "provider_call",
+            req_id = %req_id,
+            out_req_id = %out_req_id,
+            endpoint = endpoint,
+            provider = %self.api_base,
+            timeout_ms = timeout.as_millis() as u64,
+        );
+        let started = Instant::now();
+        let raced: Result<ProviderCall<T>, GithubError> = futures_util::select_biased! {
             _ = self.cancel.clone().wait().fuse() => Err(GithubError::Cancelled),
-            r = compio::time::timeout(timeout, work).fuse() => match r {
-                Ok(inner) => inner,
+            r = compio::time::timeout(timeout, mk_inner(out_req_id.clone())).fuse() => match r {
+                Ok(pc) => Ok(pc),
                 Err(_elapsed) => Err(GithubError::Timeout(timeout)),
+            }
+        };
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match raced {
+            Ok(pc) => {
+                info!(
+                    evt = "provider_call_done",
+                    req_id = %req_id,
+                    out_req_id = %out_req_id,
+                    status = pc.status,
+                    gh_req_id = pc.gh_req_id.as_deref().unwrap_or(""),
+                    elapsed_ms = elapsed_ms,
+                );
+                match pc.result {
+                    Ok(v) => Ok((v, out_req_id, pc.gh_req_id)),
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => {
+                info!(
+                    evt = "provider_call_done",
+                    req_id = %req_id,
+                    out_req_id = %out_req_id,
+                    status = 0,
+                    gh_req_id = "",
+                    elapsed_ms = elapsed_ms,
+                    error = %e,
+                );
+                Err(e)
             }
         }
     }
@@ -257,30 +322,94 @@ impl GitHubProvider {
     /// Verify the App private key signs a valid JWT and the App is
     /// reachable at `api_base`. The reported App ID must match the
     /// configured one — a mismatch indicates a wrong key/App pairing.
-    pub async fn selfcheck(&self) -> Result<SelfcheckOutcome, GithubError> {
-        self.timed(self.selfcheck_timeout, self.selfcheck_inner())
-            .await
+    pub async fn selfcheck(&self, req_id: &str) -> Result<SelfcheckOutcome, GithubError> {
+        let (mut outcome, out_req_id, gh_req_id) = self
+            .with_breadcrumbs(req_id, "selfcheck", self.selfcheck_timeout, |out| {
+                self.selfcheck_inner(out)
+            })
+            .await?;
+        outcome.out_req_id = out_req_id;
+        outcome.gh_req_id = gh_req_id;
+        Ok(outcome)
     }
 
-    async fn selfcheck_inner(&self) -> Result<SelfcheckOutcome, GithubError> {
-        let jwt = self.sign_jwt_now().await?;
+    async fn selfcheck_inner(&self, out_req_id: String) -> ProviderCall<SelfcheckOutcome> {
+        let jwt = match self.sign_jwt_now().await {
+            Ok(j) => j,
+            Err(e) => {
+                return ProviderCall {
+                    status: 0,
+                    gh_req_id: None,
+                    result: Err(e),
+                };
+            }
+        };
         let url = format!("{}/app", self.api_base);
-        let resp = self
+        let req = match self
             .client
-            .get(&url)?
-            .bearer_auth(&jwt)?
-            .header("Accept", ACCEPT_HEADER)?
-            .header("X-GitHub-Api-Version", GITHUB_API_VERSION)?
-            .header("User-Agent", &self.user_agent)?
-            .send()
-            .await?;
+            .get(&url)
+            .and_then(|r| r.bearer_auth(&jwt))
+            .and_then(|r| r.header("Accept", ACCEPT_HEADER))
+            .and_then(|r| r.header("X-GitHub-Api-Version", GITHUB_API_VERSION))
+            .and_then(|r| r.header("User-Agent", &self.user_agent))
+            .and_then(|r| r.header(X_REQUEST_ID_HEADER, &out_req_id))
+            .and_then(|r| {
+                r.header(
+                    REQUEST_TIMEOUT_HEADER,
+                    &self.selfcheck_timeout.as_secs().to_string(),
+                )
+            }) {
+            Ok(r) => r,
+            Err(e) => {
+                return ProviderCall {
+                    status: 0,
+                    gh_req_id: None,
+                    result: Err(GithubError::from(e)),
+                };
+            }
+        };
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                return ProviderCall {
+                    status: 0,
+                    gh_req_id: None,
+                    result: Err(GithubError::from(e)),
+                };
+            }
+        };
         let status = resp.status().as_u16();
+        let gh_req_id = read_gh_req_id(&resp);
         match status {
             200 => {}
-            401 => return Err(GithubError::Unauthorized),
-            403 => return Err(GithubError::Forbidden),
-            500..=599 => return Err(GithubError::ServerError(status)),
-            other => return Err(GithubError::UnexpectedStatus(other)),
+            401 => {
+                return ProviderCall {
+                    status,
+                    gh_req_id,
+                    result: Err(GithubError::Unauthorized),
+                };
+            }
+            403 => {
+                return ProviderCall {
+                    status,
+                    gh_req_id,
+                    result: Err(GithubError::Forbidden),
+                };
+            }
+            500..=599 => {
+                return ProviderCall {
+                    status,
+                    gh_req_id,
+                    result: Err(GithubError::ServerError(status)),
+                };
+            }
+            other => {
+                return ProviderCall {
+                    status,
+                    gh_req_id,
+                    result: Err(GithubError::UnexpectedStatus(other)),
+                };
+            }
         }
         // HTTP `Date` header (IMF-fixdate per RFC 7231 § 7.1.1.1) is
         // accepted by `time`'s Rfc2822 parser (`GMT` → zero offset).
@@ -295,33 +424,51 @@ impl GitHubProvider {
             })
             .map(|server_t| server_t.unix_timestamp() - OffsetDateTime::now_utc().unix_timestamp())
             .unwrap_or(0);
-        let body = resp.bytes().await?;
-        let v: serde_json::Value =
-            serde_json::from_slice(&body).map_err(|_| GithubError::JsonParse {
-                context: "selfcheck",
-            })?;
-        let reported =
-            v.get("client_id")
-                .and_then(|i| i.as_str())
-                .ok_or(GithubError::MissingField {
+        let body = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                return ProviderCall {
+                    status,
+                    gh_req_id,
+                    result: Err(GithubError::from(e)),
+                };
+            }
+        };
+        let parsed: Result<SelfcheckOutcome, GithubError> = (|| {
+            let v: serde_json::Value =
+                serde_json::from_slice(&body).map_err(|_| GithubError::JsonParse {
                     context: "selfcheck",
-                    field: "client_id",
                 })?;
-        if reported != self.client_id {
-            return Err(GithubError::ClientIdMismatch {
-                configured: self.client_id.clone(),
-                reported: reported.to_string(),
-            });
+            let reported =
+                v.get("client_id")
+                    .and_then(|i| i.as_str())
+                    .ok_or(GithubError::MissingField {
+                        context: "selfcheck",
+                        field: "client_id",
+                    })?;
+            if reported != self.client_id {
+                return Err(GithubError::ClientIdMismatch {
+                    configured: self.client_id.clone(),
+                    reported: reported.to_string(),
+                });
+            }
+            Ok(SelfcheckOutcome {
+                client_id: self.client_id.clone(),
+                installation_id: self.installation_id,
+                api_base: self.api_base.clone(),
+                clock_skew_sec,
+                out_req_id: String::new(),
+                gh_req_id: None,
+            })
+        })();
+        ProviderCall {
+            status,
+            gh_req_id,
+            result: parsed,
         }
-        Ok(SelfcheckOutcome {
-            client_id: self.client_id.clone(),
-            installation_id: self.installation_id,
-            api_base: self.api_base.clone(),
-            clock_skew_sec,
-        })
     }
 
-    pub async fn mint(&self, path: &str) -> Result<MintOutcome, GithubError> {
+    pub async fn mint(&self, req_id: &str, path: &str) -> Result<MintOutcome, GithubError> {
         let (owner, repo) = split_owner_repo(path)?;
         let key = format!(
             "{}/{}",
@@ -331,17 +478,19 @@ impl GitHubProvider {
         let now = (self.clock)();
 
         let repo_id = self
-            .resolve_with_singleflight(&key, owner, repo, now)
+            .resolve_with_singleflight(req_id, &key, owner, repo, now)
             .await?;
 
-        match self.mint_token(repo_id, path).await {
-            Ok((token, expires_at)) => Ok(MintOutcome {
+        match self.mint_token(req_id, repo_id, path).await {
+            Ok((token, expires_at, out_req_id, gh_req_id)) => Ok(MintOutcome {
                 response: git_credential::Response {
                     username: "x-access-token".to_string(),
                     password: token,
                     password_expiry_utc: expires_at,
                 },
                 repo_id,
+                out_req_id,
+                gh_req_id,
             }),
             Err(GithubError::RepoNotFound { path: p }) => {
                 // Repo deleted/recreated since the resolve — drop the
@@ -358,6 +507,7 @@ impl GitHubProvider {
     /// it completes, all waiters retry the cache lookup.
     async fn resolve_with_singleflight(
         &self,
+        req_id: &str,
         key: &str,
         owner: &str,
         repo: &str,
@@ -379,7 +529,7 @@ impl GitHubProvider {
                     // retry rather than block forever on a notify
                     // that will never come.
                     let mut guard = InFlightGuard::new(&self.repo_ids, key, ev);
-                    let result = self.resolve_repo_id(owner, repo).await;
+                    let result = self.resolve_repo_id(req_id, owner, repo).await;
                     match &result {
                         Ok(id) => self.repo_ids.put_done(key, *id, now + CACHE_TTL),
                         Err(_) => self.repo_ids.invalidate(key),
@@ -391,96 +541,216 @@ impl GitHubProvider {
         }
     }
 
-    async fn resolve_repo_id(&self, owner: &str, repo: &str) -> Result<u64, GithubError> {
-        self.timed(
-            self.request_timeout,
-            self.resolve_repo_id_inner(owner, repo),
-        )
-        .await
+    async fn resolve_repo_id(
+        &self,
+        req_id: &str,
+        owner: &str,
+        repo: &str,
+    ) -> Result<u64, GithubError> {
+        let (id, _out, _gh) = self
+            .with_breadcrumbs(req_id, "resolve_repo_id", self.request_timeout, |out| {
+                self.resolve_repo_id_inner(out, owner, repo)
+            })
+            .await?;
+        Ok(id)
     }
 
-    async fn resolve_repo_id_inner(&self, owner: &str, repo: &str) -> Result<u64, GithubError> {
-        let jwt = self.sign_jwt_now().await?;
+    async fn resolve_repo_id_inner(
+        &self,
+        out_req_id: String,
+        owner: &str,
+        repo: &str,
+    ) -> ProviderCall<u64> {
+        let jwt = match self.sign_jwt_now().await {
+            Ok(j) => j,
+            Err(e) => {
+                return ProviderCall {
+                    status: 0,
+                    gh_req_id: None,
+                    result: Err(e),
+                };
+            }
+        };
         let url = format!(
             "{}/repos/{}/{}",
             self.api_base,
             utf8_percent_encode(owner, REPO_PATH_SAFE),
             utf8_percent_encode(repo, REPO_PATH_SAFE),
         );
-        let resp = self
+        let req = match self
             .client
-            .get(&url)?
-            .bearer_auth(&jwt)?
-            .header("Accept", ACCEPT_HEADER)?
-            .header("X-GitHub-Api-Version", GITHUB_API_VERSION)?
-            .header("User-Agent", &self.user_agent)?
-            .send()
-            .await?;
-        let status = resp.status().as_u16();
-        match status {
-            200 => {}
-            401 => return Err(GithubError::Unauthorized),
-            403 => return Err(GithubError::Forbidden),
-            404 => {
-                return Err(GithubError::RepoNotFound {
-                    path: format!("{owner}/{repo}"),
-                });
+            .get(&url)
+            .and_then(|r| r.bearer_auth(&jwt))
+            .and_then(|r| r.header("Accept", ACCEPT_HEADER))
+            .and_then(|r| r.header("X-GitHub-Api-Version", GITHUB_API_VERSION))
+            .and_then(|r| r.header("User-Agent", &self.user_agent))
+            .and_then(|r| r.header(X_REQUEST_ID_HEADER, &out_req_id))
+            .and_then(|r| {
+                r.header(
+                    REQUEST_TIMEOUT_HEADER,
+                    &self.request_timeout.as_secs().to_string(),
+                )
+            }) {
+            Ok(r) => r,
+            Err(e) => {
+                return ProviderCall {
+                    status: 0,
+                    gh_req_id: None,
+                    result: Err(GithubError::from(e)),
+                };
             }
-            429 => return Err(GithubError::RateLimited),
-            500..=599 => return Err(GithubError::ServerError(status)),
-            _ => return Err(GithubError::UnexpectedStatus(status)),
+        };
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                return ProviderCall {
+                    status: 0,
+                    gh_req_id: None,
+                    result: Err(GithubError::from(e)),
+                };
+            }
+        };
+        let status = resp.status().as_u16();
+        let gh_req_id = read_gh_req_id(&resp);
+        let err: Option<GithubError> = match status {
+            200 => None,
+            401 => Some(GithubError::Unauthorized),
+            403 => Some(GithubError::Forbidden),
+            404 => Some(GithubError::RepoNotFound {
+                path: format!("{owner}/{repo}"),
+            }),
+            429 => Some(GithubError::RateLimited),
+            500..=599 => Some(GithubError::ServerError(status)),
+            _ => Some(GithubError::UnexpectedStatus(status)),
+        };
+        if let Some(e) = err {
+            return ProviderCall {
+                status,
+                gh_req_id,
+                result: Err(e),
+            };
         }
-        let body = resp.bytes().await?;
-        parse_repo_response(&body)
+        let body = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                return ProviderCall {
+                    status,
+                    gh_req_id,
+                    result: Err(GithubError::from(e)),
+                };
+            }
+        };
+        ProviderCall {
+            status,
+            gh_req_id,
+            result: parse_repo_response(&body),
+        }
     }
 
     async fn mint_token(
         &self,
+        req_id: &str,
         repo_id: u64,
         path: &str,
-    ) -> Result<(String, SystemTime), GithubError> {
-        self.timed(self.request_timeout, self.mint_token_inner(repo_id, path))
-            .await
+    ) -> Result<(String, SystemTime, String, Option<String>), GithubError> {
+        let ((token, expires_at), out_req_id, gh_req_id) = self
+            .with_breadcrumbs(req_id, "mint_token", self.request_timeout, |out| {
+                self.mint_token_inner(out, repo_id, path)
+            })
+            .await?;
+        Ok((token, expires_at, out_req_id, gh_req_id))
     }
 
     async fn mint_token_inner(
         &self,
+        out_req_id: String,
         repo_id: u64,
         path: &str,
-    ) -> Result<(String, SystemTime), GithubError> {
-        let jwt = self.sign_jwt_now().await?;
+    ) -> ProviderCall<(String, SystemTime)> {
+        let jwt = match self.sign_jwt_now().await {
+            Ok(j) => j,
+            Err(e) => {
+                return ProviderCall {
+                    status: 0,
+                    gh_req_id: None,
+                    result: Err(e),
+                };
+            }
+        };
         let url = format!(
             "{}/app/installations/{}/access_tokens",
             self.api_base, self.installation_id
         );
         let body = build_mint_body(repo_id);
-        let resp = self
+        let req = match self
             .client
-            .post(&url)?
-            .bearer_auth(&jwt)?
-            .header("Accept", ACCEPT_HEADER)?
-            .header("X-GitHub-Api-Version", GITHUB_API_VERSION)?
-            .header("User-Agent", &self.user_agent)?
-            .header("Content-Type", "application/json")?
-            .body(body)
-            .send()
-            .await?;
-        let status = resp.status().as_u16();
-        match status {
-            201 => {}
-            401 => return Err(GithubError::Unauthorized),
-            403 => return Err(GithubError::Forbidden),
-            404 => {
-                return Err(GithubError::RepoNotFound {
-                    path: path.to_string(),
-                });
+            .post(&url)
+            .and_then(|r| r.bearer_auth(&jwt))
+            .and_then(|r| r.header("Accept", ACCEPT_HEADER))
+            .and_then(|r| r.header("X-GitHub-Api-Version", GITHUB_API_VERSION))
+            .and_then(|r| r.header("User-Agent", &self.user_agent))
+            .and_then(|r| r.header("Content-Type", "application/json"))
+            .and_then(|r| r.header(X_REQUEST_ID_HEADER, &out_req_id))
+            .and_then(|r| {
+                r.header(
+                    REQUEST_TIMEOUT_HEADER,
+                    &self.request_timeout.as_secs().to_string(),
+                )
+            }) {
+            Ok(r) => r.body(body),
+            Err(e) => {
+                return ProviderCall {
+                    status: 0,
+                    gh_req_id: None,
+                    result: Err(GithubError::from(e)),
+                };
             }
-            429 => return Err(GithubError::RateLimited),
-            500..=599 => return Err(GithubError::ServerError(status)),
-            _ => return Err(GithubError::UnexpectedStatus(status)),
+        };
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                return ProviderCall {
+                    status: 0,
+                    gh_req_id: None,
+                    result: Err(GithubError::from(e)),
+                };
+            }
+        };
+        let status = resp.status().as_u16();
+        let gh_req_id = read_gh_req_id(&resp);
+        let err: Option<GithubError> = match status {
+            201 => None,
+            401 => Some(GithubError::Unauthorized),
+            403 => Some(GithubError::Forbidden),
+            404 => Some(GithubError::RepoNotFound {
+                path: path.to_string(),
+            }),
+            429 => Some(GithubError::RateLimited),
+            500..=599 => Some(GithubError::ServerError(status)),
+            _ => Some(GithubError::UnexpectedStatus(status)),
+        };
+        if let Some(e) = err {
+            return ProviderCall {
+                status,
+                gh_req_id,
+                result: Err(e),
+            };
         }
-        let bytes = resp.bytes().await?;
-        parse_mint_response(&bytes)
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                return ProviderCall {
+                    status,
+                    gh_req_id,
+                    result: Err(GithubError::from(e)),
+                };
+            }
+        };
+        ProviderCall {
+            status,
+            gh_req_id,
+            result: parse_mint_response(&bytes),
+        }
     }
 
     async fn sign_jwt_now(&self) -> Result<String, GithubError> {
@@ -493,6 +763,28 @@ enum CacheAction {
     Hit(u64),
     Wait(Rc<synchrony::sync::event::Event>),
     Resolve(Rc<synchrony::sync::event::Event>),
+}
+
+/// One outbound HTTPS call's bookkeeping: the parsed result, the
+/// response's HTTP status, and the `X-GitHub-Request-Id` header
+/// (if any). Even on error we still want status + gh_req_id for
+/// the `provider_call_done` log line, which is why this isn't a
+/// plain `Result`.
+struct ProviderCall<T> {
+    status: u16,
+    gh_req_id: Option<String>,
+    result: Result<T, GithubError>,
+}
+
+const REQUEST_TIMEOUT_HEADER: &str = "Request-Timeout";
+const X_REQUEST_ID_HEADER: &str = "X-Request-ID";
+const GH_REQUEST_ID_HEADER: &str = "x-github-request-id";
+
+fn read_gh_req_id(resp: &cyper::Response) -> Option<String> {
+    resp.headers()
+        .get(GH_REQUEST_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
 }
 
 /// Holds the InFlight claim for the resolver task. On `Drop` (i.e.

@@ -143,6 +143,27 @@ pub struct Service {
     admin_listener: UnixListener,
 }
 
+/// Cloneable, opaque handle to a running `Service`. External code
+/// uses this for operator-visible actions (e.g. reloading
+/// `clients.json` from a SIGHUP handler) without holding a
+/// reference to `Service` itself — `Service` is consumed by
+/// `run()`, so the handle is what survives across the spawn
+/// boundary. Internal state remains private.
+#[derive(Clone)]
+pub struct ServiceHandle {
+    state: Rc<SharedState>,
+}
+
+impl ServiceHandle {
+    /// Reload `clients.json` from the path configured at
+    /// `Service::prepare` time and atomically swap the in-memory
+    /// table. Logs the outcome as `evt=config_reload`.
+    pub async fn reload_clients(&self) {
+        let path = self.state.clients_file_path.clone();
+        self.state.reload_clients(&path).await
+    }
+}
+
 impl Service {
     /// Sequencing matters here: PEM bytes and Unix-socket binds need
     /// filesystem access that the sandbox will deny, so they happen
@@ -263,28 +284,33 @@ impl Service {
         })
     }
 
-    /// Clone the SharedState handle for use by external tasks
-    /// (e.g. the SIGHUP handler in `crate::signals`). The returned
-    /// `Rc<SharedState>` is opaque externally — `SharedState`'s
-    /// fields are `pub(crate)` so only daemon-crate code can
-    /// inspect or mutate state through it.
-    pub fn state_handle(&self) -> Rc<SharedState> {
-        self.state.clone()
+    /// Returns an opaque cloneable handle to the running service.
+    /// Use it from outside code to drive operator-visible actions
+    /// (e.g. SIGHUP-triggered `reload_clients`) without holding a
+    /// reference to `Service` itself (which is consumed by `run`).
+    pub fn handle(&self) -> ServiceHandle {
+        ServiceHandle {
+            state: self.state.clone(),
+        }
     }
 
     /// Per-provider startup selfcheck. Logs `evt=selfcheck` once per
     /// provider and never returns Err (soft-fail per PROTOCOLS.md).
     /// Each provider's selfcheck is itself bounded by its configured
     /// `selfcheck_timeout` and races the shutdown token from inside
-    /// `GitHubProvider::timed` — so a SIGTERM during this call
-    /// returns quickly with `GithubError::Cancelled` rather than
-    /// hanging the daemon at startup.
+    /// `GitHubProvider::with_breadcrumbs` — so a SIGTERM during this
+    /// call returns quickly with `GithubError::Cancelled` rather
+    /// than hanging the daemon at startup.
     pub async fn selfcheck(&self) {
         for (host, provider) in &self.state.providers {
-            match provider.selfcheck().await {
+            let req_id = ulid::Ulid::new().to_string();
+            match provider.selfcheck(&req_id).await {
                 Ok(outcome) => {
                     info!(
                         evt = "selfcheck",
+                        req_id = %req_id,
+                        out_req_id = %outcome.out_req_id,
+                        gh_req_id = outcome.gh_req_id.as_deref().unwrap_or(""),
                         provider = %host,
                         ok = true,
                         clock_skew_sec = outcome.clock_skew_sec,
@@ -293,6 +319,7 @@ impl Service {
                 Err(e) => {
                     warn!(
                         evt = "selfcheck",
+                        req_id = %req_id,
                         provider = %host,
                         ok = false,
                         error = %e,
@@ -687,11 +714,16 @@ async fn handle_connection(mut stream: UnixStream, req_id: String, state: Rc<Sha
 
     // ------ Phase 5: mint ------
     let started = Instant::now();
-    let mint_result = provider.mint(&request.path).await;
+    let mint_result = provider.mint(&req_id, &request.path).await;
     let provider_ms = started.elapsed().as_millis() as u64;
 
-    let (response, repo_id) = match mint_result {
-        Ok(outcome) => (outcome.response, outcome.repo_id),
+    let (response, repo_id, out_req_id, gh_req_id) = match mint_result {
+        Ok(outcome) => (
+            outcome.response,
+            outcome.repo_id,
+            outcome.out_req_id,
+            outcome.gh_req_id,
+        ),
         Err(e) => {
             // RepoNotFound at mint-time = the provider just invalidated
             // a (possibly cached) repo-id; surface that to the operator
@@ -754,6 +786,8 @@ async fn handle_connection(mut stream: UnixStream, req_id: String, state: Rc<Sha
 
     info!(
         req_id = %req_id,
+        out_req_id = %out_req_id,
+        gh_req_id = gh_req_id.as_deref().unwrap_or(""),
         evt = "mint",
         provider = %request.host,
         client = %client.name,

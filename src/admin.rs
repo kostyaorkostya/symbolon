@@ -74,6 +74,19 @@ pub(crate) enum Request {
     },
 }
 
+impl Request {
+    fn op_name(&self) -> &'static str {
+        match self {
+            Request::Status => "status",
+            Request::List => "list",
+            Request::Enroll { .. } => "enroll",
+            Request::Revoke { .. } => "revoke",
+            Request::Mint { .. } => "mint",
+            Request::Selfcheck { .. } => "selfcheck",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum CliCommand {
     Status,
@@ -199,6 +212,7 @@ pub(crate) async fn run_admin_loop(
 }
 
 async fn handle_admin(mut stream: UnixStream, state: Rc<SharedState>) {
+    let req_id = ulid::Ulid::new().to_string();
     let raw = match read_line(&mut stream).await {
         Ok(bytes) if !bytes.is_empty() => bytes,
         _ => return,
@@ -206,12 +220,14 @@ async fn handle_admin(mut stream: UnixStream, state: Rc<SharedState>) {
     let request: Request = match serde_json::from_slice(&raw) {
         Ok(r) => r,
         Err(e) => {
+            info!(evt = "admin_request", req_id = %req_id, ok = false, error = %e);
             let resp = error_response("bad_request", &format!("request parse failed: {e}"));
             let _ = write_response(&mut stream, &resp).await;
             return;
         }
     };
-    let resp_value = match dispatch(&request, &state).await {
+    info!(evt = "admin_request", req_id = %req_id, op = %request.op_name());
+    let resp_value = match dispatch(&req_id, &request, &state).await {
         Ok(v) => v,
         Err(e) => e,
     };
@@ -219,6 +235,7 @@ async fn handle_admin(mut stream: UnixStream, state: Rc<SharedState>) {
 }
 
 async fn dispatch(
+    req_id: &str,
     request: &Request,
     state: &Rc<SharedState>,
 ) -> Result<serde_json::Value, serde_json::Value> {
@@ -230,14 +247,16 @@ async fn dispatch(
             client,
             ip,
             note,
-        } => handle_enroll(state, provider, client, *ip, note.clone()).await,
-        Request::Revoke { provider, client } => handle_revoke(state, provider, client).await,
+        } => handle_enroll(req_id, state, provider, client, *ip, note.clone()).await,
+        Request::Revoke { provider, client } => {
+            handle_revoke(req_id, state, provider, client).await
+        }
         Request::Mint {
             provider,
             client,
             path,
-        } => handle_mint(state, provider, client, path).await,
-        Request::Selfcheck { provider } => handle_selfcheck(state, provider).await,
+        } => handle_mint(req_id, state, provider, client, path).await,
+        Request::Selfcheck { provider } => handle_selfcheck(req_id, state, provider).await,
     }
 }
 
@@ -283,12 +302,14 @@ fn handle_list(state: &SharedState) -> serde_json::Value {
 }
 
 async fn handle_enroll(
+    req_id: &str,
     state: &SharedState,
     provider: &str,
     client: &str,
     ip: IpAddr,
     note: Option<String>,
 ) -> Result<serde_json::Value, serde_json::Value> {
+    let _ = req_id; // logged at handle_admin entry; not threaded further today
     // Collapse IPv4-mapped IPv6 (::ffff:a.b.c.d) → IPv4 so an
     // operator enrolling the dual-stack form for an IPv4 host hits
     // the same bucket the daemon's accept-loop canonicalizes into.
@@ -404,10 +425,12 @@ async fn handle_enroll(
 }
 
 async fn handle_revoke(
+    req_id: &str,
     state: &SharedState,
     provider: &str,
     client: &str,
 ) -> Result<serde_json::Value, serde_json::Value> {
+    let _ = req_id; // logged at handle_admin entry; not threaded further today
     if provider != PROVIDER_GITHUB {
         return Err(error_response(
             "unknown_provider",
@@ -468,6 +491,7 @@ async fn handle_revoke(
 }
 
 async fn handle_mint(
+    req_id: &str,
     state: &Rc<SharedState>,
     provider: &str,
     client: &str,
@@ -486,7 +510,7 @@ async fn handle_mint(
             &format!("no enrolled client named '{client}'"),
         ));
     }
-    match provider_obj.mint(path).await {
+    match provider_obj.mint(req_id, path).await {
         Ok(outcome) => {
             let expires_unix = outcome
                 .response
@@ -500,6 +524,8 @@ async fn handle_mint(
                 "password": outcome.response.password,
                 "expires_at_unix": expires_unix,
                 "repo_id": outcome.repo_id,
+                "out_req_id": outcome.out_req_id,
+                "gh_req_id": outcome.gh_req_id,
             }))
         }
         Err(e) => Err(error_response_from_github(&e)),
@@ -507,6 +533,7 @@ async fn handle_mint(
 }
 
 async fn handle_selfcheck(
+    req_id: &str,
     state: &Rc<SharedState>,
     provider: &str,
 ) -> Result<serde_json::Value, serde_json::Value> {
@@ -516,13 +543,15 @@ async fn handle_selfcheck(
             &format!("provider '{provider}' not configured"),
         )
     })?;
-    match provider_obj.selfcheck().await {
+    match provider_obj.selfcheck(req_id).await {
         Ok(outcome) => Ok(serde_json::json!({
             "ok": true,
             "client_id": outcome.client_id,
             "installation_id": outcome.installation_id,
             "api_base": outcome.api_base,
             "clock_skew_sec": outcome.clock_skew_sec,
+            "out_req_id": outcome.out_req_id,
+            "gh_req_id": outcome.gh_req_id,
         })),
         Err(e) => Err(error_response_from_github(&e)),
     }

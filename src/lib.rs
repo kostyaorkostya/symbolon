@@ -50,7 +50,7 @@ pub use crate::config::{
 #[doc(hidden)]
 pub use crate::cpu_worker::CpuWorker;
 #[doc(hidden)]
-pub use crate::daemon::{Service, run as run_daemon};
+pub use crate::daemon::{Service, ServiceHandle, run as run_daemon};
 #[doc(hidden)]
 pub use crate::loader::load_config;
 #[doc(hidden)]

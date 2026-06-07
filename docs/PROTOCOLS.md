@@ -302,6 +302,20 @@ References: [REST API for App installations][gh-installs],
     unset; configurable by the operator. Required by GitHub (missing
     UA → 403). Intentionally carries no version number so an
     attacker can't narrow the applicable CVE list.
+  - `X-Request-ID: <out_req_id>` — fresh ULID per outbound call.
+    The same value flows into the `provider_call` /
+    `provider_call_done` breadcrumbs and into `MintOutcome` /
+    `SelfcheckOutcome` for operator-side correlation.
+  - `Request-Timeout: <seconds>` — best-effort hint per the expired
+    IETF draft (`draft-thomson-hybi-http-timeout`). Integer seconds
+    derived from the per-call timeout (`request_timeout` for
+    resolve / mint; `selfcheck_timeout` for selfcheck). GitHub does
+    not document honouring it; any intermediate proxy that follows
+    the draft (e.g. envoy) might. Cost is one header.
+
+Response (read on every call): `X-GitHub-Request-Id` is captured
+into `gh_req_id` on the outcome / breadcrumb so an operator can
+join the broker's log to GitHub's side when filing a ticket.
 - Body:
   ```json
   {
@@ -409,6 +423,15 @@ top-level keys.
 | `stunnel_sighup_failed` | `error` — emitted at `warn` lvl when `StunnelController::sighup` fails after an enroll/revoke rewrote `gcb.psk`. The state mutation is NOT rolled back; operator notices via `gcb status` or stunnel logs |
 | `drain_incomplete` | `inflight_drained`, `drain_ms` — emitted at `warn` lvl when the per-connection drain deadline elapses with handlers still in flight at shutdown |
 | `signal_registration_failed` | `signal`, `error` — emitted at `error` lvl by `main` when `signal-hook-registry::register` fails at startup. Treated as fatal (exit 1) — without it the daemon cannot honour SIGTERM/SIGINT/SIGHUP |
+| `admin_request` | `req_id`, `op` — emitted by the admin loop at entry of each request. The `req_id` (ULID) ties downstream `provider_call` / `mint` / `selfcheck` events back to this admin invocation |
+| `provider_call` | `req_id`, `out_req_id`, `endpoint` (`resolve_repo_id` \| `mint_token` \| `selfcheck`), `provider`, `timeout_ms` — emitted before each outbound HTTPS call |
+| `provider_call_done` | `req_id`, `out_req_id`, `status` (HTTP status code, 0 if no response), `gh_req_id` (X-GitHub-Request-Id, empty if absent), `elapsed_ms`, optional `error` — emitted after each outbound HTTPS call |
+
+The `mint`, `selfcheck`, and (when available) `mint_denied` /
+`provider_error` / `cache_invalidated` events also carry
+`out_req_id` and `gh_req_id` fields when the underlying outbound
+call yielded them, so a grep on `req_id` or `out_req_id` returns
+the full chain.
 
 `reason` values for `mint_denied`:
 `client_unknown | unknown_host | repo_not_accessible | provider_4xx | malformed_request`.

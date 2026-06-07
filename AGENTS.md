@@ -118,7 +118,11 @@ Pinned in `Cargo.toml`:
   compio's default features can't silently disable it. The `signal`
   feature is intentionally NOT enabled — we use signal-hook-registry
   directly for permanent signal handlers; see `src/signals.rs`.)
-- `cyper` (HTTPS client for provider APIs)
+- `cyper` with feature `http2` (HTTPS client for provider APIs;
+  ALPN auto-negotiates h2 over TLS when the server advertises it
+  — api.github.com does — so an idle keep-alive connection from a
+  preceding resolve call is reused for the follow-up mint
+  without a fresh TLS handshake).
 - `jsonwebtoken` with feature `rust_crypto` (App JWT; `rust_crypto`
   is mandatory in 10.x — without a crypto-provider feature the
   crate panics at sign-time. `rust_crypto` over `aws_lc_rs` keeps

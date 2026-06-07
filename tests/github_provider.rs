@@ -25,7 +25,10 @@ async fn mint_happy_path() {
     mount_mint_ok(&server).await;
 
     let provider = build_provider(server.uri()).await;
-    let outcome = provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
+    let outcome = provider
+        .mint("test-req", &format!("{OWNER}/{REPO}"))
+        .await
+        .unwrap();
 
     assert_eq!(outcome.response.username, "x-access-token");
     assert_eq!(outcome.response.password, TOKEN);
@@ -60,13 +63,20 @@ async fn mint_uses_cached_repo_id() {
         .await;
 
     let provider = build_provider(server.uri()).await;
-    provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
-    provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
+    provider
+        .mint("test-req", &format!("{OWNER}/{REPO}"))
+        .await
+        .unwrap();
+    provider
+        .mint("test-req", &format!("{OWNER}/{REPO}"))
+        .await
+        .unwrap();
     // MockServer's drop verifies `.expect(N)` counts.
 }
 
 #[compio::test]
 async fn mint_request_headers_and_body_exact() {
+    use wiremock::matchers::header_exists;
     let server = MockServer::start().await;
     mount_repo_ok(&server).await;
     Mock::given(method("POST"))
@@ -75,6 +85,12 @@ async fn mint_request_headers_and_body_exact() {
         .and(header("X-GitHub-Api-Version", "2022-11-28"))
         .and(header("User-Agent", "gcb"))
         .and(header("Content-Type", "application/json"))
+        // X-Request-ID is a per-call ULID; just assert presence
+        // (per-call value is non-deterministic).
+        .and(header_exists("X-Request-ID"))
+        // Request-Timeout is derived from the per-call timeout (10s
+        // for mint per test fixture).
+        .and(header("Request-Timeout", "10"))
         .and(body_bytes(canonical_mint_body()))
         .respond_with(
             ResponseTemplate::new(201)
@@ -85,7 +101,36 @@ async fn mint_request_headers_and_body_exact() {
         .await;
 
     let provider = build_provider(server.uri()).await;
-    provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
+    provider
+        .mint("test-req", &format!("{OWNER}/{REPO}"))
+        .await
+        .unwrap();
+}
+
+#[compio::test]
+async fn mint_surfaces_github_request_id() {
+    let server = MockServer::start().await;
+    mount_repo_ok(&server).await;
+    Mock::given(method("POST"))
+        .and(path(mint_path()))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .insert_header("X-GitHub-Request-Id", "ABC:DEF:1234")
+                .set_body_json(json!({"token": TOKEN, "expires_at": EXPIRES_AT})),
+        )
+        .mount(&server)
+        .await;
+
+    let provider = build_provider(server.uri()).await;
+    let outcome = provider
+        .mint("test-req", &format!("{OWNER}/{REPO}"))
+        .await
+        .unwrap();
+    assert_eq!(outcome.gh_req_id.as_deref(), Some("ABC:DEF:1234"));
+    assert!(
+        !outcome.out_req_id.is_empty(),
+        "out_req_id should be a ULID"
+    );
 }
 
 #[compio::test]
@@ -98,7 +143,10 @@ async fn resolve_returns_404() {
         .await;
 
     let provider = build_provider(server.uri()).await;
-    let err = provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap_err();
+    let err = provider
+        .mint("test-req", &format!("{OWNER}/{REPO}"))
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, GithubError::RepoNotFound { ref path } if path == &format!("{OWNER}/{REPO}"))
     );
@@ -116,7 +164,10 @@ async fn mint_returns_401() {
 
     let provider = build_provider(server.uri()).await;
     assert!(matches!(
-        provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap_err(),
+        provider
+            .mint("test-req", &format!("{OWNER}/{REPO}"))
+            .await
+            .unwrap_err(),
         GithubError::Unauthorized
     ));
 }
@@ -133,7 +184,10 @@ async fn mint_returns_403() {
 
     let provider = build_provider(server.uri()).await;
     assert!(matches!(
-        provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap_err(),
+        provider
+            .mint("test-req", &format!("{OWNER}/{REPO}"))
+            .await
+            .unwrap_err(),
         GithubError::Forbidden
     ));
 }
@@ -150,7 +204,10 @@ async fn mint_returns_429() {
 
     let provider = build_provider(server.uri()).await;
     assert!(matches!(
-        provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap_err(),
+        provider
+            .mint("test-req", &format!("{OWNER}/{REPO}"))
+            .await
+            .unwrap_err(),
         GithubError::RateLimited
     ));
 }
@@ -167,7 +224,10 @@ async fn mint_returns_500() {
 
     let provider = build_provider(server.uri()).await;
     assert!(matches!(
-        provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap_err(),
+        provider
+            .mint("test-req", &format!("{OWNER}/{REPO}"))
+            .await
+            .unwrap_err(),
         GithubError::ServerError(500)
     ));
 }
@@ -198,7 +258,10 @@ async fn mint_invalidates_on_404() {
         .await;
 
     let provider = build_provider(server.uri()).await;
-    provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
+    provider
+        .mint("test-req", &format!("{OWNER}/{REPO}"))
+        .await
+        .unwrap();
 
     drop(first_post);
 
@@ -210,7 +273,10 @@ async fn mint_invalidates_on_404() {
         .mount_as_scoped(&server)
         .await;
 
-    let err = provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap_err();
+    let err = provider
+        .mint("test-req", &format!("{OWNER}/{REPO}"))
+        .await
+        .unwrap_err();
     assert!(matches!(err, GithubError::RepoNotFound { .. }));
 
     drop(second_post);
@@ -227,6 +293,9 @@ async fn mint_invalidates_on_404() {
         .mount(&server)
         .await;
 
-    provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
+    provider
+        .mint("test-req", &format!("{OWNER}/{REPO}"))
+        .await
+        .unwrap();
     // Drop of `server` at end of test verifies all `.expect(N)` counts.
 }

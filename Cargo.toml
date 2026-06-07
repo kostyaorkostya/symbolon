@@ -14,7 +14,7 @@ compio = { version = "0.19", features = [
   "runtime",
   "time",
 ] }
-cyper = "0.9"
+cyper = { version = "0.9", features = ["http2"] }
 futures-channel = "0.3"
 futures-util = "0.3.32"
 humantime-serde = "1.1.1"

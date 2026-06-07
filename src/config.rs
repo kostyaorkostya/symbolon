@@ -149,22 +149,27 @@ pub struct ProviderGithub {
     /// string at this layer; URL parsing is the provider module's
     /// responsibility.
     pub api_base: String,
-    pub app_id: u64,
+    /// GitHub App Client ID (the `Iv1.`/`Iv23l...` string visible on
+    /// the App's settings page). Used as the JWT `iss` claim; this
+    /// is the documented preferred form per GitHub's "Generating a
+    /// JSON web token (JWT) for a GitHub App" guide.
+    pub client_id: String,
     pub installation_id: u64,
     /// PEM-encoded App private key; loaded once at startup.
     pub private_key_path: PathBuf,
-    /// Startup self-check timeout, in seconds. Required — there is
-    /// no sane default; the operator picks based on their network's
-    /// p99 latency to api.github.com.
-    pub selfcheck_timeout_secs: u64,
-    /// Per-request timeout (resolve repo ID, mint token) in seconds.
-    /// Defaults to 10s.
-    #[serde(default = "default_request_timeout_secs")]
-    pub request_timeout_secs: u64,
+    /// Startup self-check timeout (e.g. `"5s"`). Required — no
+    /// default; the operator picks based on their network's p99
+    /// latency to api.github.com.
+    #[serde(with = "humantime_serde")]
+    pub selfcheck_timeout: std::time::Duration,
+    /// Per-request timeout for resolve / mint HTTPS calls
+    /// (e.g. `"10s"`). Defaults to 10s if omitted.
+    #[serde(with = "humantime_serde", default = "default_request_timeout")]
+    pub request_timeout: std::time::Duration,
 }
 
-fn default_request_timeout_secs() -> u64 {
-    10
+fn default_request_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(10)
 }
 
 /// Top-level parsed `clients.json`.
@@ -271,10 +276,10 @@ level = "info"
 [provider.github]
 host = "github.com"
 api_base = "https://api.github.com"
-app_id = 123456
+client_id = "Iv23liABCDEFGHIJklmn"
 installation_id = 789012
 private_key_path = "/etc/gcb/github-app.pem"
-selfcheck_timeout_secs = 5
+selfcheck_timeout = "5s"
 "#;
 
     #[test]
@@ -292,7 +297,7 @@ selfcheck_timeout_secs = 5
         let gh = cfg.provider.github.expect("github provider present");
         assert_eq!(gh.host, "github.com");
         assert_eq!(gh.api_base, "https://api.github.com");
-        assert_eq!(gh.app_id, 123_456);
+        assert_eq!(gh.client_id, "Iv23liABCDEFGHIJklmn");
         assert_eq!(gh.installation_id, 789_012);
         assert_eq!(
             gh.private_key_path,
@@ -328,6 +333,12 @@ selfcheck_timeout_secs = 5
     #[test]
     fn config_rejects_missing_installation_id() {
         let src = KNOWN_GOOD_CONFIG.replace("installation_id = 789012\n", "");
+        assert!(toml::from_str::<Config>(&src).is_err());
+    }
+
+    #[test]
+    fn config_rejects_missing_client_id() {
+        let src = KNOWN_GOOD_CONFIG.replace("client_id = \"Iv23liABCDEFGHIJklmn\"\n", "");
         assert!(toml::from_str::<Config>(&src).is_err());
     }
 

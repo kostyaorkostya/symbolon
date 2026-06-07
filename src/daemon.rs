@@ -379,7 +379,7 @@ pub async fn run(cfg: &Config, config_path: &Path) -> Result<RunStats, DaemonErr
 
 /// Reload `clients.json` and atomically swap the in-memory table.
 /// Public so `crate::signals` can call it on SIGHUP.
-pub async fn reload_clients(state: &Rc<SharedState>, path: &Path) {
+pub(crate) async fn reload_clients(state: &Rc<SharedState>, path: &Path) {
     let file = match crate::loader::load_clients_file(path).await {
         Ok(f) => f,
         Err(e) => {
@@ -556,16 +556,31 @@ async fn handle_connection(mut stream: UnixStream, req_id: String, state: Rc<Sha
             Ok(p) => break p,
             Err(ProxyProtocolError::Incomplete { need_total, .. }) => {
                 if need_total > MAX_REQUEST_BYTES {
-                    warn!(req_id = %req_id, evt = "proxy_header_invalid", bytes_read = buf.len(), reason = "header_exceeds_cap");
+                    warn!(
+                        req_id = %req_id,
+                        evt = "proxy_header_invalid",
+                        bytes_read = buf.len(),
+                        reason = "header_exceeds_cap",
+                    );
                     return;
                 }
                 if !read_more(&mut stream, &mut buf, &mut chunk).await {
-                    warn!(req_id = %req_id, evt = "proxy_header_invalid", bytes_read = buf.len(), reason = "eof_before_header");
+                    warn!(
+                        req_id = %req_id,
+                        evt = "proxy_header_invalid",
+                        bytes_read = buf.len(),
+                        reason = "eof_before_header",
+                    );
                     return;
                 }
             }
             Err(e) => {
-                warn!(req_id = %req_id, evt = "proxy_header_invalid", bytes_read = buf.len(), error = %e);
+                warn!(
+                    req_id = %req_id,
+                    evt = "proxy_header_invalid",
+                    bytes_read = buf.len(),
+                    error = %e,
+                );
                 return;
             }
         }
@@ -579,7 +594,12 @@ async fn handle_connection(mut stream: UnixStream, req_id: String, state: Rc<Sha
     // upstream stack flip would silently break attribution.
     let lookup_ip = canonicalize_ip(parsed.source_ip);
     let Some(client) = state.clients.borrow().get(&lookup_ip).cloned() else {
-        warn!(req_id = %req_id, evt = "mint_denied", reason = "client_unknown", src_ip = %parsed.source_ip);
+        warn!(
+            req_id = %req_id,
+            evt = "mint_denied",
+            reason = "client_unknown",
+            src_ip = %parsed.source_ip,
+        );
         return;
     };
     info!(req_id = %req_id, evt = "accept", src_ip = %parsed.source_ip, client = %client.name);
@@ -592,16 +612,34 @@ async fn handle_connection(mut stream: UnixStream, req_id: String, state: Rc<Sha
             Ok(r) => break r,
             Err(GitCredentialError::UnterminatedBlock) => {
                 if block.len() >= MAX_REQUEST_BYTES - parsed.header_len {
-                    warn!(req_id = %req_id, evt = "mint_denied", reason = "malformed_request", client = %client.name, detail = "request_exceeds_cap");
+                    warn!(
+                        req_id = %req_id,
+                        evt = "mint_denied",
+                        reason = "malformed_request",
+                        client = %client.name,
+                        detail = "request_exceeds_cap",
+                    );
                     return;
                 }
                 if !read_more(&mut stream, &mut block, &mut chunk).await {
-                    warn!(req_id = %req_id, evt = "mint_denied", reason = "malformed_request", client = %client.name, detail = "eof_before_terminator");
+                    warn!(
+                        req_id = %req_id,
+                        evt = "mint_denied",
+                        reason = "malformed_request",
+                        client = %client.name,
+                        detail = "eof_before_terminator",
+                    );
                     return;
                 }
             }
             Err(e) => {
-                warn!(req_id = %req_id, evt = "mint_denied", reason = "malformed_request", client = %client.name, error = %e);
+                warn!(
+                    req_id = %req_id,
+                    evt = "mint_denied",
+                    reason = "malformed_request",
+                    client = %client.name,
+                    error = %e,
+                );
                 return;
             }
         }
@@ -609,7 +647,13 @@ async fn handle_connection(mut stream: UnixStream, req_id: String, state: Rc<Sha
 
     // ------ Phase 4: host dispatch ------
     let Some(provider) = state.providers.get(&request.host) else {
-        warn!(req_id = %req_id, evt = "mint_denied", reason = "unknown_host", host = %request.host, client = %client.name);
+        warn!(
+            req_id = %req_id,
+            evt = "mint_denied",
+            reason = "unknown_host",
+            host = %request.host,
+            client = %client.name,
+        );
         return;
     };
 
@@ -648,11 +692,23 @@ async fn handle_connection(mut stream: UnixStream, req_id: String, state: Rc<Sha
     // ------ Phase 6: emit response ------
     let mut out = Vec::with_capacity(256);
     if let Err(e) = git_credential::write_response(&response, &mut out) {
-        warn!(req_id = %req_id, evt = "provider_error", reason = "response_encode", provider = %request.host, error = %e);
+        warn!(
+            req_id = %req_id,
+            evt = "provider_error",
+            reason = "response_encode",
+            provider = %request.host,
+            error = %e,
+        );
         return;
     }
     if let Err(e) = write_all_buf(&mut stream, out).await {
-        warn!(req_id = %req_id, evt = "provider_error", reason = "response_write", provider = %request.host, error = %e);
+        warn!(
+            req_id = %req_id,
+            evt = "provider_error",
+            reason = "response_write",
+            provider = %request.host,
+            error = %e,
+        );
         return;
     }
     let _ = stream.flush().await;
@@ -691,28 +747,93 @@ fn log_mint_error(
 ) {
     match &err {
         GithubError::RepoNotFound { .. } => {
-            warn!(req_id = %req_id, evt = "mint_denied", reason = "repo_not_accessible", provider_status = 404, provider = %host, client = %client_name, repo = %path, provider_ms = provider_ms);
+            warn!(
+                req_id = %req_id,
+                evt = "mint_denied",
+                reason = "repo_not_accessible",
+                provider_status = 404,
+                provider = %host,
+                client = %client_name,
+                repo = %path,
+                provider_ms = provider_ms,
+            );
         }
         GithubError::Unauthorized => {
-            warn!(req_id = %req_id, evt = "mint_denied", reason = "provider_4xx", provider_status = 401, provider = %host, client = %client_name, repo = %path, provider_ms = provider_ms);
+            warn!(
+                req_id = %req_id,
+                evt = "mint_denied",
+                reason = "provider_4xx",
+                provider_status = 401,
+                provider = %host,
+                client = %client_name,
+                repo = %path,
+                provider_ms = provider_ms,
+            );
         }
         GithubError::Forbidden => {
-            warn!(req_id = %req_id, evt = "mint_denied", reason = "provider_4xx", provider_status = 403, provider = %host, client = %client_name, repo = %path, provider_ms = provider_ms);
+            warn!(
+                req_id = %req_id,
+                evt = "mint_denied",
+                reason = "provider_4xx",
+                provider_status = 403,
+                provider = %host,
+                client = %client_name,
+                repo = %path,
+                provider_ms = provider_ms,
+            );
         }
         GithubError::RateLimited => {
-            warn!(req_id = %req_id, evt = "mint_denied", reason = "provider_4xx", provider_status = 429, provider = %host, client = %client_name, repo = %path, provider_ms = provider_ms);
+            warn!(
+                req_id = %req_id,
+                evt = "mint_denied",
+                reason = "provider_4xx",
+                provider_status = 429,
+                provider = %host,
+                client = %client_name,
+                repo = %path,
+                provider_ms = provider_ms,
+            );
         }
         GithubError::MalformedPath(_) => {
-            warn!(req_id = %req_id, evt = "mint_denied", reason = "malformed_request", provider = %host, client = %client_name, repo = %path, provider_ms = provider_ms);
+            warn!(
+                req_id = %req_id,
+                evt = "mint_denied",
+                reason = "malformed_request",
+                provider = %host,
+                client = %client_name,
+                repo = %path,
+                provider_ms = provider_ms,
+            );
         }
         GithubError::ServerError(status) => {
-            warn!(req_id = %req_id, evt = "provider_error", status = *status, provider = %host, repo = %path, provider_ms = provider_ms);
+            warn!(
+                req_id = %req_id,
+                evt = "provider_error",
+                status = *status,
+                provider = %host,
+                repo = %path,
+                provider_ms = provider_ms,
+            );
         }
         GithubError::UnexpectedStatus(status) => {
-            warn!(req_id = %req_id, evt = "provider_error", status = *status, provider = %host, repo = %path, provider_ms = provider_ms);
+            warn!(
+                req_id = %req_id,
+                evt = "provider_error",
+                status = *status,
+                provider = %host,
+                repo = %path,
+                provider_ms = provider_ms,
+            );
         }
         _ => {
-            warn!(req_id = %req_id, evt = "provider_error", provider = %host, repo = %path, provider_ms = provider_ms, error = %err);
+            warn!(
+                req_id = %req_id,
+                evt = "provider_error",
+                provider = %host,
+                repo = %path,
+                provider_ms = provider_ms,
+                error = %err,
+            );
         }
     }
 }

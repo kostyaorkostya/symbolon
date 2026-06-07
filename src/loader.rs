@@ -14,7 +14,7 @@ pub async fn load_config(path: &Path) -> Result<Config, ConfigError> {
 }
 
 /// Load and parse `clients.json`.
-pub async fn load_clients_file(path: &Path) -> Result<ClientsFile, ConfigError> {
+pub(crate) async fn load_clients_file(path: &Path) -> Result<ClientsFile, ConfigError> {
     let text = read_utf8(path).await?;
     config::parse_clients_file(&text, path)
 }

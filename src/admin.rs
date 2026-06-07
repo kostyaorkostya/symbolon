@@ -46,7 +46,7 @@ const PROVIDER_GITHUB: &str = "github";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
-pub enum Request {
+pub(crate) enum Request {
     Status,
     List,
     Enroll {
@@ -164,7 +164,7 @@ pub enum AdminError {
 // Daemon-side: accept loop
 // ---------------------------------------------------------------------------
 
-pub async fn run_admin_loop(
+pub(crate) async fn run_admin_loop(
     listener: UnixListener,
     state: Rc<SharedState>,
 ) -> Result<(), AdminError> {
@@ -519,7 +519,7 @@ async fn handle_selfcheck(
     match provider_obj.selfcheck().await {
         Ok(outcome) => Ok(serde_json::json!({
             "ok": true,
-            "app_id": outcome.app_id,
+            "client_id": outcome.client_id,
             "installation_id": outcome.installation_id,
             "api_base": outcome.api_base,
             "clock_skew_sec": outcome.clock_skew_sec,
@@ -539,12 +539,12 @@ fn error_response_from_github(err: &GithubError) -> serde_json::Value {
         GithubError::RateLimited => ("provider_4xx", "rate limited (429)".to_string()),
         GithubError::MalformedPath(p) => ("bad_request", format!("malformed owner/repo path: {p}")),
         GithubError::ServerError(s) => ("internal", format!("provider 5xx: {s}")),
-        GithubError::AppIdMismatch {
+        GithubError::ClientIdMismatch {
             configured,
             reported,
         } => (
             "internal",
-            format!("App ID mismatch: configured {configured}, GitHub reports {reported}"),
+            format!("Client ID mismatch: configured {configured}, GitHub reports {reported}"),
         ),
         _ => ("internal", format!("{err}")),
     };
@@ -681,7 +681,10 @@ fn print_success(command: &CliCommand, response: &serde_json::Value) {
             println!("expires_at_unix={exp}");
         }
         CliCommand::GithubSelfcheck => {
-            let app_id = response.get("app_id").and_then(|v| v.as_u64()).unwrap_or(0);
+            let client_id = response
+                .get("client_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
             let api = response
                 .get("api_base")
                 .and_then(|v| v.as_str())
@@ -690,7 +693,7 @@ fn print_success(command: &CliCommand, response: &serde_json::Value) {
                 .get("clock_skew_sec")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
-            println!("OK: App {app_id} reachable at {api}, clock skew {skew}s");
+            println!("OK: App {client_id} reachable at {api}, clock skew {skew}s");
         }
     }
 }

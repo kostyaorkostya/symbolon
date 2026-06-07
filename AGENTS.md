@@ -187,6 +187,14 @@ Pinned in `Cargo.toml`:
   `cyper::ClientBuilder` compares `attempt.url().host_str()`
   against the cached api host so a redirect can never carry the
   App JWT off-domain.)
+- `humantime-serde` (TOML-string parsing for `Duration` fields like
+  `selfcheck_timeout = "5s"` / `request_timeout = "10s"`. Tiny,
+  pulls only `humantime`. Avoids the `_secs: u64` code smell where
+  the unit had to leak into the field name.)
+- `thin-cell` (one-word `Rc<RefCell<T>>` replacement from the
+  compio-rs ecosystem, used for `ConnectionTracker.active` —
+  shared counter across tracker and per-handler closures. Same
+  API shape as `Rc<RefCell<T>>`; one pointer instead of two.)
 
 Do not add, remove, or swap crates without asking. Versions are locked
 via `Cargo.lock`. `rust-toolchain.toml` pins the compiler.

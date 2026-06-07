@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gcb::config::ProviderGithub;
 use gcb::cpu_worker::CpuWorker;
@@ -16,7 +16,7 @@ use serde_json::json;
 use wiremock::matchers::{body_bytes, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const APP_ID: u64 = 12345;
+const CLIENT_ID: &str = "Iv1.test12345";
 const INSTALLATION_ID: u64 = 789;
 const OWNER: &str = "octocat";
 const REPO: &str = "Hello-World";
@@ -32,11 +32,11 @@ async fn build_provider(api_base: String) -> GitHubProvider {
     let cfg = ProviderGithub {
         host: "github.com".to_string(),
         api_base,
-        app_id: APP_ID,
+        client_id: CLIENT_ID.to_string(),
         installation_id: INSTALLATION_ID,
         private_key_path: fixture_pem_path(),
-        selfcheck_timeout_secs: 5,
-        request_timeout_secs: 10,
+        selfcheck_timeout: Duration::from_secs(5),
+        request_timeout: Duration::from_secs(10),
     };
     let key = GitHubProvider::load_key(&cfg).await.unwrap();
     let worker = Rc::new(CpuWorker::new("gcb-test-jwt-signer").unwrap());
@@ -400,11 +400,11 @@ mod daemon_e2e {
                 github: Some(ProviderGithub {
                     host: "github.com".to_string(),
                     api_base,
-                    app_id: APP_ID,
+                    client_id: CLIENT_ID.to_string(),
                     installation_id: INSTALLATION_ID,
                     private_key_path: fixture_pem_path(),
-                    selfcheck_timeout_secs: 5,
-                    request_timeout_secs: 10,
+                    selfcheck_timeout: Duration::from_secs(5),
+                    request_timeout: Duration::from_secs(10),
                 }),
             },
         }
@@ -627,11 +627,11 @@ mod admin_e2e {
                 github: Some(ProviderGithub {
                     host: "github.com".to_string(),
                     api_base,
-                    app_id: APP_ID,
+                    client_id: CLIENT_ID.to_string(),
                     installation_id: INSTALLATION_ID,
                     private_key_path: fixture_pem_path(),
-                    selfcheck_timeout_secs: 5,
-                    request_timeout_secs: 10,
+                    selfcheck_timeout: Duration::from_secs(5),
+                    request_timeout: Duration::from_secs(10),
                 }),
             },
         }
@@ -939,9 +939,10 @@ mod admin_e2e {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/app"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": APP_ID})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 12345,
+                "client_id": CLIENT_ID,
+            })))
             .mount(&server)
             .await;
         spawn_daemon(&paths, server.uri()).await;
@@ -956,7 +957,7 @@ mod admin_e2e {
             serde_json::json!(true),
             "selfcheck failed: {resp:?}"
         );
-        assert_eq!(resp["app_id"], APP_ID);
+        assert_eq!(resp["client_id"], CLIENT_ID);
         paths.cleanup();
     }
 }

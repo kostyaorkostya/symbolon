@@ -62,9 +62,11 @@ pidfile = "/run/gcb/gcb.pid"
 #   api_base = "https://github.example.com/api/v3"
 host = "github.com"
 api_base = "https://api.github.com"
-app_id = 123456
+client_id = "Iv23liABCDEFGHIJklmn"
 installation_id = 789012
 private_key_path = "/etc/gcb/github-app.pem"
+selfcheck_timeout = "5s"
+# request_timeout = "10s"   # optional; default 10s
 ```
 
 Unknown top-level keys are rejected by `serde` deserialization
@@ -253,7 +255,7 @@ Op fields (request → response):
 | `enroll` | `provider`, `client`, `ip`, `note` (nullable) | `identity`, `psk_hex` (64 hex chars), `client_name` |
 | `revoke` | `provider`, `client` | — |
 | `mint` | `provider`, `client`, `path` | `username`, `password`, `expires_at_unix`, `repo_id` |
-| `selfcheck` | `provider` | `app_id`, `installation_id`, `api_base`, `clock_skew_sec` |
+| `selfcheck` | `provider` | `client_id`, `installation_id`, `api_base`, `clock_skew_sec` |
 
 Error codes:
 `bad_request | unknown_provider | unknown_client |

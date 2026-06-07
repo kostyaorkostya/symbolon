@@ -194,7 +194,7 @@ pub fn parse(input: &[u8]) -> Result<Request, GitCredentialError> {
     })
 }
 
-pub fn write_response(resp: &Response, out: &mut Vec<u8>) -> Result<(), GitCredentialError> {
+pub(crate) fn write_response(resp: &Response, out: &mut Vec<u8>) -> Result<(), GitCredentialError> {
     check_response_field("username", &resp.username)?;
     check_response_field("password", &resp.password)?;
 

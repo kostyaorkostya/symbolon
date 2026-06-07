@@ -254,6 +254,68 @@ If you suspect attribution drift, correlate stunnel's own logs
 (`/var/log/stunnel/stunnel.log` records PSK identities at debug
 levels) against `gcb`'s `accept`/`mint` events by timestamp.
 
+## Hardening recommendations
+
+The per-mint scoping (`repository_ids: [one_repo]` plus
+`contents: write` + `metadata: read`) is the narrowest permission
+set GitHub will issue for a token that can push commits. Within
+that scope, a compromised token can do more than `git push` —
+notably, manage releases (create, edit, delete release records,
+replace release assets, move release tags). These capabilities
+can be mitigated at the GitHub side without changing the broker.
+They are recommended for any repository the broker is allowed to
+mint for, especially if that repository publishes release
+artifacts trusted by downstream consumers.
+
+### Enable Immutable Releases (per repository)
+
+Settings → General → Releases → **Enable release immutability**.
+
+Once enabled, every release published from that point forward is
+immutable: assets cannot be added, modified, or deleted, and the
+release's tag is locked to its publication commit. Existing
+releases remain mutable unless re-published. Release attestations
+(Sigstore-signed) are generated automatically; consumers can
+verify with `gh release verify <tag>` or
+`gh release verify-asset <tag> <file>`.
+
+Available on all GitHub plans including Free. See the [official
+documentation](https://docs.github.com/en/enterprise-cloud@latest/code-security/concepts/supply-chain-security/immutable-releases).
+
+### Restrict creation of release tags (per repository)
+
+Settings → Rules → New ruleset → **New tag ruleset**.
+
+- **Target tags**: pattern matching your release tags (e.g. `v*`).
+- **Bypass list**: keep `Repository admin` only. Do NOT add the
+  broker's GitHub App.
+- **Tag rules**: enable **Restrict creations**, **Restrict
+  updates**, **Restrict deletions**, and **Block force pushes**.
+
+The broker's tokens act as the App identity, not as the
+repository admin, so they cannot create, update, or delete tags
+matching the release pattern. Legitimate release tagging
+continues to work from contexts that authenticate as the admin
+(your local clone, a GitHub Actions workflow, etc.).
+
+Combined with Immutable Releases above, this closes both the
+release-asset-tampering vector (existing releases) and the
+rogue-release-creation vector (new releases) on the GitHub side.
+
+#### Plan-tier caveat
+
+Repository rulesets are enforced on:
+- Any **public** repository (all plans, including Free).
+- **Private** repositories on GitHub Pro, Team, or Enterprise
+  Cloud.
+
+On Free accounts, rulesets created on **private** repositories
+save successfully and appear in the UI, but are not enforced;
+GitHub shows a banner indicating this. If the repository is
+private and the account is on the Free tier, the protection
+takes effect only after the repo is made public or the plan is
+upgraded.
+
 ## Revocation
 
 To revoke a single client:

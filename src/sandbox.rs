@@ -29,7 +29,7 @@ use seccompiler::{
 
 /// Operator-selected enforcement policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SandboxLevel {
+pub(crate) enum SandboxLevel {
     /// Refuse to start if the kernel cannot enforce ABI 6 features.
     Required,
     /// Apply what the kernel supports; report degradation.
@@ -40,7 +40,7 @@ pub enum SandboxLevel {
 
 /// Filesystem paths the daemon needs after restriction. Anything not
 /// listed here becomes unreachable.
-pub struct SandboxPaths {
+pub(crate) struct SandboxPaths {
     /// Files needing `ReadFile` only.
     pub read_files: Vec<PathBuf>,
     /// Dirs needing `ReadFile | ReadDir` (e.g. CA-bundle dirs).
@@ -57,7 +57,7 @@ pub struct SandboxPaths {
 /// What `apply` actually managed to put in place. Reported back so the
 /// daemon can log a structured `sandbox_applied` event.
 #[derive(Debug, Clone, Copy)]
-pub struct SandboxOutcome {
+pub(crate) struct SandboxOutcome {
     /// Landlock ABI we built the ruleset against (always 6 unless
     /// `Off`).
     pub requested_abi: u8,
@@ -103,7 +103,10 @@ pub enum SandboxError {
 /// Apply landlock + seccomp to the calling thread. Effects persist
 /// for the lifetime of the thread and propagate to descendants. Only
 /// call once per process.
-pub fn apply(level: SandboxLevel, paths: &SandboxPaths) -> Result<SandboxOutcome, SandboxError> {
+pub(crate) fn apply(
+    level: SandboxLevel,
+    paths: &SandboxPaths,
+) -> Result<SandboxOutcome, SandboxError> {
     if level == SandboxLevel::Off {
         return Ok(SandboxOutcome {
             requested_abi: 0,
@@ -169,7 +172,12 @@ fn apply_landlock(
                 // CA-bundle paths vary by distro; missing one is
                 // tolerable on best-effort and we surface it at debug
                 // so an operator running `--required` can chase it.
-                tracing::debug!(evt = "sandbox_path_skipped", path = %d.display(), reason = "open_failed", error = %e);
+                tracing::debug!(
+                    evt = "sandbox_path_skipped",
+                    path = %d.display(),
+                    reason = "open_failed",
+                    error = %e,
+                );
                 continue;
             }
         };
@@ -187,7 +195,11 @@ fn apply_landlock(
             Err(PathFdError::OpenCall { source, .. })
                 if source.kind() == io::ErrorKind::NotFound =>
             {
-                tracing::debug!(evt = "sandbox_path_skipped", path = %f.display(), reason = "enoent");
+                tracing::debug!(
+                    evt = "sandbox_path_skipped",
+                    path = %f.display(),
+                    reason = "enoent",
+                );
             }
             Err(e) => return Err(SandboxError::PathOpen(e)),
         }

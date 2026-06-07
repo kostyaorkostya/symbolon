@@ -47,16 +47,26 @@ On github.com:
 3. Webhook: disable. The broker does not consume webhooks.
 4. Where can this App be installed? **Only on this account.**
 5. Generate a private key; download the `.pem` file.
-6. Install the App on your account. Note the **App ID** (top of the
-   App settings page) and the **installation ID** (visible in the URL
-   after installation, e.g. `/installations/789012`).
+6. Install the App on your account. Note the **Client ID** (a
+   string like `Iv23liABCDEFGHIJklmn`, listed alongside the App ID
+   on the settings page) and the **installation ID** (visible in
+   the URL after installation, e.g. `/installations/789012`). The
+   broker uses the Client ID as the JWT `iss` claim — this is
+   GitHub's now-recommended form per
+   [Generating a JSON web token (JWT) for a GitHub App](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app#about-json-web-tokens-jwts).
 7. Choose **Only select repositories** and pick the ones you want the
    broker to be able to mint for. This is the working set — the
    broker will mint tokens for any of these. Keep it small.
 
 For **GitHub Enterprise Server**: the same steps apply on your GHES
-instance. The App ID and installation ID will differ from any public
-github.com Apps.
+instance. The Client ID and installation ID will differ from any
+public github.com Apps.
+
+After creating the App and installing it on your repos, see
+[`OPERATIONS.md` § Hardening recommendations](OPERATIONS.md#hardening-recommendations)
+for per-repo settings (Immutable Releases, tag ruleset) that
+mitigate the release-management capability that comes with
+`Contents: write`.
 
 ## 3. Set up the broker host
 
@@ -158,9 +168,11 @@ level = "info"
 #   api_base = "https://github.example.com/api/v3"
 host = "github.com"
 api_base = "https://api.github.com"
-app_id = 123456            # from step 2
-installation_id = 789012   # from step 2
+client_id = "Iv23liABCDEFGHIJklmn"   # from step 2 (App settings page)
+installation_id = 789012             # from step 2
 private_key_path = "/etc/gcb/github-app.pem"
+selfcheck_timeout = "5s"             # required; tune to your network's p99 to api.github.com
+# request_timeout = "10s"            # optional; default 10s
 ```
 
 ```sh

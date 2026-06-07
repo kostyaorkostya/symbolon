@@ -3,26 +3,27 @@
 //! Shape modeled after tokio-util's `TaskTracker` paired with
 //! `CancellationToken` (see `tokio/tokio-util/src/task/task_tracker.rs`
 //! in the reference clone). Adapted to compio's single-threaded
-//! runtime: `Rc<RefCell<usize>>` for the active counter instead of
-//! atomics, and `synchrony::sync::event::Event` for the empty
-//! notification (the multi-thread variant — `notify` is `&self`).
+//! runtime: `thin_cell::unsync::ThinCell<usize>` for the active
+//! counter (one-word equivalent of `Rc<RefCell<usize>>`), and
+//! `synchrony::sync::event::Event` for the empty notification (the
+//! multi-thread variant — `notify` is `&self`).
 //!
 //! Usage: build with `new(cancel, per_handler_timeout, drain_deadline)`,
 //! `spawn(handler)` to launch a connection handler that gets a clone
 //! of the cancel token, then `drain(self)` on shutdown to wait for
 //! handlers to finish (bounded by `drain_deadline`).
 
-use std::cell::RefCell;
 use std::future::Future;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use compio::runtime::CancelToken;
 use synchrony::sync::event::Event;
+use thin_cell::unsync::ThinCell;
 
 pub(crate) struct ConnectionTracker {
     cancel: CancelToken,
-    active: Rc<RefCell<usize>>,
+    active: ThinCell<usize>,
     empty: Rc<Event>,
     per_handler_timeout: Duration,
     drain_deadline: Duration,
@@ -43,7 +44,7 @@ impl ConnectionTracker {
     ) -> Self {
         Self {
             cancel,
-            active: Rc::new(RefCell::new(0)),
+            active: ThinCell::new(0),
             empty: Rc::new(Event::new()),
             per_handler_timeout,
             drain_deadline,
@@ -59,14 +60,14 @@ impl ConnectionTracker {
         F: FnOnce(CancelToken) -> Fut + 'static,
         Fut: Future<Output = ()> + 'static,
     {
-        *self.active.borrow_mut() += 1;
+        *self.active.borrow() += 1;
         let active = self.active.clone();
         let empty = self.empty.clone();
         let cancel = self.cancel.clone();
         let timeout = self.per_handler_timeout;
         compio::runtime::spawn(async move {
             let _ = compio::time::timeout(timeout, handler(cancel)).await;
-            let mut a = active.borrow_mut();
+            let mut a = active.borrow();
             *a -= 1;
             if *a == 0 {
                 empty.notify(usize::MAX);
@@ -99,10 +100,10 @@ impl ConnectionTracker {
                 break false;
             }
         };
-        let drained = initial.saturating_sub(*self.active.borrow());
+        let final_count = *self.active.borrow();
         DrainStats {
             drain_ms: start.elapsed().as_millis() as u64,
-            inflight_drained: drained,
+            inflight_drained: initial.saturating_sub(final_count),
             drain_complete,
         }
     }

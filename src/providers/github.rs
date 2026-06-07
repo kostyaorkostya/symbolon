@@ -46,7 +46,7 @@ const JWT_LIFETIME: u64 = 540;
 
 pub struct GitHubProvider {
     api_base: String,
-    app_id: u64,
+    client_id: String,
     installation_id: u64,
     signer: JwtSigner,
     client: cyper::Client,
@@ -124,8 +124,11 @@ pub enum GithubError {
     ServerError(u16),
     #[error("unexpected provider status: {0}")]
     UnexpectedStatus(u16),
-    #[error("App ID mismatch: configured {configured}, GitHub reports {reported}")]
-    AppIdMismatch { configured: u64, reported: u64 },
+    #[error("Client ID mismatch: configured {configured}, GitHub reports {reported}")]
+    ClientIdMismatch {
+        configured: String,
+        reported: String,
+    },
     #[error("provider request timed out after {0:?}")]
     Timeout(Duration),
     #[error("provider request cancelled (daemon shutting down)")]
@@ -134,10 +137,10 @@ pub enum GithubError {
 
 #[derive(Debug, Clone)]
 pub struct SelfcheckOutcome {
-    pub app_id: u64,
-    pub installation_id: u64,
-    pub api_base: String,
-    pub clock_skew_sec: i64,
+    pub(crate) client_id: String,
+    pub(crate) installation_id: u64,
+    pub(crate) api_base: String,
+    pub(crate) clock_skew_sec: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -217,15 +220,15 @@ impl GitHubProvider {
         };
         Ok(Self {
             api_base,
-            app_id: cfg.app_id,
+            client_id: cfg.client_id.clone(),
             installation_id: cfg.installation_id,
             signer,
             client,
             user_agent: format!("gcb/{}", env!("CARGO_PKG_VERSION")),
             clock,
             repo_ids: RepoIdCache::default(),
-            selfcheck_timeout: Duration::from_secs(cfg.selfcheck_timeout_secs),
-            request_timeout: Duration::from_secs(cfg.request_timeout_secs),
+            selfcheck_timeout: cfg.selfcheck_timeout,
+            request_timeout: cfg.request_timeout,
             cancel,
         })
     }
@@ -293,21 +296,21 @@ impl GitHubProvider {
                 context: "selfcheck",
                 source,
             })?;
-        let reported = v
-            .get("id")
-            .and_then(|i| i.as_u64())
-            .ok_or(GithubError::MissingField {
-                context: "selfcheck",
-                field: "id",
-            })?;
-        if reported != self.app_id {
-            return Err(GithubError::AppIdMismatch {
-                configured: self.app_id,
-                reported,
+        let reported =
+            v.get("client_id")
+                .and_then(|i| i.as_str())
+                .ok_or(GithubError::MissingField {
+                    context: "selfcheck",
+                    field: "client_id",
+                })?;
+        if reported != self.client_id {
+            return Err(GithubError::ClientIdMismatch {
+                configured: self.client_id.clone(),
+                reported: reported.to_string(),
             });
         }
         Ok(SelfcheckOutcome {
-            app_id: self.app_id,
+            client_id: self.client_id.clone(),
             installation_id: self.installation_id,
             api_base: self.api_base.clone(),
             clock_skew_sec,
@@ -471,7 +474,7 @@ impl GitHubProvider {
     }
 
     async fn sign_jwt_now(&self) -> Result<String, GithubError> {
-        let claims = build_claims((self.clock)(), self.app_id);
+        let claims = build_claims((self.clock)(), &self.client_id);
         self.signer.sign(claims).await
     }
 }
@@ -531,10 +534,10 @@ struct MintPermissions {
     metadata: &'static str,
 }
 
-fn build_claims(now: SystemTime, app_id: u64) -> JwtClaims {
+fn build_claims(now: SystemTime, client_id: &str) -> JwtClaims {
     let unix = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     JwtClaims {
-        iss: app_id.to_string(),
+        iss: client_id.to_string(),
         iat: unix.saturating_sub(JWT_LEEWAY_PAST),
         exp: unix.saturating_add(JWT_LIFETIME),
     }
@@ -682,8 +685,8 @@ mod tests {
 
     #[test]
     fn build_claims_at_fixed_time() {
-        let claims = build_claims(t(1_700_000_000), 42);
-        assert_eq!(claims.iss, "42");
+        let claims = build_claims(t(1_700_000_000), "Iv1.test42");
+        assert_eq!(claims.iss, "Iv1.test42");
         assert_eq!(claims.iat, 1_700_000_000 - 60);
         assert_eq!(claims.exp, 1_700_000_000 + 540);
     }
@@ -691,7 +694,7 @@ mod tests {
     #[test]
     fn sign_jwt_produces_three_parts() {
         let key = EncodingKey::from_rsa_pem(FIXTURE_PEM.as_bytes()).unwrap();
-        let claims = build_claims(t(1_700_000_000), 42);
+        let claims = build_claims(t(1_700_000_000), "Iv1.test42");
         let token = sign_jwt_blocking(&claims, &key).unwrap();
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3);
@@ -809,11 +812,11 @@ mod tests {
         let cfg = ProviderGithub {
             host: "github.com".to_string(),
             api_base: "https://api.github.com/".to_string(),
-            app_id: 1,
+            client_id: "Iv1.test1".to_string(),
             installation_id: 2,
             private_key_path: fixture_pem_path(),
-            selfcheck_timeout_secs: 5,
-            request_timeout_secs: 10,
+            selfcheck_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(10),
         };
         let key = GitHubProvider::load_key(&cfg).await.unwrap();
         let worker = Rc::new(CpuWorker::new("gcb-test-jwt").unwrap());

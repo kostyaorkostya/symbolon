@@ -29,14 +29,13 @@
 //! `clients.json` and swaps the in-memory table.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::FutureExt;
-use futures_util::stream::{FuturesUnordered, StreamExt};
 
 use compio::BufResult;
 use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -45,6 +44,8 @@ use compio::runtime::CancelToken;
 use tracing::{info, warn};
 
 use crate::config::{ClientsFile, Config, SandboxMode};
+use crate::connection_tracker::ConnectionTracker;
+use crate::cpu_worker::CpuWorker;
 use crate::git_credential::{self, GitCredentialError};
 use crate::providers::github::{GitHubProvider, GithubError};
 use crate::proxy_protocol::{self, ProxyProtocolError};
@@ -80,33 +81,40 @@ pub enum DaemonError {
     NoParentDir(&'static str),
     #[error("failed to apply sandbox")]
     Sandbox(#[from] SandboxError),
+    #[error("failed to spawn CPU worker thread")]
+    CpuWorker(#[source] std::io::Error),
+    #[error("daemon prepare cancelled by shutdown signal")]
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedClient {
-    pub name: String,
-    pub providers: HashSet<String>,
-    pub enrolled_at: String,
-    pub note: Option<String>,
+pub(crate) struct ResolvedClient {
+    pub(crate) name: String,
+    pub(crate) providers: Vec<String>,
+    pub(crate) enrolled_at: String,
+    pub(crate) note: Option<String>,
 }
 
 /// Shared between the listen-side accept loop and the admin-side
 /// accept loop. `clients` is mutable so admin enroll/revoke can
-/// update it in place; `providers` is fixed at startup.
+/// update it in place; `providers` is fixed at startup. Field
+/// visibility is `pub(crate)` so external callers see only an
+/// opaque `Rc<SharedState>` — they can hold and pass it around but
+/// not peek at internals.
 pub struct SharedState {
-    pub clients: RefCell<HashMap<IpAddr, ResolvedClient>>,
-    pub providers: HashMap<String, GitHubProvider>,
-    pub psk_file_path: PathBuf,
-    pub clients_file_path: PathBuf,
-    pub stunnel_pidfile: PathBuf,
-    pub listen_socket_path: PathBuf,
-    pub admin_socket_path: PathBuf,
-    pub start_time: SystemTime,
+    pub(crate) clients: RefCell<HashMap<IpAddr, ResolvedClient>>,
+    pub(crate) providers: HashMap<String, GitHubProvider>,
+    pub(crate) psk_file_path: PathBuf,
+    pub(crate) clients_file_path: PathBuf,
+    pub(crate) stunnel_pidfile: PathBuf,
+    pub(crate) listen_socket_path: PathBuf,
+    pub(crate) admin_socket_path: PathBuf,
+    pub(crate) start_time: SystemTime,
     /// Cancelled by `crate::signals` watchers on SIGTERM/SIGINT. The
     /// main accept loop and the admin loop both race `wait()` on it;
     /// the SIGHUP loop does too. Loops exit cleanly on cancel,
     /// letting their `JoinHandle`s be joined.
-    pub shutdown: CancelToken,
+    pub(crate) shutdown: CancelToken,
 }
 
 /// Statistics returned from `Service::run` so main can log the
@@ -114,30 +122,98 @@ pub struct SharedState {
 pub struct RunStats {
     pub drain_ms: u64,
     pub inflight_drained: usize,
+    /// True iff every inflight connection handler finished within
+    /// the drain deadline. False means some handlers were left to
+    /// time out on their own per-handler timeout.
+    pub drain_complete: bool,
 }
 
 /// The running daemon: business logic only. Knows nothing about
 /// signals, sd_notify, or pidfiles — main wires those.
 pub struct Service {
     state: Rc<SharedState>,
+    listener: UnixListener,
+    admin_listener: UnixListener,
 }
 
 impl Service {
-    /// Bootstrap: load clients.json, build providers (reads PEM),
-    /// bind both Unix sockets, apply the sandbox. Returns the
-    /// service plus the two bound listeners; main owns and passes
-    /// them back into `run`.
-    pub async fn bootstrap(
+    /// Sequencing matters here: PEM bytes and Unix-socket binds need
+    /// filesystem access that the sandbox will deny, so they happen
+    /// first. `apply_sandbox` then closes the gate. The shared
+    /// `CpuWorker` is spawned AFTER the sandbox so its thread
+    /// inherits the landlock ruleset and seccomp filter — spawning
+    /// it before would leak an unsandboxed thread into the process.
+    pub async fn prepare(
         cfg: &Config,
         config_path: &Path,
         shutdown: CancelToken,
-    ) -> Result<(Self, UnixListener, UnixListener), DaemonError> {
+    ) -> Result<Self, DaemonError> {
+        // Race the whole preparation against shutdown so an early
+        // SIGTERM (e.g. during a hung PEM read on a stale NFS mount)
+        // returns cleanly without binding sockets we'd then have to
+        // unlink.
+        futures_util::select_biased! {
+            _ = shutdown.clone().wait().fuse() => Err(DaemonError::Cancelled),
+            r = Self::prepare_inner(cfg, config_path, shutdown.clone()).fuse() => r,
+        }
+    }
+
+    async fn prepare_inner(
+        cfg: &Config,
+        config_path: &Path,
+        shutdown: CancelToken,
+    ) -> Result<Self, DaemonError> {
         let clients_file = crate::loader::load_clients_file(&cfg.clients.file).await?;
         let clients_table = build_clients_table(clients_file)?;
 
+        // Pre-sandbox: read provider PEMs into memory.
+        let github_key = if let Some(gh) = &cfg.provider.github {
+            Some(GitHubProvider::load_key(gh).await?)
+        } else {
+            None
+        };
+
+        // Pre-sandbox: bind both UDS.
+        let listen_path = &cfg.listen.socket;
+        unlink_stale(listen_path).await?;
+        let listener =
+            UnixListener::bind(listen_path)
+                .await
+                .map_err(|source| DaemonError::Bind {
+                    path: listen_path.clone(),
+                    source,
+                })?;
+        // 0660: stunnel (running as group `gcb` per INSTALL.md) needs
+        // write access to forward into us. World access is removed so
+        // a loose parent-dir ACL alone cannot expose the listen socket.
+        chmod_socket(listen_path, 0o660)?;
+
+        let admin_path = &cfg.admin.socket_path;
+        unlink_stale(admin_path).await?;
+        let admin_listener =
+            UnixListener::bind(admin_path)
+                .await
+                .map_err(|source| DaemonError::Bind {
+                    path: admin_path.clone(),
+                    source,
+                })?;
+        // 0600: only root and the daemon UID can talk to admin.
+        // SO_PEERCRED in run_admin_loop is the second gate.
+        chmod_socket(admin_path, 0o600)?;
+
+        // Sandbox gate closes here.
+        apply_sandbox(cfg)?;
+
+        // Post-sandbox: spawn the shared CPU worker (its OS thread
+        // inherits the seccomp filter via clone(2) and the landlock
+        // ruleset via TGID-wide application).
+        let cpu_worker = Rc::new(CpuWorker::new("gcb-cpu-worker").map_err(DaemonError::CpuWorker)?);
+
+        // Post-sandbox: construct providers with pre-loaded keys.
         let mut providers: HashMap<String, GitHubProvider> = HashMap::new();
         if let Some(gh) = &cfg.provider.github {
-            let provider = GitHubProvider::new(gh).await?;
+            let key = github_key.expect("github_key loaded above when gh is Some");
+            let provider = GitHubProvider::new(gh, key, cpu_worker.clone(), shutdown.clone())?;
             providers.insert(gh.host.clone(), provider);
         }
 
@@ -153,53 +229,37 @@ impl Service {
             shutdown,
         });
 
-        let listen_path = &cfg.listen.socket;
-        unlink_stale(listen_path).await?;
-        let listener =
-            UnixListener::bind(listen_path)
-                .await
-                .map_err(|source| DaemonError::Bind {
-                    path: listen_path.clone(),
-                    source,
-                })?;
-
-        let admin_path = &cfg.admin.socket_path;
-        unlink_stale(admin_path).await?;
-        let admin_listener =
-            UnixListener::bind(admin_path)
-                .await
-                .map_err(|source| DaemonError::Bind {
-                    path: admin_path.clone(),
-                    source,
-                })?;
-
-        apply_sandbox(cfg)?;
-
         info!(
-            evt = "bootstrap",
+            evt = "prepare",
             version = env!("CARGO_PKG_VERSION"),
             config_path = %config_path.display(),
             listen_socket = %listen_path.display(),
             admin_socket = %admin_path.display(),
         );
 
-        Ok((Self { state }, listener, admin_listener))
+        Ok(Self {
+            state,
+            listener,
+            admin_listener,
+        })
     }
 
     /// Clone the SharedState handle for use by external tasks
-    /// (e.g. the SIGHUP handler in `crate::signals`).
+    /// (e.g. the SIGHUP handler in `crate::signals`). The returned
+    /// `Rc<SharedState>` is opaque externally — `SharedState`'s
+    /// fields are `pub(crate)` so only daemon-crate code can
+    /// inspect or mutate state through it.
     pub fn state_handle(&self) -> Rc<SharedState> {
         self.state.clone()
     }
 
-    /// The cancel token shared across daemon loops. Main triggers
-    /// it via signals.
-    pub fn shutdown_token(&self) -> CancelToken {
-        self.state.shutdown.clone()
-    }
-
     /// Per-provider startup selfcheck. Logs `evt=selfcheck` once per
     /// provider and never returns Err (soft-fail per PROTOCOLS.md).
+    /// Each provider's selfcheck is itself bounded by its configured
+    /// `selfcheck_timeout` and races the shutdown token from inside
+    /// `GitHubProvider::timed` — so a SIGTERM during this call
+    /// returns quickly with `GithubError::Cancelled` rather than
+    /// hanging the daemon at startup.
     pub async fn selfcheck(&self) {
         for (host, provider) in &self.state.providers {
             match provider.selfcheck().await {
@@ -225,12 +285,10 @@ impl Service {
 
     /// Run the accept loops until `shutdown` is cancelled, drain
     /// per-connection handlers, unlink sockets. Returns RunStats.
-    pub async fn run(
-        self,
-        listener: UnixListener,
-        admin_listener: UnixListener,
-    ) -> Result<RunStats, DaemonError> {
+    pub async fn run(self) -> Result<RunStats, DaemonError> {
         let state = self.state;
+        let listener = self.listener;
+        let admin_listener = self.admin_listener;
         let provider_names: Vec<&str> = state.providers.keys().map(String::as_str).collect();
         info!(evt = "startup", providers = ?provider_names, "daemon started");
 
@@ -244,12 +302,15 @@ impl Service {
             }
         });
 
-        // Main accept loop, racing accept against the shutdown token.
-        // Per-connection JoinHandles live in a FuturesUnordered;
-        // select_next_some prunes completed ones in-loop so memory
-        // stays bounded. Shape matches Apache iggy's tcp_listener.rs.
-        let mut handlers: FuturesUnordered<compio::runtime::JoinHandle<()>> =
-            FuturesUnordered::new();
+        // Per-connection bookkeeping via ConnectionTracker. Each
+        // spawn is wrapped with PER_CONNECTION_TIMEOUT; drain on
+        // shutdown waits up to 5 s for handlers to finish, after
+        // which the spawned tasks are left to time out on their own.
+        let tracker = ConnectionTracker::new(
+            state.shutdown.clone(),
+            PER_CONNECTION_TIMEOUT,
+            Duration::from_secs(5),
+        );
         loop {
             futures_util::select! {
                 accept_res = listener.accept().fuse() => {
@@ -259,45 +320,33 @@ impl Service {
                     // iteration. Drop the stream rather than start
                     // a handler we won't drain — the next loop
                     // iteration's select! will pick the
-                    // shutdown.wait() arm and break. Net effect:
-                    // zero streams accepted after cancel; in-flight
-                    // handlers drain on their own timers.
+                    // shutdown.wait() arm and break.
                     if state.shutdown.is_cancelled() {
                         drop(stream);
                         continue;
                     }
                     let req_id = ulid::Ulid::new().to_string();
                     let state = state.clone();
-                    handlers.push(compio::runtime::spawn(async move {
-                        let _ = compio::time::timeout(
-                            PER_CONNECTION_TIMEOUT,
-                            handle_connection(stream, req_id, state),
-                        )
-                        .await;
-                    }));
+                    tracker.spawn(move |_cancel| async move {
+                        handle_connection(stream, req_id, state).await;
+                    });
                 }
-                // Prune completed handlers in-loop. select_next_some
-                // yields Pending when the stream is empty, so this
-                // arm doesn't fire-spin.
-                _ = handlers.select_next_some() => {}
                 _ = state.shutdown.clone().wait().fuse() => break,
             }
         }
 
-        // Drain in-flight per-connection handlers with a deadline.
-        // On timeout, dropping `handlers` cancels the still-in-flight
-        // tasks via compio's JoinHandle drop=cancel semantics.
-        let drain_start = Instant::now();
-        let mut drained = 0usize;
-        let _ = compio::time::timeout(Duration::from_secs(5), async {
-            while handlers.next().await.is_some() {
-                drained += 1;
-            }
-        })
-        .await;
-        let drain_ms = drain_start.elapsed().as_millis() as u64;
-        let inflight_drained = drained;
-        // `handlers` dropped at end of scope; remaining tasks cancelled.
+        let drain_stats = tracker.drain().await;
+        let drain_ms = drain_stats.drain_ms;
+        let inflight_drained = drain_stats.inflight_drained;
+        let drain_complete = drain_stats.drain_complete;
+        if !drain_complete {
+            tracing::warn!(
+                evt = "drain_incomplete",
+                inflight_drained,
+                drain_ms,
+                "drain deadline expired with handlers still in flight",
+            );
+        }
 
         // Join admin loop. By this point shutdown is cancelled so
         // its inner select! will break.
@@ -311,11 +360,12 @@ impl Service {
         Ok(RunStats {
             drain_ms,
             inflight_drained,
+            drain_complete,
         })
     }
 }
 
-/// Convenience wrapper: bootstrap the service with a fresh
+/// Convenience wrapper: prepare the service with a fresh
 /// `CancelToken`, then run until the token fires. The daemon itself
 /// does NOT install signal handlers — production code (main) wires
 /// signals into the token via `crate::signals`. This wrapper is for
@@ -323,9 +373,8 @@ impl Service {
 /// dropping the spawned task.
 pub async fn run(cfg: &Config, config_path: &Path) -> Result<RunStats, DaemonError> {
     let shutdown = CancelToken::new();
-    let (service, listener, admin_listener) =
-        Service::bootstrap(cfg, config_path, shutdown).await?;
-    service.run(listener, admin_listener).await
+    let service = Service::prepare(cfg, config_path, shutdown).await?;
+    service.run().await
 }
 
 /// Reload `clients.json` and atomically swap the in-memory table.
@@ -354,6 +403,40 @@ pub async fn reload_clients(state: &Rc<SharedState>, path: &Path) {
     );
 }
 
+fn canonicalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        v4 => v4,
+    }
+}
+
+fn chmod_socket(path: &Path, mode: u32) -> Result<(), DaemonError> {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::Permissions::from_mode(mode);
+    std::fs::set_permissions(path, perms).map_err(|source| DaemonError::Bind {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+#[cfg(target_env = "musl")]
+const fn nameservice_files() -> &'static [&'static str] {
+    &["/etc/resolv.conf", "/etc/hosts"]
+}
+
+#[cfg(not(target_env = "musl"))]
+const fn nameservice_files() -> &'static [&'static str] {
+    &[
+        "/etc/resolv.conf",
+        "/etc/hosts",
+        "/etc/nsswitch.conf",
+        "/etc/gai.conf",
+    ]
+}
+
 fn apply_sandbox(cfg: &Config) -> Result<(), DaemonError> {
     let level = match cfg.security.sandbox {
         SandboxMode::Required => SandboxLevel::Required,
@@ -370,30 +453,14 @@ fn apply_sandbox(cfg: &Config) -> Result<(), DaemonError> {
         ],
         read_dirs,
         // Files consulted by libc `getaddrinfo` for our single
-        // outbound HTTPS hostname (`api.github.com`). We resolve via
-        // the system resolver (cyper default) — hickory is deferred
-        // due to its tokio coupling, see AGENTS.md.
-        resolv_files: [
-            // glibc + musl: DNS nameserver list and search domains.
-            "/etc/resolv.conf",
-            // glibc + musl: static hostname→IP overrides; consulted
-            // before DNS depending on nsswitch order.
-            "/etc/hosts",
-            // glibc: NSS module order (files vs dns vs mdns). musl
-            // ignores this file; safe to keep on the allowlist for
-            // glibc builds.
-            "/etc/nsswitch.conf",
-            // glibc: RFC 3484 address-sort preferences for the
-            // results getaddrinfo returns. musl ignores it.
-            "/etc/gai.conf",
-            // /etc/host.conf and /etc/services intentionally NOT
-            // included: host.conf is legacy and ignored by modern
-            // libcs; /etc/services is for getservbyname (port-by-
-            // name) which we don't use — we pass numeric port 443.
-        ]
-        .iter()
-        .map(PathBuf::from)
-        .collect(),
+        // outbound HTTPS hostname (`api.github.com`). musl reads only
+        // /etc/resolv.conf and /etc/hosts; nsswitch.conf and gai.conf
+        // are pure glibc constructs the musl binary never opens, so
+        // they're omitted from the musl ruleset. /etc/host.conf and
+        // /etc/services are intentionally NOT included on either:
+        // host.conf is legacy/ignored, /etc/services is for
+        // getservbyname which we don't use (we pass numeric 443).
+        resolv_files: nameservice_files().iter().map(PathBuf::from).collect(),
         write_parent_dirs: {
             let mut v = vec![
                 cfg.clients
@@ -422,6 +489,8 @@ fn apply_sandbox(cfg: &Config) -> Result<(), DaemonError> {
     };
     let outcome = sandbox::apply(level, &paths)?;
     let degraded = !matches!(outcome.status, "fully_enforced" | "off");
+    // tracing's event! macro requires a const level, so we can't
+    // factor the level branch out further than this.
     if degraded {
         warn!(
             evt = "sandbox_applied",
@@ -462,7 +531,9 @@ async fn unlink_stale(path: &Path) -> Result<(), DaemonError> {
 fn build_clients_table(file: ClientsFile) -> Result<HashMap<IpAddr, ResolvedClient>, DaemonError> {
     let mut table = HashMap::new();
     for entry in file.clients {
-        let key = entry.ip;
+        // canonicalize so an IPv4-mapped IPv6 entry in clients.json
+        // collides with its IPv4 form (a likely operator mistake).
+        let key = canonicalize_ip(entry.ip);
         let value = ResolvedClient {
             name: entry.name,
             providers: entry.providers.into_iter().collect(),
@@ -477,6 +548,7 @@ fn build_clients_table(file: ClientsFile) -> Result<HashMap<IpAddr, ResolvedClie
 }
 
 async fn handle_connection(mut stream: UnixStream, req_id: String, state: Rc<SharedState>) {
+    let mut chunk: Vec<u8> = Vec::with_capacity(READ_CHUNK_BYTES);
     // ------ Phase 1: PROXY v2 header ------
     let mut buf: Vec<u8> = Vec::with_capacity(MAX_REQUEST_BYTES);
     let parsed = loop {
@@ -487,7 +559,7 @@ async fn handle_connection(mut stream: UnixStream, req_id: String, state: Rc<Sha
                     warn!(req_id = %req_id, evt = "proxy_header_invalid", bytes_read = buf.len(), reason = "header_exceeds_cap");
                     return;
                 }
-                if !read_more(&mut stream, &mut buf).await {
+                if !read_more(&mut stream, &mut buf, &mut chunk).await {
                     warn!(req_id = %req_id, evt = "proxy_header_invalid", bytes_read = buf.len(), reason = "eof_before_header");
                     return;
                 }
@@ -500,7 +572,13 @@ async fn handle_connection(mut stream: UnixStream, req_id: String, state: Rc<Sha
     };
 
     // ------ Phase 2: IP → client lookup ------
-    let Some(client) = state.clients.borrow().get(&parsed.source_ip).cloned() else {
+    // Normalise IPv4-mapped IPv6 (::ffff:a.b.c.d) → IPv4 so a
+    // dual-stack stunnel that reports the same operator-enrolled host
+    // either way still hits one entry. clients.json typically lists
+    // IPs by family (V4 or V6); without this normalisation, an
+    // upstream stack flip would silently break attribution.
+    let lookup_ip = canonicalize_ip(parsed.source_ip);
+    let Some(client) = state.clients.borrow().get(&lookup_ip).cloned() else {
         warn!(req_id = %req_id, evt = "mint_denied", reason = "client_unknown", src_ip = %parsed.source_ip);
         return;
     };
@@ -517,7 +595,7 @@ async fn handle_connection(mut stream: UnixStream, req_id: String, state: Rc<Sha
                     warn!(req_id = %req_id, evt = "mint_denied", reason = "malformed_request", client = %client.name, detail = "request_exceeds_cap");
                     return;
                 }
-                if !read_more(&mut stream, &mut block).await {
+                if !read_more(&mut stream, &mut block, &mut chunk).await {
                     warn!(req_id = %req_id, evt = "mint_denied", reason = "malformed_request", client = %client.name, detail = "eof_before_terminator");
                     return;
                 }
@@ -642,16 +720,24 @@ fn log_mint_error(
 // Per-iteration `Vec` allocation. For our traffic (<<1 mint/s) the
 // alloc cost is invisible relative to network RTT. If profiling
 // ever shows otherwise, iggy reuses a single
-// `BytesMut::with_capacity(...)` via `.clear()` across iterations
-// (see iggy/core/server/src/tcp/connection_handler.rs); compio's
-// `BufferPool` + `AsyncReadManaged` is the io_uring-native answer.
-async fn read_more(stream: &mut UnixStream, accumulated: &mut Vec<u8>) -> bool {
-    let chunk = Vec::with_capacity(READ_CHUNK_BYTES);
-    let BufResult(res, chunk) = stream.read(chunk).await;
+// Reads up to READ_CHUNK_BYTES into `chunk`, then appends what was
+// filled into `accumulated`. `chunk` is owned by the caller so its
+// allocation is reused across iterations (iggy pattern at
+// iggy/core/server/src/tcp/connection_handler.rs:49-81). compio's
+// `BufferPool` + `AsyncReadManaged` is the io_uring-native answer
+// for cross-connection reuse and is out of scope here.
+async fn read_more(
+    stream: &mut UnixStream,
+    accumulated: &mut Vec<u8>,
+    chunk: &mut Vec<u8>,
+) -> bool {
+    chunk.clear();
+    let BufResult(res, returned) = stream.read(std::mem::take(chunk)).await;
+    *chunk = returned;
     match res {
         Ok(0) => false,
         Ok(_) => {
-            accumulated.extend_from_slice(&chunk);
+            accumulated.extend_from_slice(chunk);
             true
         }
         Err(_) => false,
@@ -691,7 +777,7 @@ mod tests {
         assert_eq!(table.len(), 2);
         let v1 = table.get(&"192.168.122.10".parse().unwrap()).unwrap();
         assert_eq!(v1.name, "vm-1");
-        assert!(v1.providers.contains("github"));
+        assert!(v1.providers.iter().any(|p| p == "github"));
     }
 
     #[test]
@@ -743,7 +829,7 @@ mod tests {
             "10.0.0.1".parse().unwrap(),
             ResolvedClient {
                 name: "old".to_string(),
-                providers: HashSet::new(),
+                providers: Vec::new(),
                 enrolled_at: "x".to_string(),
                 note: None,
             },
@@ -762,5 +848,32 @@ mod tests {
         assert!(borrow.get(&"10.0.0.1".parse().unwrap()).is_none());
         drop(borrow);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn canonicalize_ip_collapses_v4_mapped_v6_to_v4() {
+        let mapped: IpAddr = "::ffff:192.0.2.1".parse().unwrap();
+        let plain: IpAddr = "192.0.2.1".parse().unwrap();
+        assert_eq!(canonicalize_ip(mapped), plain);
+        // Native V6 left alone.
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        assert_eq!(canonicalize_ip(v6), v6);
+        // Bare V4 left alone.
+        let v4: IpAddr = "10.0.0.1".parse().unwrap();
+        assert_eq!(canonicalize_ip(v4), v4);
+    }
+
+    #[test]
+    fn build_clients_table_collapses_v4_mapped_v6_against_v4() {
+        let file = ClientsFile {
+            version: 1,
+            clients: vec![entry("client-v4mapped", "::ffff:192.0.2.42", &["github"])],
+        };
+        let table = build_clients_table(file).unwrap();
+        let v4: IpAddr = "192.0.2.42".parse().unwrap();
+        assert!(
+            table.contains_key(&v4),
+            "::ffff:192.0.2.42 should land under the IPv4 key after canonicalization",
+        );
     }
 }

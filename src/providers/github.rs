@@ -12,15 +12,30 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use compio::runtime::CancelToken;
+use cyper::redirect;
+use futures_util::FutureExt;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::Serialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use url::Url;
+
+// Encodes any byte outside GitHub's documented name character class
+// ([A-Za-z0-9._-]). `split_owner_repo` already rejects such bytes;
+// this encoding is defence-in-depth so a future char-class
+// regression cannot become a URL-injection.
+const REPO_PATH_SAFE: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'.').remove(b'_');
 
 use crate::config::ProviderGithub;
+use crate::cpu_worker::CpuWorker;
 use crate::git_credential;
 
 const GITHUB_API_VERSION: &str = "2022-11-28";
@@ -30,7 +45,6 @@ const JWT_LEEWAY_PAST: u64 = 60;
 const JWT_LIFETIME: u64 = 540;
 
 pub struct GitHubProvider {
-    host: String,
     api_base: String,
     app_id: u64,
     installation_id: u64,
@@ -39,15 +53,26 @@ pub struct GitHubProvider {
     user_agent: String,
     clock: fn() -> SystemTime,
     repo_ids: RepoIdCache,
+    selfcheck_timeout: Duration,
+    request_timeout: Duration,
+    // Cloned from Service::shutdown so HTTPS calls observe shutdown
+    // and return promptly with GithubError::Cancelled instead of
+    // blocking the daemon drain.
+    cancel: CancelToken,
 }
 
 #[derive(Default)]
-struct RepoIdCache(RefCell<HashMap<String, CachedRepoId>>);
+struct RepoIdCache(RefCell<HashMap<String, CacheEntry>>);
 
-#[derive(Copy, Clone)]
-struct CachedRepoId {
-    id: u64,
-    expires_at: SystemTime,
+enum CacheEntry {
+    Done { id: u64, expires_at: SystemTime },
+    // Single-flight: when one mint task is resolving a key, other
+    // mint tasks for the same key store a clone of this Event and
+    // await `listen()` instead of issuing a duplicate resolve. The
+    // resolver `notify`s on completion (success or failure), and
+    // waiters retry the lookup — Done(id) by then, or evicted on
+    // failure.
+    InFlight(Rc<synchrony::sync::event::Event>),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -101,6 +126,10 @@ pub enum GithubError {
     UnexpectedStatus(u16),
     #[error("App ID mismatch: configured {configured}, GitHub reports {reported}")]
     AppIdMismatch { configured: u64, reported: u64 },
+    #[error("provider request timed out after {0:?}")]
+    Timeout(Duration),
+    #[error("provider request cancelled (daemon shutting down)")]
+    Cancelled,
 }
 
 #[derive(Debug, Clone)]
@@ -124,67 +153,108 @@ impl From<cyper::Error> for GithubError {
 }
 
 impl GitHubProvider {
-    pub async fn new(cfg: &ProviderGithub) -> Result<Self, GithubError> {
-        Self::with_overrides(cfg, None, SystemTime::now).await
-    }
-
-    /// Test-only ctor. External code should use [`new`].
-    #[doc(hidden)]
-    pub async fn with_overrides(
-        cfg: &ProviderGithub,
-        api_base_override: Option<String>,
-        clock: fn() -> SystemTime,
-    ) -> Result<Self, GithubError> {
+    /// Load the App private key from disk and parse it into an
+    /// `EncodingKey`. Must run BEFORE the sandbox closes filesystem
+    /// access; the resulting `Arc` is then handed to [`new`] post-
+    /// sandbox along with the shared CpuWorker.
+    pub async fn load_key(cfg: &ProviderGithub) -> Result<Arc<EncodingKey>, GithubError> {
         let pem_bytes = compio::fs::read(&cfg.private_key_path)
             .await
             .map_err(|source| GithubError::PemRead {
                 path: cfg.private_key_path.clone(),
                 source,
             })?;
-        let encoding_key =
+        let key =
             EncodingKey::from_rsa_pem(&pem_bytes).map_err(|source| GithubError::PemParse {
                 path: cfg.private_key_path.clone(),
                 source,
             })?;
+        Ok(Arc::new(key))
+    }
+
+    pub fn new(
+        cfg: &ProviderGithub,
+        key: Arc<EncodingKey>,
+        cpu_worker: Rc<CpuWorker>,
+        cancel: CancelToken,
+    ) -> Result<Self, GithubError> {
+        Self::with_overrides(cfg, key, cpu_worker, cancel, None, SystemTime::now)
+    }
+
+    #[doc(hidden)]
+    pub fn with_overrides(
+        cfg: &ProviderGithub,
+        key: Arc<EncodingKey>,
+        cpu_worker: Rc<CpuWorker>,
+        cancel: CancelToken,
+        api_base_override: Option<String>,
+        clock: fn() -> SystemTime,
+    ) -> Result<Self, GithubError> {
         let api_base = api_base_override
             .unwrap_or_else(|| cfg.api_base.clone())
             .trim_end_matches('/')
             .to_string();
 
-        let signer = JwtSigner::new(encoding_key).map_err(GithubError::SignerSpawn)?;
+        // Same-origin redirect policy: HTTPS to api.github.com may
+        // redirect within api.github.com, never elsewhere. Off-host
+        // redirects would carry the App JWT off-domain.
+        let api_host = Url::parse(&api_base)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned))
+            .ok_or_else(|| GithubError::MalformedPath(format!("api_base={api_base}")))?;
+        let policy = redirect::Policy::custom(move |attempt| {
+            if attempt.url().host_str() == Some(&api_host) {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        });
+        let client = cyper::Client::builder().redirect(policy).build()?;
+
+        let signer = JwtSigner {
+            worker: cpu_worker,
+            key,
+        };
         Ok(Self {
-            host: cfg.host.clone(),
             api_base,
             app_id: cfg.app_id,
             installation_id: cfg.installation_id,
             signer,
-            client: cyper::Client::new()?,
+            client,
             user_agent: format!("gcb/{}", env!("CARGO_PKG_VERSION")),
             clock,
             repo_ids: RepoIdCache::default(),
+            selfcheck_timeout: Duration::from_secs(cfg.selfcheck_timeout_secs),
+            request_timeout: Duration::from_secs(cfg.request_timeout_secs),
+            cancel,
         })
     }
 
-    pub fn host(&self) -> &str {
-        &self.host
-    }
-
-    pub fn app_id(&self) -> u64 {
-        self.app_id
-    }
-
-    pub fn installation_id(&self) -> u64 {
-        self.installation_id
-    }
-
-    pub fn api_base(&self) -> &str {
-        &self.api_base
+    /// Wrap an async operation with (1) shutdown-cancel race and
+    /// (2) bounded timeout. Returns `Cancelled` on cancel-first,
+    /// `Timeout` on deadline, or the inner result otherwise.
+    async fn timed<F, T>(&self, timeout: Duration, work: F) -> Result<T, GithubError>
+    where
+        F: Future<Output = Result<T, GithubError>>,
+    {
+        futures_util::select_biased! {
+            _ = self.cancel.clone().wait().fuse() => Err(GithubError::Cancelled),
+            r = compio::time::timeout(timeout, work).fuse() => match r {
+                Ok(inner) => inner,
+                Err(_elapsed) => Err(GithubError::Timeout(timeout)),
+            }
+        }
     }
 
     /// Verify the App private key signs a valid JWT and the App is
     /// reachable at `api_base`. The reported App ID must match the
     /// configured one — a mismatch indicates a wrong key/App pairing.
     pub async fn selfcheck(&self) -> Result<SelfcheckOutcome, GithubError> {
+        self.timed(self.selfcheck_timeout, self.selfcheck_inner())
+            .await
+    }
+
+    async fn selfcheck_inner(&self) -> Result<SelfcheckOutcome, GithubError> {
         let jwt = self.sign_jwt_now().await?;
         let url = format!("{}/app", self.api_base);
         let resp = self
@@ -253,14 +323,9 @@ impl GitHubProvider {
         );
         let now = (self.clock)();
 
-        let repo_id = match self.repo_ids.lookup(&key, now) {
-            Some(id) => id,
-            None => {
-                let id = self.resolve_repo_id(owner, repo).await?;
-                self.repo_ids.insert(&key, id, now + CACHE_TTL);
-                id
-            }
-        };
+        let repo_id = self
+            .resolve_with_singleflight(&key, owner, repo, now)
+            .await?;
 
         match self.mint_token(repo_id, path).await {
             Ok((token, expires_at)) => Ok(MintOutcome {
@@ -281,9 +346,54 @@ impl GitHubProvider {
         }
     }
 
+    /// Single-flight wrapper around `resolve_repo_id`. Concurrent
+    /// mints for the same key share a single in-flight resolve; once
+    /// it completes, all waiters retry the cache lookup.
+    async fn resolve_with_singleflight(
+        &self,
+        key: &str,
+        owner: &str,
+        repo: &str,
+        now: SystemTime,
+    ) -> Result<u64, GithubError> {
+        loop {
+            match self.repo_ids.get_or_claim(key, now) {
+                CacheAction::Hit(id) => return Ok(id),
+                CacheAction::Wait(ev) => {
+                    ev.listen().await;
+                    // Loop to re-check; the resolver may have
+                    // landed a Done entry, evicted on failure, or
+                    // raced ahead leaving Done expired.
+                }
+                CacheAction::Resolve(ev) => {
+                    let result = self.resolve_repo_id(owner, repo).await;
+                    match &result {
+                        Ok(id) => self.repo_ids.put_done(key, *id, now + CACHE_TTL),
+                        Err(_) => self.repo_ids.invalidate(key),
+                    }
+                    ev.notify(usize::MAX);
+                    return result;
+                }
+            }
+        }
+    }
+
     async fn resolve_repo_id(&self, owner: &str, repo: &str) -> Result<u64, GithubError> {
+        self.timed(
+            self.request_timeout,
+            self.resolve_repo_id_inner(owner, repo),
+        )
+        .await
+    }
+
+    async fn resolve_repo_id_inner(&self, owner: &str, repo: &str) -> Result<u64, GithubError> {
         let jwt = self.sign_jwt_now().await?;
-        let url = format!("{}/repos/{}/{}", self.api_base, owner, repo);
+        let url = format!(
+            "{}/repos/{}/{}",
+            self.api_base,
+            utf8_percent_encode(owner, REPO_PATH_SAFE),
+            utf8_percent_encode(repo, REPO_PATH_SAFE),
+        );
         let resp = self
             .client
             .get(&url)?
@@ -312,6 +422,15 @@ impl GitHubProvider {
     }
 
     async fn mint_token(
+        &self,
+        repo_id: u64,
+        path: &str,
+    ) -> Result<(String, SystemTime), GithubError> {
+        self.timed(self.request_timeout, self.mint_token_inner(repo_id, path))
+            .await
+    }
+
+    async fn mint_token_inner(
         &self,
         repo_id: u64,
         path: &str,
@@ -357,20 +476,35 @@ impl GitHubProvider {
     }
 }
 
+enum CacheAction {
+    Hit(u64),
+    Wait(Rc<synchrony::sync::event::Event>),
+    Resolve(Rc<synchrony::sync::event::Event>),
+}
+
 impl RepoIdCache {
-    fn lookup(&self, key: &str, now: SystemTime) -> Option<u64> {
-        self.0
-            .borrow()
-            .get(key)
-            .copied()
-            .filter(|e| e.expires_at > now)
-            .map(|e| e.id)
+    /// Atomic test-and-set. Returns Hit on fresh Done entry, Wait
+    /// when another task is already resolving (with that resolver's
+    /// completion event), or Resolve when this caller should
+    /// perform the resolve (with a fresh event the caller will
+    /// notify on completion).
+    fn get_or_claim(&self, key: &str, now: SystemTime) -> CacheAction {
+        let mut cache = self.0.borrow_mut();
+        match cache.get(key) {
+            Some(CacheEntry::Done { id, expires_at }) if *expires_at > now => CacheAction::Hit(*id),
+            Some(CacheEntry::InFlight(ev)) => CacheAction::Wait(ev.clone()),
+            _ => {
+                let ev = Rc::new(synchrony::sync::event::Event::new());
+                cache.insert(key.to_string(), CacheEntry::InFlight(ev.clone()));
+                CacheAction::Resolve(ev)
+            }
+        }
     }
 
-    fn insert(&self, key: &str, id: u64, expires_at: SystemTime) {
+    fn put_done(&self, key: &str, id: u64, expires_at: SystemTime) {
         self.0
             .borrow_mut()
-            .insert(key.to_string(), CachedRepoId { id, expires_at });
+            .insert(key.to_string(), CacheEntry::Done { id, expires_at });
     }
 
     fn invalidate(&self, key: &str) {
@@ -415,32 +549,20 @@ fn sign_jwt_blocking(claims: &JwtClaims, key: &EncodingKey) -> Result<String, Gi
     jsonwebtoken::encode(&header, claims, key).map_err(GithubError::JwtSign)
 }
 
-/// Thin wrapper around [`crate::cpu_worker::CpuWorker`] that holds
-/// the App's `EncodingKey` and dispatches `sign_jwt_blocking` jobs
-/// to a dedicated `gcb-jwt-signer` OS thread.
-///
-/// The actual thread + mpsc + oneshot plumbing lives in
-/// `crate::cpu_worker`; this struct just owns the worker and the
-/// key, and gives callers a typed `sign(claims)` API.
+/// Holds a shared [`CpuWorker`] handle and the App's `EncodingKey`,
+/// dispatching `sign_jwt_blocking` jobs to the worker thread. The
+/// worker is shared across all providers in the daemon and spawned
+/// once at Service init, after the sandbox is in place.
 struct JwtSigner {
-    worker: crate::cpu_worker::CpuWorker,
-    // `Arc` so each `sign` call cheaply clones a handle into the
-    // closure shipped to the worker thread, without copying the
-    // key bytes.
-    key: std::sync::Arc<EncodingKey>,
+    worker: Rc<CpuWorker>,
+    // Arc so each sign call clones a handle into the closure shipped
+    // to the worker thread without copying the key bytes.
+    key: Arc<EncodingKey>,
 }
 
 impl JwtSigner {
-    fn new(key: EncodingKey) -> std::io::Result<Self> {
-        let worker = crate::cpu_worker::CpuWorker::new("gcb-jwt-signer")?;
-        Ok(Self {
-            worker,
-            key: std::sync::Arc::new(key),
-        })
-    }
-
     async fn sign(&self, claims: JwtClaims) -> Result<String, GithubError> {
-        let key = std::sync::Arc::clone(&self.key);
+        let key = Arc::clone(&self.key);
         match self
             .worker
             .run(move || sign_jwt_blocking(&claims, &key))
@@ -502,14 +624,24 @@ fn parse_repo_response(bytes: &[u8]) -> Result<u64, GithubError> {
         })
 }
 
+// GitHub's documented character set for owner/repo names:
+// alphanumerics, dash, underscore, dot. Any other byte (slash beyond
+// the single separator, `?`, `#`, `%`, NUL, control bytes, non-ASCII)
+// is rejected before the value reaches a URL `format!`.
+fn is_valid_owner_or_repo_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')
+}
+
 fn split_owner_repo(path: &str) -> Result<(&str, &str), GithubError> {
-    if !path.is_ascii() {
-        return Err(GithubError::MalformedPath(path.to_string()));
-    }
     let mut parts = path.splitn(2, '/');
     let owner = parts.next().unwrap_or("");
     let repo = parts.next().unwrap_or("");
-    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+    if owner.is_empty() || repo.is_empty() {
+        return Err(GithubError::MalformedPath(path.to_string()));
+    }
+    if !owner.bytes().all(is_valid_owner_or_repo_byte)
+        || !repo.bytes().all(is_valid_owner_or_repo_byte)
+    {
         return Err(GithubError::MalformedPath(path.to_string()));
     }
     Ok((owner, repo))
@@ -680,8 +812,13 @@ mod tests {
             app_id: 1,
             installation_id: 2,
             private_key_path: fixture_pem_path(),
+            selfcheck_timeout_secs: 5,
+            request_timeout_secs: 10,
         };
-        let p = GitHubProvider::new(&cfg).await.unwrap();
+        let key = GitHubProvider::load_key(&cfg).await.unwrap();
+        let worker = Rc::new(CpuWorker::new("gcb-test-jwt").unwrap());
+        let cancel = compio::runtime::CancelToken::new();
+        let p = GitHubProvider::new(&cfg, key, worker, cancel).unwrap();
         assert_eq!(p.api_base, "https://api.github.com");
     }
 
@@ -689,42 +826,66 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test_app_key.pem")
     }
 
-    #[test]
-    fn cache_key_case_insensitive() {
-        let cache = RepoIdCache::default();
-        let now = t(1_000_000);
-        cache.insert("foo/bar", 42, now + Duration::from_secs(600));
-        assert_eq!(cache.lookup("foo/bar", now), Some(42));
+    fn assert_hit(action: CacheAction, expected: u64) {
+        match action {
+            CacheAction::Hit(id) => assert_eq!(id, expected),
+            CacheAction::Wait(_) => panic!("expected Hit, got Wait"),
+            CacheAction::Resolve(_) => panic!("expected Hit, got Resolve"),
+        }
+    }
+
+    fn assert_resolve(action: CacheAction) {
+        match action {
+            CacheAction::Resolve(_) => {}
+            CacheAction::Hit(_) => panic!("expected Resolve, got Hit"),
+            CacheAction::Wait(_) => panic!("expected Resolve, got Wait"),
+        }
     }
 
     #[test]
-    fn cache_ttl_hit() {
+    fn cache_done_hit_within_ttl() {
         let cache = RepoIdCache::default();
         let now = t(1_000_000);
-        cache.insert("foo/bar", 42, now + Duration::from_secs(600));
-        assert_eq!(
-            cache.lookup("foo/bar", now + Duration::from_secs(599)),
-            Some(42)
+        cache.put_done("foo/bar", 42, now + Duration::from_secs(600));
+        assert_hit(cache.get_or_claim("foo/bar", now), 42);
+        assert_hit(
+            cache.get_or_claim("foo/bar", now + Duration::from_secs(599)),
+            42,
         );
     }
 
     #[test]
-    fn cache_ttl_miss() {
+    fn cache_done_miss_when_expired() {
         let cache = RepoIdCache::default();
         let now = t(1_000_000);
-        cache.insert("foo/bar", 42, now + Duration::from_secs(600));
-        assert_eq!(
-            cache.lookup("foo/bar", now + Duration::from_secs(601)),
-            None
-        );
+        cache.put_done("foo/bar", 42, now + Duration::from_secs(600));
+        // Expired entry yields Resolve (the new caller takes
+        // ownership of refreshing it).
+        assert_resolve(cache.get_or_claim("foo/bar", now + Duration::from_secs(601)));
     }
 
     #[test]
     fn cache_invalidate_removes_entry() {
         let cache = RepoIdCache::default();
         let now = t(1_000_000);
-        cache.insert("foo/bar", 42, now + Duration::from_secs(600));
+        cache.put_done("foo/bar", 42, now + Duration::from_secs(600));
         cache.invalidate("foo/bar");
-        assert_eq!(cache.lookup("foo/bar", now), None);
+        assert_resolve(cache.get_or_claim("foo/bar", now));
+    }
+
+    #[test]
+    fn cache_singleflight_second_caller_waits() {
+        let cache = RepoIdCache::default();
+        let now = t(1_000_000);
+        // First caller claims an in-flight slot.
+        assert_resolve(cache.get_or_claim("foo/bar", now));
+        // Second caller for same key gets a Wait, sharing the
+        // first caller's event. Don't call notify (the test only
+        // verifies the state-machine transition).
+        match cache.get_or_claim("foo/bar", now) {
+            CacheAction::Wait(_) => {}
+            CacheAction::Hit(_) => panic!("expected Wait, got Hit"),
+            CacheAction::Resolve(_) => panic!("expected Wait, got Resolve"),
+        }
     }
 }

@@ -156,10 +156,37 @@ Pinned in `Cargo.toml`:
   pull it in the same way — see compio-0.18 `examples/tick.rs`).
 - `ulid` (request IDs)
 - `thiserror` (errors)
-- `rustix` with feature `process` (signal delivery to stunnel via
-  `kill(2)` after enroll/revoke rewrites `gcb.psk`; also used for
-  the `Signal::HUP`/`Signal::INT`/`Signal::TERM` raw values handed
-  to `compio_signal::unix::signal`)
+- `rustix` with features `net,process`. `process` for signal
+  delivery to stunnel via `kill(2)` after enroll/revoke rewrites
+  `gcb.psk`. `net` for `socket_peercred` on the admin UDS — the
+  SO_PEERCRED check that rejects connections from UIDs other than
+  root or the daemon's own (defense in depth against a loose
+  `/run/gcb/` ACL).
+- `signal-hook-registry` (long-lived OS-level signal handler
+  installed once at startup. Replaces `compio::signal::unix::signal`
+  which is one-shot and reverts the kernel disposition to `SigDfl`
+  on listener drop — a SIGHUP delivered in that gap would kill the
+  daemon. We register synchronous handlers per signal that set an
+  AtomicBool + notify an `event_listener::Event`; the compio task
+  loop awaits the Event re-armably. Same pattern compio-signal uses
+  internally, just with a permanent handler.)
+- `synchrony` with features `async_flag,event` (sync primitives for
+  `compio`. `unsync::async_flag::AsyncFlag` backs
+  `ConnectionTracker`'s "drain empty" notification;
+  `sync::event::Event` is the re-armable wakeup for signal handlers
+  and for the singleflight cache in `providers::github`. Already a
+  transitive dep via `compio-signal`; promoted to direct so the
+  version is pinned independently.)
+- `percent-encoding` (URL component encoding for the owner/repo
+  segments of GitHub API paths. The path parser already rejects
+  any byte outside `[A-Za-z0-9._-]`; the encoding is defense in
+  depth so a future char-class regression cannot become a URL
+  injection.)
+- `url` (parse `api_base` to extract its host string once at
+  provider construction. The same-origin redirect policy on
+  `cyper::ClientBuilder` compares `attempt.url().host_str()`
+  against the cached api host so a redirect can never carry the
+  App JWT off-domain.)
 
 Do not add, remove, or swap crates without asking. Versions are locked
 via `Cargo.lock`. `rust-toolchain.toml` pins the compiler.
@@ -230,15 +257,20 @@ src/
   main.rs              # entry; dispatches daemon vs CLI vs subcommands
   lib.rs               # crate-level docs, pub re-exports
   config.rs            # config.toml + clients.json parsing
+  connection_tracker.rs# spawn / drain abstraction for accept loops
   cpu_worker.rs        # Dedicated OS thread for CPU-bound work
   git_credential.rs    # protocol parse/emit; CR/LF rejection mandatory
   proxy_protocol.rs    # PROXY v2 parsing
-  daemon.rs            # accept loop, per-connection handler, signal handling
+  daemon.rs            # accept loop, per-connection handler, Service shape
   admin.rs             # Unix socket + CLI dispatch
-  errors.rs            # crate-wide error composition (stub; deferred)
+  signals.rs           # signal-hook-registry handlers → CancelToken
+  ready.rs             # sd_notify + pidfile (atomic) at startup
+  loader.rs            # async config/clients.json file reads
+  logging.rs           # GcbJsonFormatter (ts/lvl/evt field renames)
+  sandbox.rs           # landlock + seccomp
   providers/
     mod.rs             # Provider abstraction (lightweight)
-    github.rs          # GitHub: JWT, repo-ID resolve, mint
+    github.rs          # GitHub: JWT, repo-ID singleflight cache, mint
 tests/
   integration.rs       # wiremock-rs against provider APIs
 fuzz/                  # cargo-fuzz subproject (nightly-pinned)
@@ -352,15 +384,18 @@ Known omissions, not oversights:
   ([hickory-dns issue #2142](https://github.com/hickory-dns/hickory-dns/issues/2142)
   + multiple users-forum threads confirm no compio/async-std
   backend exists). AGENTS.md hard-NOTs tokio. The sandbox allowlist
-  therefore continues to include four nameservice files
-  (`/etc/resolv.conf`, `/etc/hosts`, `/etc/nsswitch.conf`,
-  `/etc/gai.conf`) for libc
-  `getaddrinfo`. Reopen when either (a) hickory ships a runtime-
-  agnostic mode, (b) a compio-native DNS crate appears on crates.io,
-  or (c) operator need is concrete enough to justify hand-rolling a
-  tiny UDP stub resolver on `compio-net` (~150–250 LOC, A/AAAA
-  only). DoT/DoH are out of scope for our threat model regardless —
-  see PROTOCOLS.md for the rationale.
+  therefore continues to include the nameservice files libc's
+  `getaddrinfo` actually reads — selected at compile time via
+  `cfg(target_env = "musl")` in `src/daemon.rs::nameservice_files`.
+  musl reads `/etc/resolv.conf` and `/etc/hosts` only; glibc also
+  reads `/etc/nsswitch.conf` and `/etc/gai.conf`. The musl release
+  binary's ruleset therefore omits the two glibc-only files.
+  Reopen when either (a) hickory ships a runtime-agnostic mode,
+  (b) a compio-native DNS crate appears on crates.io, or (c)
+  operator need is concrete enough to justify hand-rolling a tiny
+  UDP stub resolver on `compio-net` (~150–250 LOC, A/AAAA only).
+  DoT/DoH are out of scope for our threat model regardless — see
+  PROTOCOLS.md for the rationale.
 - **Socket activation via `listen-fds` / `listenfd`.** systemd can
   hand pre-bound sockets to the daemon; would eliminate our own
   `UnixListener::bind` step under systemd. Real lifecycle redesign,

@@ -18,7 +18,6 @@
 //! write the daemon sends `SIGHUP` to stunnel via
 //! [`rustix::process::kill_process`].
 
-use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -169,46 +168,38 @@ pub async fn run_admin_loop(
     listener: UnixListener,
     state: Rc<SharedState>,
 ) -> Result<(), AdminError> {
-    use futures_util::stream::{FuturesUnordered, StreamExt};
+    // Cache effective UID once. Peer connections from this UID or
+    // root are admitted; everything else is rejected with
+    // evt=admin_denied. AGENTS.md invariant #9: the admin socket is
+    // the sole admin surface, so this is the choke point.
+    let my_uid = rustix::process::geteuid().as_raw();
 
-    let mut handlers: FuturesUnordered<compio::runtime::JoinHandle<()>> = FuturesUnordered::new();
+    let tracker = crate::connection_tracker::ConnectionTracker::new(
+        state.shutdown.clone(),
+        PER_CONNECTION_TIMEOUT,
+        Duration::from_secs(5),
+    );
     loop {
         futures_util::select! {
             accept_res = listener.accept().fuse() => {
                 let (stream, _peer) = accept_res.map_err(AdminError::Accept)?;
-                // Race: shutdown.cancel() fired while accept was
-                // already polled-ready this select! iteration. Drop
-                // the stream; the next iteration breaks via the
-                // shutdown.wait() arm. Zero connections accepted
-                // after cancel; in-flight handlers drain on their
-                // own timers (see Service::run for the symmetric
-                // listener-side comment).
                 if state.shutdown.is_cancelled() {
                     drop(stream);
                     continue;
                 }
+                if !check_peer_uid(&stream, my_uid) {
+                    drop(stream);
+                    continue;
+                }
                 let state = state.clone();
-                handlers.push(compio::runtime::spawn(async move {
-                    let _ = compio::time::timeout(
-                        PER_CONNECTION_TIMEOUT,
-                        handle_admin(stream, state),
-                    )
-                    .await;
-                }));
+                tracker.spawn(move |_cancel| async move {
+                    handle_admin(stream, state).await;
+                });
             }
-            // Prune completed handlers. Pending when empty.
-            _ = handlers.select_next_some() => {}
             _ = state.shutdown.clone().wait().fuse() => break,
         }
     }
-
-    // Drain in-flight admin handlers with deadline. Same shape as
-    // the listener-side drain in daemon.rs::Service::run.
-    let _ = compio::time::timeout(Duration::from_secs(5), async {
-        while handlers.next().await.is_some() {}
-    })
-    .await;
-
+    let _ = tracker.drain().await;
     Ok(())
 }
 
@@ -315,6 +306,17 @@ async fn handle_enroll(
             "client name must be non-empty ASCII without ':' or whitespace",
         ));
     }
+    // PROTOCOLS.md "CR or embedded LF inside any string field is
+    // rejected (same Clone2Leak-class defence applied to the admin
+    // path)" — applies to `note` as well as `client`.
+    if let Some(n) = note.as_deref()
+        && n.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0x00))
+    {
+        return Err(error_response(
+            "bad_request",
+            "note must not contain CR/LF/NUL bytes",
+        ));
+    }
 
     // Snapshot existing entries for collision checks. Drop the borrow
     // before any await/file I/O — we'll re-acquire borrow_mut at the
@@ -376,13 +378,11 @@ async fn handle_enroll(
         .map_err(|e| error_response("internal", &format!("write clients.json: {e}")))?;
 
     // Commit to in-memory state.
-    let mut providers_set = HashSet::new();
-    providers_set.insert(PROVIDER_GITHUB.to_string());
     state.clients.borrow_mut().insert(
         ip,
         ResolvedClient {
             name: client.to_string(),
-            providers: providers_set,
+            providers: vec![PROVIDER_GITHUB.to_string()],
             enrolled_at,
             note,
         },
@@ -747,7 +747,7 @@ async fn generate_psk_key() -> std::io::Result<[u8; 32]> {
     Ok(arr)
 }
 
-async fn atomic_write(path: &Path, content: Vec<u8>, mode: u32) -> std::io::Result<()> {
+pub(crate) async fn atomic_write(path: &Path, content: Vec<u8>, mode: u32) -> std::io::Result<()> {
     use compio::io::AsyncWriteAtExt;
     let dir = path
         .parent()
@@ -849,10 +849,46 @@ fn format_rfc3339_z(t: SystemTime) -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    // from_unix_timestamp accepts any i64 within ±9999 years; secs
+    // (u64) saturates to i64 just past the year-292B mark, so the
+    // cast is fine here. RFC3339 formatting of a valid OffsetDateTime
+    // is infallible. Both unwraps would only fire on internal bugs.
     let dt = time::OffsetDateTime::from_unix_timestamp(secs as i64)
-        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+        .expect("u64 seconds within i64::MAX");
     dt.format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+        .expect("RFC3339 format is infallible for OffsetDateTime")
+}
+
+// Returns false (denial) only on a definitive non-root, non-self UID.
+// On `socket_peercred` syscall failure we admit the connection and
+// log; refusing on syscall error would be a denial-of-service
+// against the operator if the kernel ever returns a transient EINVAL
+// or similar.
+fn check_peer_uid(stream: &UnixStream, my_uid: u32) -> bool {
+    use std::os::fd::AsFd;
+    match rustix::net::sockopt::socket_peercred(stream.as_fd()) {
+        Ok(cred) => {
+            let uid = cred.uid.as_raw();
+            if uid == 0 || uid == my_uid {
+                true
+            } else {
+                tracing::warn!(
+                    evt = "admin_denied",
+                    peer_uid = uid,
+                    peer_pid = cred.pid.as_raw_nonzero().get(),
+                );
+                false
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                evt = "admin_peercred_failed",
+                error = %e,
+                "admitting connection; peer credentials unavailable",
+            );
+            true
+        }
+    }
 }
 
 async fn sighup_stunnel(pidfile: &Path) -> Result<(), AdminError> {
@@ -867,14 +903,43 @@ async fn sighup_stunnel(pidfile: &Path) -> Result<(), AdminError> {
         source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
     })?;
     let trimmed = raw.trim();
-    let pid: i32 = trimmed.parse().map_err(|_| AdminError::StunnelPidParse {
+    let pid_int: i32 = trimmed.parse().map_err(|_| AdminError::StunnelPidParse {
         path: pidfile.to_path_buf(),
         raw: raw.clone(),
     })?;
-    let pid = rustix::process::Pid::from_raw(pid).ok_or_else(|| AdminError::StunnelPidParse {
-        path: pidfile.to_path_buf(),
-        raw,
-    })?;
+    let pid =
+        rustix::process::Pid::from_raw(pid_int).ok_or_else(|| AdminError::StunnelPidParse {
+            path: pidfile.to_path_buf(),
+            raw,
+        })?;
+
+    // PID-reuse defence: confirm /proc/<pid>/comm is stunnel before
+    // signalling. Without this check, a SIGHUP could land on an
+    // unrelated process that inherited the PID after stunnel exited.
+    let comm_path = format!("/proc/{pid_int}/comm");
+    let comm_bytes =
+        compio::fs::read(&comm_path)
+            .await
+            .map_err(|source| AdminError::StunnelPid {
+                path: pidfile.to_path_buf(),
+                source,
+            })?;
+    let comm = std::str::from_utf8(&comm_bytes)
+        .map(str::trim)
+        .unwrap_or("");
+    if comm != "stunnel" {
+        tracing::warn!(
+            evt = "stunnel_pid_mismatch",
+            pidfile = %pidfile.display(),
+            pid = pid_int,
+            comm = comm,
+        );
+        return Err(AdminError::StunnelPidParse {
+            path: pidfile.to_path_buf(),
+            raw: format!("comm={comm}, expected stunnel"),
+        });
+    }
+
     rustix::process::kill_process(pid, rustix::process::Signal::HUP).map_err(|e| {
         AdminError::StunnelPid {
             path: pidfile.to_path_buf(),
@@ -891,6 +956,12 @@ async fn sighup_stunnel(pidfile: &Path) -> Result<(), AdminError> {
 // for the symmetric comment.
 async fn read_line(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
     let mut accumulated = Vec::new();
+    // Single 1 KiB chunk buffer reused across reads via clear-and-
+    // reclaim (iggy pattern at
+    // iggy/core/server/src/tcp/connection_handler.rs:49-81).
+    // compio takes the Vec by value and returns it; we reuse the
+    // allocation on the next iteration.
+    let mut chunk: Vec<u8> = Vec::with_capacity(1024);
     loop {
         if let Some(pos) = accumulated.iter().position(|&b| b == b'\n') {
             accumulated.truncate(pos);
@@ -902,8 +973,9 @@ async fn read_line(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
                 "admin request exceeds size cap",
             ));
         }
-        let chunk = Vec::with_capacity(1024);
-        let BufResult(res, chunk) = stream.read(chunk).await;
+        chunk.clear();
+        let BufResult(res, returned) = stream.read(chunk).await;
+        chunk = returned;
         match res {
             Ok(0) => return Ok(accumulated),
             Ok(_) => accumulated.extend_from_slice(&chunk),
@@ -913,7 +985,7 @@ async fn read_line(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
 }
 
 async fn write_response(stream: &mut UnixStream, value: &serde_json::Value) -> std::io::Result<()> {
-    let mut payload = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
+    let mut payload = serde_json::to_vec(value).map_err(std::io::Error::other)?;
     payload.push(b'\n');
     let BufResult(res, _) = stream.write_all(payload).await;
     res?;

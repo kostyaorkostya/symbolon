@@ -12,6 +12,7 @@
 
 pub mod admin;
 pub mod config;
+pub(crate) mod connection_tracker;
 pub mod cpu_worker;
 pub mod daemon;
 pub mod git_credential;

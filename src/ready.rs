@@ -8,7 +8,6 @@
 
 use std::path::Path;
 
-use compio::BufResult;
 use sd_notify::NotifyState;
 
 /// Call once main has decided the daemon is ready: config loaded,
@@ -16,12 +15,14 @@ use sd_notify::NotifyState;
 ///
 /// Sends `READY=1` to `$NOTIFY_SOCKET` if set (no-op outside
 /// systemd), and writes the current pid to `pidfile` if provided.
+/// The pidfile write goes through `atomic_write` so a concurrent
+/// reader (init system supervisor) never observes an empty or
+/// partial file.
 pub async fn notify(pidfile: Option<&Path>) {
     let _ = sd_notify::notify(&[NotifyState::Ready]);
     if let Some(path) = pidfile {
-        let contents = format!("{}\n", std::process::id());
-        let BufResult(res, _) = compio::fs::write(path, contents.into_bytes()).await;
-        if let Err(e) = res {
+        let contents = format!("{}\n", std::process::id()).into_bytes();
+        if let Err(e) = crate::admin::atomic_write(path, contents, 0o644).await {
             tracing::warn!(evt = "ready_pidfile_write_failed", path = %path.display(), error = %e);
         }
     }

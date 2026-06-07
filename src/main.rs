@@ -56,14 +56,13 @@ async fn run_daemon(config_path: PathBuf) -> ExitCode {
     let shutdown = compio::runtime::CancelToken::new();
     let shutdown_watcher = gcb::signals::spawn_shutdown_watcher(shutdown.clone());
 
-    let (service, listener, admin_listener) =
-        match gcb::daemon::Service::bootstrap(&cfg, &config_path, shutdown.clone()).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!(error = %e, "bootstrap failed");
-                return ExitCode::from(1);
-            }
-        };
+    let service = match gcb::daemon::Service::prepare(&cfg, &config_path, shutdown.clone()).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, "prepare failed");
+            return ExitCode::from(1);
+        }
+    };
 
     let sighup = gcb::signals::spawn_sighup_handler(
         service.state_handle(),
@@ -73,10 +72,10 @@ async fn run_daemon(config_path: PathBuf) -> ExitCode {
 
     service.selfcheck().await;
 
-    // Lifecycle order: Service::bootstrap above already loaded
-    // config, built providers, bound BOTH Unix sockets (the kernel
-    // begins queueing incoming connections at bind time), and
-    // applied the sandbox. selfcheck just hit GitHub via HTTPS.
+    // Lifecycle order: Service::prepare above already loaded
+    // config, bound BOTH Unix sockets (the kernel begins queueing
+    // incoming connections at bind time), applied the sandbox, and
+    // built providers. selfcheck just hit GitHub via HTTPS.
     //
     // Now we tell the init system we're ready. `service.run` below
     // starts the accept loop; any connections the kernel queued
@@ -85,7 +84,7 @@ async fn run_daemon(config_path: PathBuf) -> ExitCode {
     gcb::ready::notify(cfg.runtime.pidfile.as_deref()).await;
     tracing::info!(evt = "ready", pid = std::process::id());
 
-    let run_result = service.run(listener, admin_listener).await;
+    let run_result = service.run().await;
     let signal_name = shutdown_watcher.await.unwrap_or("SIGTERM");
     let _ = sighup.await;
 
@@ -96,6 +95,7 @@ async fn run_daemon(config_path: PathBuf) -> ExitCode {
                 signal = signal_name,
                 inflight_drained = stats.inflight_drained,
                 drain_ms = stats.drain_ms,
+                drain_complete = stats.drain_complete,
             );
             ExitCode::SUCCESS
         }

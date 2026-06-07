@@ -58,7 +58,18 @@ pub enum GitCredentialError {
     ResponseControlByte { field: &'static str },
     #[error("password_expiry_utc is before the UNIX epoch")]
     EmitInvalidExpiry,
+    #[error("value for '{key}' exceeds {max} bytes")]
+    ValueTooLong { key: &'static str, max: usize },
+    #[error("request block exceeds {max} bytes")]
+    RequestTooLarge { max: usize },
 }
+
+/// Hard ceilings for git-credential request parsing. Real-world
+/// inputs are tens of bytes; legitimate hosts/paths run hundreds at
+/// most. Bounded to defend against pathological inputs (e.g. a
+/// runaway value buffer) without restricting any plausible repo URL.
+pub const MAX_VALUE_BYTES: usize = 4 * 1024;
+pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 /// Parse a git-credential request block.
 ///
@@ -74,6 +85,11 @@ pub enum GitCredentialError {
 /// Returns `Err` on any deviation; the daemon closes the connection
 /// without a response on any error from this function.
 pub fn parse(input: &[u8]) -> Result<Request, GitCredentialError> {
+    if input.len() > MAX_REQUEST_BYTES {
+        return Err(GitCredentialError::RequestTooLarge {
+            max: MAX_REQUEST_BYTES,
+        });
+    }
     let term_pos = input
         .windows(2)
         .position(|w| w == b"\n\n")
@@ -113,6 +129,13 @@ pub fn parse(input: &[u8]) -> Result<Request, GitCredentialError> {
             _ => continue,
         };
 
+        if value_bytes.len() > MAX_VALUE_BYTES {
+            return Err(GitCredentialError::ValueTooLong {
+                key: key_static,
+                max: MAX_VALUE_BYTES,
+            });
+        }
+
         for &b in value_bytes {
             match b {
                 0x00 => {
@@ -143,7 +166,7 @@ pub fn parse(input: &[u8]) -> Result<Request, GitCredentialError> {
             "protocol" => &mut protocol,
             "host" => &mut host,
             "path" => &mut path,
-            _ => unreachable!(),
+            _ => unreachable!("key_static set to one of protocol/host/path by the match above"),
         };
         if slot.is_some() {
             return Err(GitCredentialError::DuplicateKey { key: key_static });
@@ -495,5 +518,34 @@ mod tests {
         let mut out = Vec::new();
         let err = write_response(&resp, &mut out).unwrap_err();
         assert!(matches!(err, GitCredentialError::EmitInvalidExpiry));
+    }
+
+    #[test]
+    fn parse_accepts_value_just_under_max() {
+        let host = "h".repeat(MAX_VALUE_BYTES);
+        let input = format!("protocol=https\nhost={host}\npath=p\n\n").into_bytes();
+        let req = parse(&input).unwrap();
+        assert_eq!(req.host.len(), MAX_VALUE_BYTES);
+    }
+
+    #[test]
+    fn parse_rejects_value_just_over_max() {
+        let host = "h".repeat(MAX_VALUE_BYTES + 1);
+        let input = format!("protocol=https\nhost={host}\npath=p\n\n").into_bytes();
+        let err = parse(&input).unwrap_err();
+        assert!(matches!(
+            err,
+            GitCredentialError::ValueTooLong { key: "host", .. }
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_request_just_over_max() {
+        // Build a block one byte past the request cap. The cap is
+        // checked before any line scanning, so we don't need a
+        // well-formed inner shape.
+        let input = vec![b'x'; MAX_REQUEST_BYTES + 1];
+        let err = parse(&input).unwrap_err();
+        assert!(matches!(err, GitCredentialError::RequestTooLarge { .. }));
     }
 }

@@ -5,9 +5,11 @@
 //! on the test thread, and they meet over a localhost TCP port.
 
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gcb::config::ProviderGithub;
+use gcb::cpu_worker::CpuWorker;
 use gcb::providers::github::{GitHubProvider, GithubError};
 
 use serde_json::json;
@@ -33,10 +35,13 @@ async fn build_provider(api_base: String) -> GitHubProvider {
         app_id: APP_ID,
         installation_id: INSTALLATION_ID,
         private_key_path: fixture_pem_path(),
+        selfcheck_timeout_secs: 5,
+        request_timeout_secs: 10,
     };
-    GitHubProvider::with_overrides(&cfg, None, SystemTime::now)
-        .await
-        .unwrap()
+    let key = GitHubProvider::load_key(&cfg).await.unwrap();
+    let worker = Rc::new(CpuWorker::new("gcb-test-jwt-signer").unwrap());
+    let cancel = compio::runtime::CancelToken::new();
+    GitHubProvider::with_overrides(&cfg, key, worker, cancel, None, SystemTime::now).unwrap()
 }
 
 fn repo_path() -> String {
@@ -398,6 +403,8 @@ mod daemon_e2e {
                     app_id: APP_ID,
                     installation_id: INSTALLATION_ID,
                     private_key_path: fixture_pem_path(),
+                    selfcheck_timeout_secs: 5,
+                    request_timeout_secs: 10,
                 }),
             },
         }
@@ -542,6 +549,34 @@ mod daemon_e2e {
         let _ = std::fs::remove_file(&socket_path);
         let _ = std::fs::remove_file(&clients_path);
     }
+
+    // End-to-end Clone2Leak defence: a request with an embedded CR
+    // byte in a value reaches the daemon's parser, which rejects it.
+    // The daemon closes the connection without a response.
+    #[compio::test]
+    async fn daemon_rejects_cr_in_host_value() {
+        let (socket_path, clients_path) = unique_paths();
+        write_clients_json(&clients_path, &[("vm-1", CLIENT_IP)]);
+        let server = MockServer::start().await;
+        let cfg = build_config(socket_path.clone(), clients_path.clone(), server.uri());
+
+        compio::runtime::spawn(async move {
+            let _ = gcb::daemon::run(&cfg, std::path::Path::new("/test/config.toml")).await;
+        })
+        .detach();
+        wait_for_socket(&socket_path).await;
+
+        let mut payload = build_proxy_v4([192, 168, 122, 10]);
+        payload.extend_from_slice(b"protocol=https\nhost=github.com\rmalicious\npath=foo\n\n");
+        let resp = send_and_read_all(&socket_path, payload).await;
+        assert!(
+            resp.is_empty(),
+            "CR in value must close the connection without a response"
+        );
+
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_file(&clients_path);
+    }
 }
 
 // =====================================================================
@@ -595,6 +630,8 @@ mod admin_e2e {
                     app_id: APP_ID,
                     installation_id: INSTALLATION_ID,
                     private_key_path: fixture_pem_path(),
+                    selfcheck_timeout_secs: 5,
+                    request_timeout_secs: 10,
                 }),
             },
         }

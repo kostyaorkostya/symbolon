@@ -153,6 +153,18 @@ pub struct ProviderGithub {
     pub installation_id: u64,
     /// PEM-encoded App private key; loaded once at startup.
     pub private_key_path: PathBuf,
+    /// Startup self-check timeout, in seconds. Required — there is
+    /// no sane default; the operator picks based on their network's
+    /// p99 latency to api.github.com.
+    pub selfcheck_timeout_secs: u64,
+    /// Per-request timeout (resolve repo ID, mint token) in seconds.
+    /// Defaults to 10s.
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+}
+
+fn default_request_timeout_secs() -> u64 {
+    10
 }
 
 /// Top-level parsed `clients.json`.
@@ -262,6 +274,7 @@ api_base = "https://api.github.com"
 app_id = 123456
 installation_id = 789012
 private_key_path = "/etc/gcb/github-app.pem"
+selfcheck_timeout_secs = 5
 "#;
 
     #[test]

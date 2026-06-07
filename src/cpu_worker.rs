@@ -25,12 +25,9 @@ use futures_channel::oneshot;
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
 pub struct CpuWorker {
-    tx: mpsc::Sender<Job>,
-    // Thread joins implicitly when `tx` is dropped (the worker's
-    // recv() returns Err and the loop exits). We hold the handle
-    // so the OS thread name persists and a future
-    // `CpuWorker::shutdown(self)` method has somewhere to land.
-    _thread: JoinHandle<()>,
+    tx: Option<mpsc::Sender<Job>>,
+    // Some until Drop joins the worker thread.
+    thread: Option<JoinHandle<()>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -46,8 +43,8 @@ impl CpuWorker {
             .name(name.into())
             .spawn(move || worker_loop(rx))?;
         Ok(Self {
-            tx,
-            _thread: thread,
+            tx: Some(tx),
+            thread: Some(thread),
         })
     }
 
@@ -63,8 +60,24 @@ impl CpuWorker {
             // reply lands; drop the result silently in that case.
             let _ = reply_tx.send(f());
         });
-        self.tx.send(job).map_err(|_| WorkerDead)?;
+        let tx = self.tx.as_ref().ok_or(WorkerDead)?;
+        tx.send(job).map_err(|_| WorkerDead)?;
         reply_rx.await.map_err(|_| WorkerDead)
+    }
+}
+
+impl Drop for CpuWorker {
+    /// Structured-concurrency: close the channel so the worker's
+    /// recv returns Err, then join the thread before returning. No
+    /// background threads outlive the last `Rc<CpuWorker>` clone.
+    /// Panics from the worker thread are not propagated (they
+    /// already would have surfaced via `WorkerDead` to the awaiter
+    /// of the panicking job — see `worker_dead_when_thread_panics`).
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
     }
 }
 

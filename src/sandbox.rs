@@ -278,7 +278,6 @@ fn build_signal_filter(arch: TargetArch) -> Result<SeccompFilter, SandboxError> 
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::Path;
     use std::thread;
 
     // Landlock + seccomp persist for the calling thread's lifetime.
@@ -399,10 +398,4 @@ mod tests {
         let out = apply(SandboxLevel::Off, &paths).unwrap();
         assert_eq!(out.status, "off");
     }
-
-    // PathBuf::display is sometimes needed in messages; keep an
-    // assertion that referencing Path works to make sure the import
-    // stays useful even if test bodies are pruned.
-    #[allow(dead_code)]
-    fn _path_helper(_: &Path) {}
 }

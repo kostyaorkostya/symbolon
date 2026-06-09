@@ -27,9 +27,9 @@ file = "/var/lib/symbolon/clients.json"
 level = "info"   # trace | debug | info | warn | error
 
 [security]
-# Sandbox enforcement policy. Controls landlock (FS + TCP-connect +
-# abstract-UDS scope at ABI 6) and a seccomp filter that confines the
-# kill-family syscalls to SIGHUP only.
+# Sandbox enforcement policy. Controls Landlock at ABI 6 (FS allowlist
+# + TCP-connect/bind + abstract-UDS scope + Scope::Signal denying
+# cross-domain signal-sending — Linux 6.12+).
 #
 #   required    – refuse to start if the kernel can't enforce ABI 6.
 #   best_effort – default. Apply what the kernel supports; degrade and
@@ -374,12 +374,13 @@ join the broker's log to GitHub's side when filing a ticket.
 3. Unlink any stale `listen.socket` and `admin.socket_path`.
 4. Bind both Unix sockets; set mode `0660`, owner `symbolon:symbolon`.
 5. Load `clients.json`. Fail fast on schema errors.
-6. Apply sandbox (landlock + seccomp). Per `[security] sandbox`:
+6. Apply sandbox (Landlock at ABI 6). Per `[security] sandbox`:
    `required` aborts on missing kernel features; `best_effort`
    degrades and emits `evt=sandbox_applied` at `warn` lvl; `off`
    skips. After this step the PEM key dir is unreachable, only the
    small allowlist (state dirs, `/dev/urandom`, `/etc/ssl/certs`,
-   nameservice files, TCP-connect to port 443, SIGHUP sends) remains
+   nameservice files, TCP-connect to port 443, intra-domain
+   signals) remains
    permitted.
 7. Run selfcheck (verify App ID matches JWT, verify each provider's
    `api_base` reachable, log clock skew).
@@ -439,7 +440,7 @@ top-level keys.
 | `revoke` | `provider`, `client` |
 | `config_reload` | `triggered_by` (`sighup`) |
 | `cache_invalidated` | `provider`, `repo`, `cause` (`404` \| `ttl_expired`) |
-| `sandbox_applied` | `policy` (`required` \| `best_effort` \| `off`), `abi` (landlock ABI requested; `0` if off), `status` (`fully_enforced` \| `partially_enforced` \| `not_enforced` \| `off`), `fs`, `tcp`, `scope`, `seccomp` (bool per subsystem actually engaged) |
+| `sandbox_applied` | `policy` (`required` \| `best_effort` \| `off`), `abi` (Landlock ABI requested; `0` if off), `status` (`fully_enforced` \| `partially_enforced` \| `not_enforced` \| `off`), `fs`, `tcp`, `scope` (bool per Landlock layer actually engaged) |
 | `sandbox_path_skipped` | `path`, `reason` (`enoent` \| `open_failed`), `error` (when applicable) — emitted at `debug` for nameservice / CA-bundle paths absent on this host |
 | `prepare` | `version`, `config_path`, `listen_socket`, `admin_socket` — emitted by `Service::prepare` once config is loaded and sockets are bound (before selfcheck and readiness) |
 | `ready` | `pid` — emitted by `main` after `service.selfcheck()` returns and `ready::notify` has sent `READY=1` to systemd (if applicable) and written the pidfile (if configured) |

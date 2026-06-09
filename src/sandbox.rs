@@ -1,14 +1,16 @@
-//! Linux sandboxing layer: applies landlock (FS + TCP + abstract-UDS
-//! scope at ABI 6) and a seccomp-BPF filter that **denies** every
-//! PID-targeted signal syscall (`kill` / `tkill` / `tgkill` /
-//! `rt_sigqueueinfo` / `rt_tgsigqueueinfo` / `pidfd_send_signal`).
+//! Linux sandboxing layer: applies Landlock at ABI 6 (FS allowlist +
+//! per-port TCP bind/connect + abstract-UDS scope + cross-process
+//! signal scope).
 //!
-//! Symbolon never signals other processes — the prior stunnel
-//! SIGHUP path was deleted along with stunnel itself (Noise NNpsk0
-//! is terminated in-process now). The complete signal-syscall deny
-//! is what `landlock::Scope::Signal` would give us if it could be
-//! enabled without breaking the SIGHUP-to-clients.json-reload path
-//! we still rely on; seccompfilter is the lever we have.
+//! `Scope::Signal` (Linux 6.12+, Landlock ABI 6) denies sending any
+//! signal to a process outside the broker's Landlock domain.
+//! Intra-process signals (panic handlers, libc `abort()`,
+//! thread-local plumbing) remain permitted — which is correct,
+//! because the things we want to *prevent* (a compromised broker
+//! attacking other processes via signals) all involve crossing the
+//! domain boundary. Symbolon does not legitimately send any signal:
+//! the prior stunnel-SIGHUP path was deleted with stunnel itself
+//! (Noise NNpsk0 is terminated in-process now).
 //!
 //! Landlock is intentionally NOT given any rule for `/etc/symbolon/`,
 //! so the App PEM key (read once at startup before this module runs) is
@@ -23,9 +25,6 @@ use landlock::{
     ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath,
     PathFd, PathFdError, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetError, RulesetStatus,
     Scope,
-};
-use seccompiler::{
-    BackendError, BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch,
 };
 
 use crate::config::SandboxMode;
@@ -66,7 +65,6 @@ pub(crate) struct SandboxOutcome {
     pub fs: bool,
     pub tcp: bool,
     pub scope: bool,
-    pub seccomp: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -85,22 +83,11 @@ pub enum SandboxError {
     /// availability.
     #[error("landlock restrict_self failed")]
     Restrict(#[source] RulesetError),
-    /// Building the seccomp filter or compiling its BPF program
-    /// failed.
-    #[error("seccomp filter construction failed")]
-    SeccompBuild(#[source] seccompiler::Error),
-    /// Loading the BPF program into the kernel failed.
-    #[error("seccomp filter install failed")]
-    SeccompInstall(#[source] seccompiler::Error),
-    /// The host architecture is not one seccompiler recognises
-    /// (x86_64 / aarch64 / riscv64).
-    #[error("unsupported host architecture for seccomp: {0}")]
-    UnsupportedArch(String),
 }
 
-/// Apply landlock + seccomp to the calling thread. Effects persist
-/// for the lifetime of the thread and propagate to descendants. Only
-/// call once per process.
+/// Apply Landlock to the calling thread. Effects persist for the
+/// lifetime of the thread and propagate to descendants. Only call
+/// once per process.
 pub(crate) fn apply(
     level: SandboxMode,
     paths: &SandboxPaths,
@@ -112,17 +99,10 @@ pub(crate) fn apply(
             fs: false,
             tcp: false,
             scope: false,
-            seccomp: false,
         });
     }
 
-    let landlock_outcome = apply_landlock(level, paths)?;
-    apply_seccomp()?;
-
-    Ok(SandboxOutcome {
-        seccomp: true,
-        ..landlock_outcome
-    })
+    apply_landlock(level, paths)
 }
 
 fn apply_landlock(
@@ -137,6 +117,7 @@ fn apply_landlock(
     let abi = ABI::V6;
     let fs_bits = AccessFs::from_all(abi);
     let net_bits = AccessNet::from_all(abi);
+    let scope_bits: BitFlags<Scope> = Scope::AbstractUnixSocket | Scope::Signal;
 
     let ruleset = Ruleset::default()
         .set_compatibility(compat)
@@ -144,7 +125,7 @@ fn apply_landlock(
         .map_err(|e| classify_ruleset_err(level, e))?
         .handle_access(net_bits)
         .map_err(|e| classify_ruleset_err(level, e))?
-        .scope(Scope::AbstractUnixSocket)
+        .scope(scope_bits)
         .map_err(|e| classify_ruleset_err(level, e))?;
 
     let mut created = ruleset.create().map_err(SandboxError::Ruleset)?;
@@ -232,7 +213,6 @@ fn apply_landlock(
         fs: fully,
         tcp: fully,
         scope: fully,
-        seccomp: false,
     })
 }
 
@@ -243,47 +223,6 @@ fn classify_ruleset_err(level: SandboxMode, e: RulesetError) -> SandboxError {
     }
 }
 
-fn apply_seccomp() -> Result<(), SandboxError> {
-    let arch: TargetArch = std::env::consts::ARCH
-        .try_into()
-        .map_err(|_| SandboxError::UnsupportedArch(std::env::consts::ARCH.to_string()))?;
-    let filter = build_signal_filter(arch)?;
-    let program: BpfProgram = filter
-        .try_into()
-        .map_err(|e: BackendError| SandboxError::SeccompBuild(seccompiler::Error::Backend(e)))?;
-    seccompiler::apply_filter(&program).map_err(SandboxError::SeccompInstall)?;
-    Ok(())
-}
-
-fn build_signal_filter(arch: TargetArch) -> Result<SeccompFilter, SandboxError> {
-    let mut rules: std::collections::BTreeMap<i64, Vec<SeccompRule>> =
-        std::collections::BTreeMap::new();
-
-    // Unconditional deny. The daemon never calls any of these — and
-    // since the stunnel SIGHUP path is gone (Noise terminated
-    // in-process), there is no legitimate sender of signals to other
-    // processes. An empty rule chain matches every call, routing it
-    // to `match_action = EPERM`.
-    for nr in [
-        libc::SYS_kill,
-        libc::SYS_tkill,
-        libc::SYS_tgkill,
-        libc::SYS_rt_sigqueueinfo,
-        libc::SYS_rt_tgsigqueueinfo,
-        libc::SYS_pidfd_send_signal,
-    ] {
-        rules.insert(nr, Vec::new());
-    }
-
-    SeccompFilter::new(
-        rules,
-        SeccompAction::Allow,
-        SeccompAction::Errno(libc::EPERM as u32),
-        arch,
-    )
-    .map_err(|e: BackendError| SandboxError::SeccompBuild(seccompiler::Error::Backend(e)))
-}
-
 #[cfg(test)]
 #[cfg(target_os = "linux")]
 mod tests {
@@ -291,10 +230,10 @@ mod tests {
     use std::fs;
     use std::thread;
 
-    // Landlock + seccomp persist for the calling thread's lifetime.
-    // Confine every test that calls `apply` (or its sub-pieces) to a
-    // dedicated worker thread so the test-binary process itself stays
-    // pristine for the rest of the test run.
+    // Landlock persists for the calling thread's lifetime. Confine
+    // every test that calls `apply` to a dedicated worker thread so
+    // the test-binary process itself stays pristine for the rest of
+    // the test run.
     fn run_isolated<F, R>(f: F) -> R
     where
         F: FnOnce() -> R + Send + 'static,
@@ -320,10 +259,7 @@ mod tests {
             apply(SandboxMode::Off, &paths).unwrap()
         });
         assert_eq!(out.status, "off");
-        assert!(!out.fs && !out.tcp && !out.scope && !out.seccomp);
-        // Still able to read arbitrary paths from the worker thread —
-        // but we're back on the test thread now, so just sanity-check
-        // the outcome shape.
+        assert!(!out.fs && !out.tcp && !out.scope);
     }
 
     #[test]
@@ -358,63 +294,6 @@ mod tests {
             // Kernel lacks landlock support — best-effort degraded to
             // a no-op; test cannot verify FS denial.
             assert!(other_res.is_ok() || other_res.is_err());
-        }
-    }
-
-    #[test]
-    fn seccomp_blocks_kill_even_with_sighup() {
-        // SYS_kill is denied unconditionally. Symbolon no longer
-        // sends signals to any other process (the prior stunnel
-        // SIGHUP path was removed when Noise replaced stunnel).
-        // This test asserts that the legacy kill(2) entry-point is
-        // fully closed.
-        let blocked = run_isolated(|| {
-            let paths = make_paths(vec![], vec![]);
-            let _ = apply(SandboxMode::BestEffort, &paths).expect("sandbox apply");
-            unsafe {
-                let pid = libc::getpid();
-                let rc = libc::kill(pid, libc::SIGHUP);
-                if rc == 0 {
-                    return Ok(());
-                }
-                let errno = *libc::__errno_location();
-                Err(errno)
-            }
-        });
-        match blocked {
-            Ok(()) => panic!("expected kill(SIGHUP) to be blocked by seccomp filter"),
-            Err(errno) => assert_eq!(errno, libc::EPERM, "expected EPERM, got {errno}"),
-        }
-    }
-
-    #[test]
-    fn seccomp_blocks_non_sighup_self_signal() {
-        // Send SIGHUP first (a child receives it harmlessly when
-        // running under cargo, since `kill` to self with SIGHUP is
-        // synchronous and we control the process). Then attempt
-        // SIGUSR1, which the filter must reject with EPERM.
-        let blocked = run_isolated(|| {
-            // Apply only seccomp (landlock off-mode skips both, but
-            // we want JUST seccomp here so the test is hermetic). We
-            // need NO_NEW_PRIVS set; landlock's restrict_self does
-            // that even when the ruleset is empty, so go through it.
-            let paths = make_paths(vec![], vec![]);
-            let _ = apply(SandboxMode::BestEffort, &paths).expect("sandbox apply");
-
-            // SIGUSR1: should be EPERM under the filter.
-            unsafe {
-                let pid = libc::getpid();
-                let rc = libc::kill(pid, libc::SIGUSR1);
-                if rc == 0 {
-                    return Ok(());
-                }
-                let errno = *libc::__errno_location();
-                Err(errno)
-            }
-        });
-        match blocked {
-            Ok(()) => panic!("expected SIGUSR1 to be blocked by seccomp filter"),
-            Err(errno) => assert_eq!(errno, libc::EPERM, "expected EPERM, got {errno}"),
         }
     }
 

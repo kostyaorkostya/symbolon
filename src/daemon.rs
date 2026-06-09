@@ -185,8 +185,8 @@ impl Service {
     /// access the sandbox would deny, so they happen first.
     /// `apply_sandbox` then closes the gate. The shared `CpuWorker`
     /// is spawned AFTER the sandbox so its thread inherits the
-    /// landlock ruleset and seccomp filter — spawning it before
-    /// would leak an unsandboxed thread into the process.
+    /// Landlock ruleset — spawning it before would leak an
+    /// unsandboxed thread into the process.
     pub async fn prepare(
         cfg: &Config,
         config_path: &Path,
@@ -254,8 +254,7 @@ impl Service {
         apply_sandbox(cfg)?;
 
         // Post-sandbox: spawn the shared CPU worker (its OS thread
-        // inherits the seccomp filter via clone(2) and the landlock
-        // ruleset via TGID-wide application).
+        // inherits the Landlock ruleset via TGID-wide application).
         let cpu_worker =
             Rc::new(CpuWorker::new("symbolon-cpu-worker").map_err(DaemonError::CpuWorker)?);
 
@@ -597,7 +596,6 @@ fn apply_sandbox(cfg: &Config) -> Result<(), DaemonError> {
             fs = outcome.fs,
             tcp = outcome.tcp,
             scope = outcome.scope,
-            seccomp = outcome.seccomp,
         );
     } else {
         info!(
@@ -608,7 +606,6 @@ fn apply_sandbox(cfg: &Config) -> Result<(), DaemonError> {
             fs = outcome.fs,
             tcp = outcome.tcp,
             scope = outcome.scope,
-            seccomp = outcome.seccomp,
         );
     }
     Ok(())

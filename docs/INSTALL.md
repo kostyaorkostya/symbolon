@@ -19,16 +19,15 @@ package versions, and provider UIs change. The stable design lives in
   - Outbound HTTPS to `api.github.com` (or your GHES API base).
   - Enough headroom for a ~3 MiB daemon. No TLS proxy needed —
     symbolon terminates Noise NNpsk0 in-process.
-  - **Linux kernel 6.10+** recommended. The broker self-sandboxes
-    with landlock (FS + TCP-connect/bind + abstract-UDS scope at
-    ABI 6) plus a seccomp-BPF filter that denies the full
-    signal-sending syscall set. Older kernels degrade under the
-    default `[security] sandbox = "best_effort"` policy and the
-    daemon emits `evt=sandbox_applied lvl=warn
-    status=partially_enforced` so the operator notices. Check with
-    `uname -r`; check landlock LSM is enabled with `grep landlock
-    /sys/kernel/security/lsm`. In an LXC container, the host kernel
-    is what counts.
+  - **Linux kernel 6.12+** recommended. The broker self-sandboxes
+    with Landlock at ABI 6: FS allowlist, per-port TCP-connect/bind,
+    abstract-UDS scope, and `Scope::Signal` (Linux 6.12+) denying
+    cross-process signal-sending. Kernels 6.10–6.11 work but
+    degrade the signal scope; the daemon emits
+    `evt=sandbox_applied lvl=warn status=partially_enforced` so
+    the operator notices. Check with `uname -r`; check Landlock LSM
+    is enabled with `grep landlock /sys/kernel/security/lsm`. In
+    an LXC container, the host kernel is what counts.
 - On each client: `git` and the ability to drop a small binary
   (`git-credential-symbolon`) in `/usr/local/bin/` plus a single PSK
   file at `/etc/symbolon/psk`.

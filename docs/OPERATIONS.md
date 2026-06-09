@@ -79,32 +79,27 @@ service (rsyslog `imuxsock` + `omfwd`, Vector, journald, etc.).
 ### `evt=sandbox_applied`
 
 Emitted exactly once at startup. Reports the result of applying
-landlock + seccomp.
+Landlock.
 
 ```jsonc
 {"evt":"sandbox_applied","policy":"best_effort","abi":6,
- "status":"fully_enforced","fs":true,"tcp":true,"scope":true,"seccomp":true}
+ "status":"fully_enforced","fs":true,"tcp":true,"scope":true}
 ```
 
-- `status: "fully_enforced"` → all of FS, TCP-connect scoping,
-  abstract-UDS scope, and the seccomp signal filter are active.
-  Logged at `info`.
+- `status: "fully_enforced"` → all of FS, TCP-connect/bind, and
+  the scope layer (abstract-UDS + cross-process signal-send) are
+  active. Logged at `info`.
 - `status: "partially_enforced"` → some features were downgraded
-  because the kernel doesn't support them. The per-subsystem booleans
-  show which. Logged at `warn`. Common cause: kernel < 6.10, so
-  scope is dropped.
-- `status: "not_enforced"` → kernel has no landlock at all. Logged at
-  `warn`. The seccomp filter still applies (`seccomp: true`).
+  because the kernel doesn't support them. The per-subsystem
+  booleans show which. Logged at `warn`. Common cause: kernel
+  < 6.12, so `Scope::Signal` is unavailable and the scope layer
+  reports false.
+- `status: "not_enforced"` → kernel has no Landlock at all.
+  Logged at `warn`. The daemon runs with no sandbox; operators
+  on this kernel should set `[security] sandbox = "required"`
+  to force startup failure rather than silent degradation.
 - `status: "off"` → `[security] sandbox = "off"` in `config.toml`.
   Logged at `info`. There is no sandboxing of any kind.
-
-To verify the running process is actually sandboxed:
-
-```sh
-PID=$(pgrep -f 'symbolon$')
-grep -E 'Seccomp|NoNewPrivs' /proc/$PID/status
-# Expect: Seccomp: 2  and  NoNewPrivs: 1
-```
 
 ## Troubleshooting
 
@@ -209,12 +204,16 @@ points at the fix.
 
 ## Sandbox: scope of protection and limitations
 
-The broker self-sandboxes at startup with landlock (FS read/write
-allowlist + outbound TCP-connect restricted to port 443 + abstract
-Unix-socket scope) and a seccomp-BPF filter that denies the full
-signal-sending syscall set (`kill`, `tkill`, `tgkill`,
-`rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `pidfd_send_signal`) with
-EPERM. Symbolon never sends signals to other processes.
+The broker self-sandboxes at startup with Landlock at ABI 6: a FS
+read/write allowlist, outbound TCP-connect restricted to port 443,
+abstract-Unix-socket scope, and `Scope::Signal` (Linux 6.12+)
+denying signals to processes outside the broker's Landlock domain.
+Intra-process signal use (Rust panic handlers, libc `abort()`,
+thread-local plumbing) is allowed — those legitimate runtime
+paths used to be incidentally blocked by an earlier seccomp filter
+which became unnecessary collateral after the Noise migration
+removed the only legitimate cross-process signal path (`SIGHUP` to
+stunnel).
 
 **What this prevents** if a dependency CVE ever lets code execute
 inside the daemon:
@@ -224,7 +223,7 @@ inside the daemon:
   files, `/dev/urandom`, CA bundle, nameservice files).
 - Binding new TCP listeners, or connecting outbound to anywhere
   other than port 443.
-- Sending any signal to any process.
+- Signalling any process outside the broker's Landlock domain.
 
 **Known limitations:**
 - The atomic-write directory grant on `/var/lib/symbolon/` covers
@@ -232,7 +231,12 @@ inside the daemon:
   overwrite `clients.json` or `psks` (which the daemon already
   self-rewrites). The PEM key is protected because it lives
   outside this dir.
-- If you want host-policy enforcement *in addition* to landlock
+- `Scope::Signal` requires Linux 6.12+. On older kernels under
+  `[security] sandbox = "best_effort"`, the scope layer reports
+  `false` and signal-send scoping is absent; the rest of the
+  ruleset still applies. Operators wanting that layer guaranteed
+  should set `sandbox = "required"`.
+- If you want host-policy enforcement *in addition* to Landlock
   (per-process syscall scope, etc.), layer AppArmor or SELinux from
   the LXC config. This is out of scope for the broker itself.
 

@@ -112,7 +112,7 @@ pub struct SecurityConfig {
     pub mlock: MlockMode,
 }
 
-/// Sandbox enforcement policy, controlling landlock + seccomp.
+/// Sandbox enforcement policy, controlling Landlock at ABI 6.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxMode {

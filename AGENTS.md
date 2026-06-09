@@ -191,31 +191,25 @@ Pinned in `Cargo.toml`:
   PKCS1-v1_5 with SHA-256 is one of the most thoroughly specified
   JOSE algorithms; the actual signing is a single `rsa::SigningKey`
   call.
-- `landlock` (Linux LSM sandboxing for FS + TCP-connect/bind +
-  abstract-UDS scope at ABI 6. Applied in `src/sandbox.rs` after
-  the TCP listen socket + admin Unix socket are bound and before
-  the accept loops; gated by `[security] sandbox` in `config.toml`
-  with default `best_effort`. Pure Rust + `libc` only; works on
-  musl. Used together with `seccompiler` to also deny every
-  signal-sending syscall — landlock's `Scope::Signal` would
-  achieve the same but blocks the operator SIGHUP path
-  (clients.json reload), which we still want.)
-- `libc` (raw syscall numbers and signal constants for the
-  `seccompiler` BPF filter, plus the `mlockall(MCL_CURRENT |
-  MCL_FUTURE | MCL_ONFAULT)` call in `src/mlock.rs`. Transitively
-  required by landlock and seccompiler anyway, so the explicit
-  dep adds no surface.)
+- `landlock` (Linux LSM sandboxing at ABI 6: FS allowlist +
+  TCP-connect/bind + abstract-UDS scope + `Scope::Signal`
+  (Linux 6.12+) denying cross-domain signal-sending. Applied in
+  `src/sandbox.rs` after the TCP listen socket + admin Unix
+  socket are bound and before the accept loops; gated by
+  `[security] sandbox` in `config.toml` with default
+  `best_effort`. Pure Rust + `libc` only; works on musl.
+  Intra-process signals (panic handlers, libc `abort()`,
+  thread-local plumbing) remain permitted — which is correct,
+  the threat surface worth blocking is *cross-process* signal
+  attacks from a compromised broker.)
+- `libc` (the `mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)`
+  call in `src/mlock.rs`. Transitively required by landlock
+  anyway, so the explicit dep adds no surface.)
 - `sd-notify` (pure-Rust `sd_notify(READY=1)` so `Type=notify`
   systemd units mark the service active when `src/ready.rs::notify`
   fires. No-op outside systemd. Daemon code never imports this —
   only `src/ready.rs` does, and `src/ready.rs` is called from
   `src/main.rs`.)
-- `seccompiler` (Firecracker's pure-Rust seccomp-BPF compiler. The
-  filter built in `src/sandbox.rs` denies the full signal-syscall
-  set — `kill` / `tkill` / `tgkill` / `rt_sigqueueinfo` /
-  `rt_tgsigqueueinfo` / `pidfd_send_signal`. Symbolon never
-  signals other processes; the prior stunnel-SIGHUP path was
-  deleted along with stunnel when Noise replaced it.)
 - `snow` with `default-features = false, features =
   ["default-resolver", "use-chacha20poly1305", "use-blake2",
   "use-curve25519", "use-getrandom", "std"]` (pure-Rust Noise
@@ -381,7 +375,7 @@ src/
   ready.rs             # sd_notify + pidfile (atomic) at startup
   loader.rs            # async config/clients.json file reads
   logging.rs           # tracing-subscriber JSON setup (stdout/stderr split)
-  sandbox.rs           # landlock + seccomp
+  sandbox.rs           # landlock (FS + TCP + UDS scope + signal scope)
   providers/
     mod.rs             # Provider abstraction (lightweight)
     github.rs          # GitHub: JWT, repo-ID singleflight cache, mint

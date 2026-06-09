@@ -14,12 +14,12 @@
 //!
 //! State writes are atomic per PROTOCOLS.md § "Atomic writes":
 //! tempfile → fsync → rename → fsync parent. `clients.json` lands
-//! with mode `0o640`, `symbolon.psk` with `0o600`. After every `symbolon.psk`
-//! write the daemon sends `SIGHUP` to stunnel via
-//! [`rustix::process::kill_process`].
+//! with mode `0o640`, the symbolon-owned `psks` file with `0o600`.
+//! The daemon owns the PSK store directly (no stunnel, no SIGHUP)
+//! — atomic write to disk and in-memory swap happen in the same
+//! enroll/revoke handler.
 
 use std::fmt::Write as _;
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -29,7 +29,7 @@ use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use compio::net::{UnixListener, UnixStream};
 use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::daemon::{ResolvedClient, SharedState};
 use crate::providers::github::GithubError;
@@ -56,7 +56,6 @@ pub(crate) enum Request {
     Enroll {
         provider: String,
         client: String,
-        ip: IpAddr,
         #[serde(default)]
         note: Option<String>,
     },
@@ -93,7 +92,6 @@ pub enum CliCommand {
     List,
     GithubEnroll {
         client: String,
-        ip: IpAddr,
         note: Option<String>,
     },
     GithubRevoke {
@@ -111,10 +109,9 @@ impl CliCommand {
         match self {
             CliCommand::Status => Request::Status,
             CliCommand::List => Request::List,
-            CliCommand::GithubEnroll { client, ip, note } => Request::Enroll {
+            CliCommand::GithubEnroll { client, note } => Request::Enroll {
                 provider: PROVIDER_GITHUB.to_string(),
                 client: client.clone(),
-                ip: *ip,
                 note: note.clone(),
             },
             CliCommand::GithubRevoke { client } => Request::Revoke {
@@ -245,9 +242,8 @@ async fn dispatch(
         Request::Enroll {
             provider,
             client,
-            ip,
             note,
-        } => handle_enroll(req_id, state, provider, client, *ip, note.clone()).await,
+        } => handle_enroll(req_id, state, provider, client, note.clone()).await,
         Request::Revoke { provider, client } => {
             handle_revoke(req_id, state, provider, client).await
         }
@@ -284,13 +280,12 @@ fn handle_list(state: &SharedState) -> serde_json::Value {
     let mut entries: Vec<serde_json::Value> = state
         .clients
         .borrow()
-        .iter()
-        .map(|(ip, c)| {
+        .values()
+        .map(|c| {
             let mut provs: Vec<&str> = c.providers.iter().map(String::as_str).collect();
             provs.sort();
             serde_json::json!({
                 "name": c.name,
-                "ip": ip.to_string(),
                 "providers": provs,
                 "enrolled_at": c.enrolled_at,
                 "note": c.note,
@@ -306,15 +301,9 @@ async fn handle_enroll(
     state: &SharedState,
     provider: &str,
     client: &str,
-    ip: IpAddr,
     note: Option<String>,
 ) -> Result<serde_json::Value, serde_json::Value> {
     let _ = req_id; // logged at handle_admin entry; not threaded further today
-    // Collapse IPv4-mapped IPv6 (::ffff:a.b.c.d) → IPv4 so an
-    // operator enrolling the dual-stack form for an IPv4 host hits
-    // the same bucket the daemon's accept-loop canonicalizes into.
-    // Mirrors daemon::canonicalize_ip on the accept path.
-    let ip = crate::daemon::canonicalize_ip(ip);
     if provider != PROVIDER_GITHUB {
         return Err(error_response(
             "unknown_provider",
@@ -339,25 +328,13 @@ async fn handle_enroll(
         ));
     }
 
-    // Snapshot existing entries for collision checks. Drop the borrow
-    // before any await/file I/O — we'll re-acquire borrow_mut at the
-    // commit step.
-    let existing: Vec<(IpAddr, String)> = state
-        .clients
-        .borrow()
-        .iter()
-        .map(|(ip, c)| (*ip, c.name.clone()))
-        .collect();
-    if existing.iter().any(|(_, n)| n == client) {
+    // Identity collision check: every enrolled client has a unique
+    // name. The PSK store and clients.json table are kept in lockstep,
+    // so checking just the clients table is sufficient.
+    if state.clients.borrow().contains_key(client) {
         return Err(error_response(
             "client_already_enrolled",
             &format!("client '{client}' already enrolled"),
-        ));
-    }
-    if existing.iter().any(|(existing_ip, _)| existing_ip == &ip) {
-        return Err(error_response(
-            "client_ip_collision",
-            &format!("ip {ip} already maps to another client"),
         ));
     }
 
@@ -366,41 +343,63 @@ async fn handle_enroll(
         .map_err(|e| error_response("internal", &format!("rng: {e}")))?;
     let psk_hex = hex_encode(&key_bytes);
 
-    // Update symbolon.psk: read existing, append new line, atomic write.
-    let mut psk_entries = read_psk_file(&state.psk_file_path)
-        .await
-        .map_err(|e| error_response("internal", &e))?;
-    psk_entries.push((client.to_string(), psk_hex.clone()));
-    let psk_content = render_psk_file(&psk_entries);
-    atomic_write(
+    // Update the in-memory PSK store, then write the new on-disk file
+    // (deterministic sorted render). Insert is idempotent — on a retry
+    // the prior partial write is replaced atomically.
+    state
+        .psks
+        .borrow_mut()
+        .insert(client.to_string(), key_bytes);
+    let psk_content = state.psks.borrow().render();
+    if let Err(e) = atomic_write(
         &state.psk_file_path,
         psk_content.into_bytes(),
         PSK_FILE_MODE,
     )
     .await
-    .map_err(|e| error_response("internal", &format!("write psk: {e}")))?;
+    {
+        // Roll back the in-memory insert so memory and disk stay
+        // coherent on a write failure.
+        state.psks.borrow_mut().remove(client);
+        return Err(error_response("internal", &format!("write psks: {e}")));
+    }
 
     // Update clients.json: read, append, atomic write.
     let enrolled_at = format_rfc3339_z(SystemTime::now());
-    let mut clients_doc = read_clients_doc(&state.clients_file_path)
-        .await
-        .map_err(|e| error_response("internal", &e))?;
+    let mut clients_doc = match read_clients_doc(&state.clients_file_path).await {
+        Ok(d) => d,
+        Err(e) => {
+            state.psks.borrow_mut().remove(client);
+            return Err(error_response("internal", &e));
+        }
+    };
     clients_doc.clients.push(crate::config::ClientEntry {
         name: client.to_string(),
-        ip,
         providers: vec![PROVIDER_GITHUB.to_string()],
         enrolled_at: enrolled_at.clone(),
         note: note.clone(),
     });
-    let clients_bytes = serde_json::to_vec_pretty(&clients_doc)
-        .map_err(|e| error_response("internal", &format!("encode clients.json: {e}")))?;
-    atomic_write(&state.clients_file_path, clients_bytes, CLIENTS_FILE_MODE)
-        .await
-        .map_err(|e| error_response("internal", &format!("write clients.json: {e}")))?;
+    let clients_bytes = match serde_json::to_vec_pretty(&clients_doc) {
+        Ok(b) => b,
+        Err(e) => {
+            state.psks.borrow_mut().remove(client);
+            return Err(error_response(
+                "internal",
+                &format!("encode clients.json: {e}"),
+            ));
+        }
+    };
+    if let Err(e) = atomic_write(&state.clients_file_path, clients_bytes, CLIENTS_FILE_MODE).await {
+        state.psks.borrow_mut().remove(client);
+        return Err(error_response(
+            "internal",
+            &format!("write clients.json: {e}"),
+        ));
+    }
 
-    // Commit to in-memory state.
+    // Commit to in-memory clients table (keyed on identity now).
     state.clients.borrow_mut().insert(
-        ip,
+        client.to_string(),
         ResolvedClient {
             name: client.to_string(),
             providers: vec![PROVIDER_GITHUB.to_string()],
@@ -409,13 +408,7 @@ async fn handle_enroll(
         },
     );
 
-    // SIGHUP stunnel. A failure here is logged but does NOT undo the
-    // enroll — operator notices via `symbolon status` or stunnel logs.
-    if let Err(e) = state.stunnel.sighup().await {
-        warn!(evt = "stunnel_sighup_failed", error = %e);
-    }
-
-    info!(evt = "enroll", provider = provider, client = client, ip = %ip);
+    info!(evt = "enroll", provider = provider, client = client);
     Ok(serde_json::json!({
         "ok": true,
         "identity": client,
@@ -438,20 +431,15 @@ async fn handle_revoke(
         ));
     }
 
-    // Find the client's IP for in-memory removal.
-    let client_ip = {
-        let borrow = state.clients.borrow();
-        borrow
-            .iter()
-            .find(|(_, c)| c.name == client)
-            .map(|(ip, _)| *ip)
-    };
-    let Some(client_ip) = client_ip else {
+    // Identity must be enrolled. Both the in-memory PSK store and the
+    // clients table are kept in lockstep by `enroll`, so checking one
+    // is sufficient.
+    if !state.clients.borrow().contains_key(client) {
         return Err(error_response(
             "unknown_client",
             &format!("no enrolled client named '{client}'"),
         ));
-    };
+    }
 
     // Rewrite clients.json without the entry. (The single-provider
     // build always removes the whole entry; multi-provider revoke is
@@ -466,25 +454,18 @@ async fn handle_revoke(
         .await
         .map_err(|e| error_response("internal", &format!("write clients.json: {e}")))?;
 
-    // Rewrite symbolon.psk without the matching identity.
-    let mut psk_entries = read_psk_file(&state.psk_file_path)
-        .await
-        .map_err(|e| error_response("internal", &e))?;
-    psk_entries.retain(|(ident, _)| ident != client);
-    let psk_content = render_psk_file(&psk_entries);
+    // Remove from the PSK store and rewrite the on-disk file.
+    state.psks.borrow_mut().remove(client);
+    let psk_content = state.psks.borrow().render();
     atomic_write(
         &state.psk_file_path,
         psk_content.into_bytes(),
         PSK_FILE_MODE,
     )
     .await
-    .map_err(|e| error_response("internal", &format!("write psk: {e}")))?;
+    .map_err(|e| error_response("internal", &format!("write psks: {e}")))?;
 
-    state.clients.borrow_mut().remove(&client_ip);
-
-    if let Err(e) = state.stunnel.sighup().await {
-        warn!(evt = "stunnel_sighup_failed", error = %e);
-    }
+    state.clients.borrow_mut().remove(client);
 
     info!(evt = "revoke", provider = provider, client = client);
     Ok(serde_json::json!({ "ok": true }))
@@ -654,7 +635,6 @@ fn print_success(command: &CliCommand, response: &serde_json::Value) {
             }
             for c in entries {
                 let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                let ip = c.get("ip").and_then(|v| v.as_str()).unwrap_or("?");
                 let provs = c
                     .get("providers")
                     .and_then(|v| v.as_array())
@@ -666,28 +646,30 @@ fn print_success(command: &CliCommand, response: &serde_json::Value) {
                     })
                     .unwrap_or_default();
                 let enrolled = c.get("enrolled_at").and_then(|v| v.as_str()).unwrap_or("?");
-                println!("{name}\t{ip}\t{provs}\t{enrolled}");
+                println!("{name}\t{provs}\t{enrolled}");
             }
         }
-        CliCommand::GithubEnroll { client, ip, .. } => {
+        CliCommand::GithubEnroll { client, .. } => {
             let psk_hex = response
                 .get("psk_hex")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            println!("Enrolled '{client}' for github.com at {ip}.");
+            println!("Enrolled '{client}' for github.com.");
             println!();
-            println!("# Paste-ready snippet for the client VM:");
-            println!("#");
-            println!("# /etc/stunnel/symbolon-client.conf");
-            println!("[symbolon]");
-            println!("client = yes");
-            println!("accept = 127.0.0.1:9418");
-            println!("connect = <broker-host>:9418");
-            println!("PSKsecrets = /etc/stunnel/symbolon-client.psk");
-            println!("ciphers = PSK");
+            println!("# On the client VM, install the helper binary alongside git:");
+            println!("#   /usr/local/bin/git-credential-symbolon");
             println!();
-            println!("# /etc/stunnel/symbolon-client.psk (mode 0600)");
-            println!("{client}:{psk_hex}");
+            println!("# Write the PSK to /etc/symbolon/psk (mode 0600):");
+            println!("{psk_hex}");
+            println!();
+            println!("# Configure git to use the helper for github.com:");
+            println!("git config --global credential.https://github.com.helper \\");
+            println!(
+                "  \"/usr/local/bin/git-credential-symbolon \\
+   --endpoint <broker-host>:9418 \\
+   --identity {client} \\
+   --psk-file /etc/symbolon/psk\""
+            );
         }
         CliCommand::GithubRevoke { client } => {
             println!("Revoked '{client}' from github.com.");
@@ -816,45 +798,13 @@ pub(crate) async fn atomic_write(path: &Path, content: Vec<u8>, mode: u32) -> st
     Ok(())
 }
 
-async fn read_psk_file(path: &Path) -> Result<Vec<(String, String)>, String> {
-    match compio::fs::read(path).await {
-        Ok(bytes) => {
-            let s = std::str::from_utf8(&bytes)
-                .map_err(|e| format!("psk file {} not utf-8: {e}", path.display()))?;
-            let mut out = Vec::new();
-            for line in s.lines() {
-                if line.is_empty() {
-                    continue;
-                }
-                if let Some((ident, key)) = line.split_once(':') {
-                    out.push((ident.to_string(), key.to_string()));
-                }
-            }
-            Ok(out)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(format!("read {}: {e}", path.display())),
-    }
-}
-
-fn render_psk_file(entries: &[(String, String)]) -> String {
-    let mut s = String::new();
-    for (ident, key) in entries {
-        s.push_str(ident);
-        s.push(':');
-        s.push_str(key);
-        s.push('\n');
-    }
-    s
-}
-
 async fn read_clients_doc(path: &Path) -> Result<crate::config::ClientsFile, String> {
     match compio::fs::read(path).await {
         Ok(bytes) => {
             serde_json::from_slice(&bytes).map_err(|e| format!("parse {}: {e}", path.display()))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(crate::config::ClientsFile {
-            version: 1,
+            version: 2,
             clients: Vec::new(),
         }),
         Err(e) => Err(format!("read {}: {e}", path.display())),
@@ -971,7 +921,6 @@ mod tests {
         let r = Request::Enroll {
             provider: "github".to_string(),
             client: "vm-1".to_string(),
-            ip: "192.168.122.10".parse().unwrap(),
             note: None,
         };
         let s = serde_json::to_string(&r).unwrap();
@@ -1028,31 +977,6 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"world\n");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[compio::test]
-    async fn render_and_read_psk_round_trip() {
-        let entries = vec![
-            ("vm-1".to_string(), "a1b2".to_string()),
-            ("vm-2".to_string(), "ccdd".to_string()),
-        ];
-        let rendered = render_psk_file(&entries);
-        assert_eq!(rendered, "vm-1:a1b2\nvm-2:ccdd\n");
-        let dir = std::env::temp_dir().join(format!("symbolon-psk-{}", ulid::Ulid::new()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("symbolon.psk");
-        atomic_write(&path, rendered.into_bytes(), 0o600)
-            .await
-            .unwrap();
-        let parsed = read_psk_file(&path).await.unwrap();
-        assert_eq!(parsed, entries);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[compio::test]
-    async fn read_psk_file_missing_returns_empty() {
-        let path = std::env::temp_dir().join(format!("symbolon-nope-{}", ulid::Ulid::new()));
-        assert!(read_psk_file(&path).await.unwrap().is_empty());
     }
 
     #[test]

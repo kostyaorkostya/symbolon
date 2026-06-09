@@ -9,7 +9,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{
     CLIENT_ID, OWNER, REPO, TOKEN, admin_request, mount_mint_ok, mount_repo_ok, spawn_daemon,
-    unique_paths_full, write_clients_json,
+    unique_paths_full, write_clients_json, write_psks_file,
 };
 
 #[compio::test]
@@ -52,27 +52,27 @@ async fn admin_enroll_persists_to_clients_json_and_psk_file() {
             "op": "enroll",
             "provider": "github",
             "client": "vm-1",
-            "ip": "192.168.122.10",
             "note": null,
         }),
     )
     .await;
-    assert_eq!(resp["ok"], serde_json::json!(true));
+    assert_eq!(resp["ok"], serde_json::json!(true), "got: {resp:?}");
     let psk_hex = resp["psk_hex"].as_str().unwrap();
     assert_eq!(psk_hex.len(), 64);
     assert!(psk_hex.chars().all(|c| c.is_ascii_hexdigit()));
 
-    let psk_text = std::fs::read_to_string(&paths.psk).unwrap();
+    let psk_text = std::fs::read_to_string(&paths.psks).unwrap();
     assert!(
-        psk_text.starts_with(&format!("vm-1:{psk_hex}")),
-        "got: {psk_text:?}"
+        psk_text.contains(&format!("vm-1:{psk_hex}")),
+        "psk file missing entry: {psk_text:?}"
     );
-    let psk_mode = std::fs::metadata(&paths.psk).unwrap().permissions().mode() & 0o777;
+    let psk_mode = std::fs::metadata(&paths.psks).unwrap().permissions().mode() & 0o777;
     assert_eq!(psk_mode, 0o600);
 
     let clients_text = std::fs::read_to_string(&paths.clients).unwrap();
     assert!(clients_text.contains("\"name\": \"vm-1\""));
-    assert!(clients_text.contains("\"192.168.122.10\""));
+    // v2 clients.json carries no `ip` field.
+    assert!(!clients_text.contains("\"ip\""));
     let cl_mode = std::fs::metadata(&paths.clients)
         .unwrap()
         .permissions()
@@ -89,8 +89,8 @@ async fn admin_enroll_persists_to_clients_json_and_psk_file() {
 #[compio::test]
 async fn admin_enroll_appends_without_clobbering_existing() {
     let paths = unique_paths_full();
-    write_clients_json(&paths.clients, &[("vm-0", "192.168.122.9")]);
-    std::fs::write(&paths.psk, "vm-0:0123abcd\n").unwrap();
+    write_clients_json(&paths.clients, &["vm-0"]);
+    write_psks_file(&paths.psks, &[("vm-0", [0x01; 32])]);
     let server = MockServer::start().await;
     spawn_daemon(&paths, server.uri()).await;
 
@@ -100,16 +100,15 @@ async fn admin_enroll_appends_without_clobbering_existing() {
             "op": "enroll",
             "provider": "github",
             "client": "vm-1",
-            "ip": "192.168.122.10",
             "note": null,
         }),
     )
     .await;
     assert_eq!(resp["ok"], serde_json::json!(true));
 
-    let psk_text = std::fs::read_to_string(&paths.psk).unwrap();
+    let psk_text = std::fs::read_to_string(&paths.psks).unwrap();
     assert!(
-        psk_text.contains("vm-0:0123abcd"),
+        psk_text.contains("vm-0:0101"),
         "lost pre-existing entry: {psk_text}"
     );
     assert!(psk_text.contains("vm-1:"), "missing new entry: {psk_text}");
@@ -120,7 +119,8 @@ async fn admin_enroll_appends_without_clobbering_existing() {
 #[compio::test]
 async fn admin_enroll_rejects_duplicate_client_name() {
     let paths = unique_paths_full();
-    write_clients_json(&paths.clients, &[("vm-1", "192.168.122.10")]);
+    write_clients_json(&paths.clients, &["vm-1"]);
+    write_psks_file(&paths.psks, &[("vm-1", [0x02; 32])]);
     let server = MockServer::start().await;
     spawn_daemon(&paths, server.uri()).await;
 
@@ -130,7 +130,6 @@ async fn admin_enroll_rejects_duplicate_client_name() {
             "op": "enroll",
             "provider": "github",
             "client": "vm-1",
-            "ip": "192.168.122.20",
             "note": null,
         }),
     )
@@ -141,9 +140,9 @@ async fn admin_enroll_rejects_duplicate_client_name() {
 }
 
 #[compio::test]
-async fn admin_enroll_rejects_duplicate_ip() {
+async fn admin_enroll_rejects_bad_charset() {
     let paths = unique_paths_full();
-    write_clients_json(&paths.clients, &[("vm-1", "192.168.122.10")]);
+    write_clients_json(&paths.clients, &[]);
     let server = MockServer::start().await;
     spawn_daemon(&paths, server.uri()).await;
 
@@ -152,41 +151,13 @@ async fn admin_enroll_rejects_duplicate_ip() {
         serde_json::json!({
             "op": "enroll",
             "provider": "github",
-            "client": "vm-2",
-            "ip": "192.168.122.10",
+            "client": "name with space",
             "note": null,
         }),
     )
     .await;
     assert_eq!(resp["ok"], serde_json::json!(false));
-    assert_eq!(resp["code"], "client_ip_collision");
-    paths.cleanup();
-}
-
-#[compio::test]
-async fn admin_enroll_canonicalizes_v4_mapped_v6() {
-    // An operator enrolling ::ffff:192.168.122.10 must collide with
-    // an existing IPv4 entry for 192.168.122.10. Without
-    // canonicalization, the two would coexist and the accept-loop's
-    // own canonicalize would route to the wrong (or no) entry.
-    let paths = unique_paths_full();
-    write_clients_json(&paths.clients, &[("vm-1", "192.168.122.10")]);
-    let server = MockServer::start().await;
-    spawn_daemon(&paths, server.uri()).await;
-
-    let resp = admin_request(
-        &paths.admin,
-        serde_json::json!({
-            "op": "enroll",
-            "provider": "github",
-            "client": "vm-2",
-            "ip": "::ffff:192.168.122.10",
-            "note": null,
-        }),
-    )
-    .await;
-    assert_eq!(resp["ok"], serde_json::json!(false));
-    assert_eq!(resp["code"], "client_ip_collision");
+    assert_eq!(resp["code"], "bad_request");
     paths.cleanup();
 }
 
@@ -203,7 +174,6 @@ async fn admin_revoke_removes_psk_entry_and_updates_clients() {
             "op": "enroll",
             "provider": "github",
             "client": "vm-1",
-            "ip": "192.168.122.10",
             "note": null,
         }),
     )
@@ -221,10 +191,10 @@ async fn admin_revoke_removes_psk_entry_and_updates_clients() {
     .await;
     assert_eq!(revoke["ok"], serde_json::json!(true));
 
-    let psk_text = std::fs::read_to_string(&paths.psk).unwrap();
+    let psk_text = std::fs::read_to_string(&paths.psks).unwrap();
     assert!(
         !psk_text.contains("vm-1:"),
-        "psk still has vm-1: {psk_text}"
+        "psks file still has vm-1: {psk_text}"
     );
 
     let listed = admin_request(&paths.admin, serde_json::json!({"op": "list"})).await;
@@ -253,7 +223,8 @@ async fn admin_revoke_unknown_client_returns_error() {
 #[compio::test]
 async fn admin_mint_calls_provider_via_wiremock() {
     let paths = unique_paths_full();
-    write_clients_json(&paths.clients, &[("vm-1", "192.168.122.10")]);
+    write_clients_json(&paths.clients, &["vm-1"]);
+    write_psks_file(&paths.psks, &[("vm-1", [0x03; 32])]);
     let server = MockServer::start().await;
     mount_repo_ok(&server).await;
     mount_mint_ok(&server).await;

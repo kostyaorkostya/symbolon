@@ -1,17 +1,18 @@
-//! Daemon: bind the Unix-domain listen socket that stunnel forwards
-//! into, accept connections, and run the per-connection state machine
-//! defined in `docs/PROTOCOLS.md`:
+//! Daemon: bind the TCP listen socket the client connects to, accept
+//! connections, and run the per-connection state machine defined in
+//! `docs/PROTOCOLS.md`:
 //!
-//! PROXY v2 parse → IP→client lookup → git-credential parse →
-//! byte-exact host dispatch → provider mint → write response.
+//! Identity prelude → PSK lookup → Noise NNpsk0 handshake →
+//! git-credential parse → byte-exact host dispatch → provider mint →
+//! write response (encrypted via the Noise transport).
 //!
 //! Per-connection errors do not propagate to the caller: each branch
 //! of the state machine emits the corresponding structured JSON log
-//! event (`evt=proxy_header_invalid`, `evt=mint_denied`,
-//! `evt=provider_error`, `evt=mint`) and closes the connection
-//! without writing a response. Per AGENTS.md invariant #7 the source
-//! IP from the PROXY v2 header is the daemon's only source of client
-//! identity.
+//! event (`evt=prelude_invalid`, `evt=handshake_failed`,
+//! `evt=mint_denied`, `evt=provider_error`, `evt=mint`) and closes
+//! the connection without writing a response. Per AGENTS.md invariant
+//! #7 the PSK identity from the Noise handshake is the daemon's sole
+//! source of client identity.
 //!
 //! Lifecycle: three long-lived tasks are spawned by `run`:
 //! the admin loop, the SIGHUP handler, and a SIGTERM/SIGINT watcher.
@@ -30,7 +31,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -39,18 +40,19 @@ use futures_util::FutureExt;
 
 use compio::BufResult;
 use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use compio::net::{UnixListener, UnixStream};
+use compio::net::{TcpListener, TcpStream, UnixListener};
 use compio::runtime::CancelToken;
+use snow::{HandshakeState, TransportState};
 use tracing::{info, warn};
 
 use crate::config::{ClientsFile, Config};
 use crate::connection_tracker::ConnectionTracker;
 use crate::cpu_worker::CpuWorker;
-use crate::git_credential::{self, GitCredentialError};
+use crate::git_credential;
 use crate::providers::github::{GitHubProvider, GithubError};
-use crate::proxy_protocol::{self, ProxyProtocolError};
+use crate::psk_store::{PskStore, PskStoreError};
 use crate::sandbox::{self, SandboxError, SandboxPaths};
-use crate::stunnel::StunnelController;
+use crate::transport::{self, PreludeError, TransportError};
 
 /// Per-connection read budget enforced at the daemon's read loop.
 /// Tighter than `git_credential::PARSER_HARD_MAX` (which is the
@@ -60,15 +62,22 @@ const WIRE_READ_BUDGET: usize = 8 * 1024;
 
 const _WIRE_BUDGET_FITS_PARSER: () = assert!(WIRE_READ_BUDGET <= git_credential::PARSER_HARD_MAX);
 const PER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
-const READ_CHUNK_BYTES: usize = 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
     #[error("failed to load clients.json")]
     LoadClients(#[from] crate::config::ConfigError),
+    #[error("failed to load PSK file")]
+    LoadPsks(#[from] PskStoreError),
     #[error("failed to construct GitHub provider")]
     Github(#[from] GithubError),
-    #[error("failed to bind listen socket at {}", path.display())]
+    #[error("failed to read PSK file at {}", path.display())]
+    PskRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to bind listen socket")]
     Bind {
         path: PathBuf,
         #[source]
@@ -82,8 +91,8 @@ pub enum DaemonError {
     },
     #[error("I/O error during accept")]
     Accept(#[source] std::io::Error),
-    #[error("clients.json contains duplicate IP address {0}")]
-    DuplicateClientIp(IpAddr),
+    #[error("clients.json contains duplicate identity {0:?}")]
+    DuplicateClientName(String),
     #[error("config path {0} has no parent directory; sandbox cannot grant write access")]
     NoParentDir(&'static str),
     #[error("failed to apply sandbox")]
@@ -109,12 +118,17 @@ pub(crate) struct ResolvedClient {
 /// opaque `Rc<SharedState>` — they can hold and pass it around but
 /// not peek at internals.
 pub struct SharedState {
-    pub(crate) clients: RefCell<HashMap<IpAddr, ResolvedClient>>,
+    /// Identity → metadata. Mutated by admin enroll/revoke. Lookup keyed
+    /// on the PSK identity surfaced by the Noise prelude.
+    pub(crate) clients: RefCell<HashMap<String, ResolvedClient>>,
+    /// Identity → 32-byte PSK. Same identities as `clients` (the
+    /// `enroll`/`revoke` admin paths keep them in lock-step). Daemon
+    /// reads this on every accepted connection to seed the Noise
+    /// responder.
+    pub(crate) psks: RefCell<PskStore>,
     pub(crate) providers: HashMap<String, GitHubProvider>,
     pub(crate) psk_file_path: PathBuf,
     pub(crate) clients_file_path: PathBuf,
-    pub(crate) stunnel: Rc<StunnelController>,
-    pub(crate) listen_socket_path: PathBuf,
     pub(crate) admin_socket_path: PathBuf,
     pub(crate) start_time: SystemTime,
     /// Cancelled by `crate::signals` watchers on SIGTERM/SIGINT. The
@@ -139,7 +153,8 @@ pub struct RunStats {
 /// signals, sd_notify, or pidfiles — main wires those.
 pub struct Service {
     state: Rc<SharedState>,
-    listener: UnixListener,
+    listener: TcpListener,
+    listen_addr: SocketAddr,
     admin_listener: UnixListener,
 }
 
@@ -165,12 +180,13 @@ impl ServiceHandle {
 }
 
 impl Service {
-    /// Sequencing matters here: PEM bytes and Unix-socket binds need
-    /// filesystem access that the sandbox will deny, so they happen
-    /// first. `apply_sandbox` then closes the gate. The shared
-    /// `CpuWorker` is spawned AFTER the sandbox so its thread
-    /// inherits the landlock ruleset and seccomp filter — spawning
-    /// it before would leak an unsandboxed thread into the process.
+    /// Sequencing matters here: PEM bytes, the TCP listen bind, the
+    /// admin Unix-socket bind, and the initial PSK file read all need
+    /// access the sandbox would deny, so they happen first.
+    /// `apply_sandbox` then closes the gate. The shared `CpuWorker`
+    /// is spawned AFTER the sandbox so its thread inherits the
+    /// landlock ruleset and seccomp filter — spawning it before
+    /// would leak an unsandboxed thread into the process.
     pub async fn prepare(
         cfg: &Config,
         config_path: &Path,
@@ -194,6 +210,10 @@ impl Service {
         let clients_file = crate::loader::load_clients_file(&cfg.clients.file).await?;
         let clients_table = build_clients_table(clients_file)?;
 
+        // Pre-sandbox: load the PSK store. Tolerate ENOENT — a fresh
+        // deployment starts with an empty roster and grows via `enroll`.
+        let psk_store = load_psk_store(&cfg.listen.psk_file).await?;
+
         // Pre-sandbox: read provider PEMs into memory.
         let github_key = if let Some(gh) = &cfg.provider.github {
             Some(GitHubProvider::load_key(gh).await?)
@@ -201,32 +221,22 @@ impl Service {
             None
         };
 
-        // Pre-sandbox: bind both UDS.
-        //
-        // There is a microsecond-scale race between bind(2) and
-        // chmod() where the socket inode briefly carries umask-
-        // default perms. Per INSTALL.md the parent directories
-        // (/run/symbolon, /etc/symbolon) are 0o750 owned by group `symbolon`, so a
-        // world-mode socket inside them is still unreachable from
-        // outside that group — the race has no observer in our
-        // deployment. A process-wide umask(0o077) would close even
-        // the theoretical window but contaminates atomic_write
-        // throughout the process; see commit log for the trial and
-        // rationale.
-        let listen_path = &cfg.listen.socket;
-        unlink_stale(listen_path).await?;
+        // Pre-sandbox: bind the inbound TCP listener directly. The
+        // daemon terminates Noise NNpsk0 in-process; no stunnel layer.
+        let listen_addr = cfg.listen.bind;
         let listener =
-            UnixListener::bind(listen_path)
+            TcpListener::bind(&listen_addr)
                 .await
                 .map_err(|source| DaemonError::Bind {
-                    path: listen_path.clone(),
+                    path: PathBuf::from(listen_addr.to_string()),
                     source,
                 })?;
-        // 0660: stunnel (running as group `symbolon` per INSTALL.md) needs
-        // write access to forward into us. World access is removed so
-        // a loose parent-dir ACL alone cannot expose the listen socket.
-        chmod_socket(listen_path, 0o660)?;
 
+        // Admin UDS bind. There is a microsecond-scale race between
+        // bind(2) and chmod() where the inode briefly carries umask-
+        // default perms; INSTALL.md pins the parent dir (`/run/symbolon`)
+        // 0o750 owned by group `symbolon`, so a world-mode socket inside
+        // is still unreachable from outside that group.
         let admin_path = &cfg.admin.socket_path;
         unlink_stale(admin_path).await?;
         let admin_listener =
@@ -257,14 +267,12 @@ impl Service {
             providers.insert(gh.host.clone(), provider);
         }
 
-        let stunnel = Rc::new(StunnelController::new(cfg.stunnel.pidfile.clone()));
         let state = Rc::new(SharedState {
             clients: RefCell::new(clients_table),
+            psks: RefCell::new(psk_store),
             providers,
-            psk_file_path: cfg.stunnel.psk_file.clone(),
+            psk_file_path: cfg.listen.psk_file.clone(),
             clients_file_path: cfg.clients.file.clone(),
-            stunnel,
-            listen_socket_path: cfg.listen.socket.clone(),
             admin_socket_path: cfg.admin.socket_path.clone(),
             start_time: SystemTime::now(),
             shutdown,
@@ -274,13 +282,14 @@ impl Service {
             evt = "prepare",
             version = env!("CARGO_PKG_VERSION"),
             config_path = %config_path.display(),
-            listen_socket = %listen_path.display(),
+            listen_addr = %listen_addr,
             admin_socket = %admin_path.display(),
         );
 
         Ok(Self {
             state,
             listener,
+            listen_addr,
             admin_listener,
         })
     }
@@ -331,10 +340,11 @@ impl Service {
     }
 
     /// Run the accept loops until `shutdown` is cancelled, drain
-    /// per-connection handlers, unlink sockets. Returns RunStats.
+    /// per-connection handlers, unlink the admin socket. Returns RunStats.
     pub async fn run(self) -> Result<RunStats, DaemonError> {
         let state = self.state;
         let listener = self.listener;
+        let _listen_addr = self.listen_addr;
         let admin_listener = self.admin_listener;
         let provider_names: Vec<&str> = state.providers.keys().map(String::as_str).collect();
         info!(evt = "startup", providers = ?provider_names, "daemon started");
@@ -404,10 +414,11 @@ impl Service {
             );
         }
 
-        // PROTOCOLS.md step 3: "Close the admin socket and the listen
-        // socket (unlinking them)." — admin first, then listen.
+        // PROTOCOLS.md shutdown step: unlink the admin Unix socket.
+        // The listen socket is a TCP listener — closing the file
+        // descriptor (when `listener` drops below) is sufficient.
         let _ = compio::fs::remove_file(&state.admin_socket_path).await;
-        let _ = compio::fs::remove_file(&state.listen_socket_path).await;
+        drop(listener);
 
         Ok(RunStats {
             drain_ms,
@@ -454,23 +465,48 @@ async fn reload_clients_inner(state: &SharedState, path: &Path) {
             return;
         }
     };
-    let count = new_table.len();
+    // Reload the PSK store alongside clients.json so hand-edits to
+    // the on-disk roster (rare; admin enroll/revoke is the normal
+    // path) are picked up coherently.
+    let new_psks = match load_psk_store(&state.psk_file_path).await {
+        Ok(store) => store,
+        Err(e) => {
+            warn!(evt = "config_reload", triggered_by = "sighup", ok = false, error = %e);
+            return;
+        }
+    };
+    let client_count = new_table.len();
+    let psk_count = new_psks.len();
     *state.clients.borrow_mut() = new_table;
+    *state.psks.borrow_mut() = new_psks;
     info!(
         evt = "config_reload",
         triggered_by = "sighup",
-        client_count = count
+        client_count = client_count,
+        psk_count = psk_count,
     );
 }
 
-pub(crate) fn canonicalize_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => IpAddr::V4(v4),
-            None => IpAddr::V6(v6),
-        },
-        v4 => v4,
-    }
+/// Read the on-disk PSK file and parse it into a `PskStore`. Treats
+/// `ENOENT` as "fresh deployment" → empty store.
+async fn load_psk_store(path: &Path) -> Result<PskStore, DaemonError> {
+    let bytes = match compio::fs::read(path).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(PskStore::empty()),
+        Err(source) => {
+            return Err(DaemonError::PskRead {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let text = std::str::from_utf8(&bytes).map_err(|source| {
+        DaemonError::LoadPsks(PskStoreError::Utf8 {
+            path: path.to_path_buf(),
+            source,
+        })
+    })?;
+    PskStore::parse(text, path).map_err(DaemonError::LoadPsks)
 }
 
 fn chmod_socket(path: &Path, mode: u32) -> Result<(), DaemonError> {
@@ -504,7 +540,7 @@ fn apply_sandbox(cfg: &Config) -> Result<(), DaemonError> {
     let paths = SandboxPaths {
         read_files: vec![
             cfg.clients.file.clone(),
-            cfg.stunnel.pidfile.clone(),
+            cfg.listen.psk_file.clone(),
             PathBuf::from("/dev/urandom"),
         ],
         read_dirs,
@@ -524,10 +560,10 @@ fn apply_sandbox(cfg: &Config) -> Result<(), DaemonError> {
                     .parent()
                     .ok_or(DaemonError::NoParentDir("clients.file"))?
                     .to_path_buf(),
-                cfg.stunnel
+                cfg.listen
                     .psk_file
                     .parent()
-                    .ok_or(DaemonError::NoParentDir("stunnel.psk_file"))?
+                    .ok_or(DaemonError::NoParentDir("listen.psk_file"))?
                     .to_path_buf(),
             ];
             // ready::notify writes the pidfile post-sandbox; its
@@ -542,6 +578,11 @@ fn apply_sandbox(cfg: &Config) -> Result<(), DaemonError> {
             }
             v
         },
+        // TCP listen socket is bound BEFORE the sandbox closes, so
+        // post-sandbox `bind` is not required. Outbound connect to
+        // port 443 is permitted by the unconditional `ConnectTcp`
+        // rule inside `sandbox::apply`.
+        bind_tcp_ports: vec![],
     };
     let outcome = sandbox::apply(level, &paths)?;
     let degraded = !matches!(outcome.status, "fully_enforced" | "off");
@@ -584,122 +625,123 @@ async fn unlink_stale(path: &Path) -> Result<(), DaemonError> {
     }
 }
 
-fn build_clients_table(file: ClientsFile) -> Result<HashMap<IpAddr, ResolvedClient>, DaemonError> {
+fn build_clients_table(file: ClientsFile) -> Result<HashMap<String, ResolvedClient>, DaemonError> {
     let mut table = HashMap::new();
     for entry in file.clients {
-        // canonicalize so an IPv4-mapped IPv6 entry in clients.json
-        // collides with its IPv4 form (a likely operator mistake).
-        let key = canonicalize_ip(entry.ip);
+        let key = entry.name.clone();
         let value = ResolvedClient {
             name: entry.name,
             providers: entry.providers.into_iter().collect(),
             enrolled_at: entry.enrolled_at,
             note: entry.note,
         };
-        if table.insert(key, value).is_some() {
-            return Err(DaemonError::DuplicateClientIp(key));
+        if table.insert(key.clone(), value).is_some() {
+            return Err(DaemonError::DuplicateClientName(key));
         }
     }
     Ok(table)
 }
 
-async fn handle_connection(mut stream: UnixStream, req_id: String, state: Rc<SharedState>) {
-    let mut chunk: Vec<u8> = Vec::with_capacity(READ_CHUNK_BYTES);
-    // ------ Phase 1: PROXY v2 header ------
-    let mut buf: Vec<u8> = Vec::with_capacity(WIRE_READ_BUDGET);
-    let parsed = loop {
-        match proxy_protocol::parse(&buf) {
-            Ok(p) => break p,
-            Err(ProxyProtocolError::Incomplete { need_total, .. }) => {
-                if need_total > WIRE_READ_BUDGET {
-                    warn!(
-                        req_id = %req_id,
-                        evt = "proxy_header_invalid",
-                        bytes_read = buf.len(),
-                        reason = "header_exceeds_cap",
-                    );
-                    return;
-                }
-                if !read_more(&mut stream, &mut buf, &mut chunk).await {
-                    warn!(
-                        req_id = %req_id,
-                        evt = "proxy_header_invalid",
-                        bytes_read = buf.len(),
-                        reason = "eof_before_header",
-                    );
-                    return;
-                }
-            }
-            Err(e) => {
-                warn!(
-                    req_id = %req_id,
-                    evt = "proxy_header_invalid",
-                    bytes_read = buf.len(),
-                    error = %e,
-                );
-                return;
-            }
+async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<SharedState>) {
+    let peer = stream.peer_addr().ok();
+    // ------ Phase 1: identity prelude ------
+    let identity_owned = match read_prelude(&mut stream).await {
+        Ok(s) => s,
+        Err(reason) => {
+            warn!(
+                req_id = %req_id,
+                evt = "prelude_invalid",
+                peer = ?peer,
+                reason = reason,
+            );
+            return;
         }
     };
 
-    // ------ Phase 2: IP → client lookup ------
-    // Normalise IPv4-mapped IPv6 (::ffff:a.b.c.d) → IPv4 so a
-    // dual-stack stunnel that reports the same operator-enrolled host
-    // either way still hits one entry. clients.json typically lists
-    // IPs by family (V4 or V6); without this normalisation, an
-    // upstream stack flip would silently break attribution.
-    let lookup_ip = canonicalize_ip(parsed.source_ip);
-    let Some(client) = state.clients.borrow().get(&lookup_ip).cloned() else {
+    // ------ Phase 2: PSK lookup + client metadata lookup ------
+    let psk = match state.psks.borrow().lookup(&identity_owned) {
+        Some(p) => *p,
+        None => {
+            warn!(
+                req_id = %req_id,
+                evt = "mint_denied",
+                reason = "client_unknown",
+                psk_identity = %identity_owned,
+                peer = ?peer,
+            );
+            return;
+        }
+    };
+    let Some(client) = state.clients.borrow().get(&identity_owned).cloned() else {
+        // PSK exists but no clients.json entry — operator desynced the
+        // two files; refuse to mint rather than guess metadata.
         warn!(
             req_id = %req_id,
             evt = "mint_denied",
-            reason = "client_unknown",
-            src_ip = %parsed.source_ip,
+            reason = "client_metadata_missing",
+            psk_identity = %identity_owned,
         );
         return;
     };
-    info!(req_id = %req_id, evt = "accept", src_ip = %parsed.source_ip, client = %client.name);
+    info!(
+        req_id = %req_id,
+        evt = "accept",
+        psk_identity = %client.name,
+        peer = ?peer,
+    );
 
-    // ------ Phase 3: git-credential block ------
-    let mut block: Vec<u8> = Vec::with_capacity(WIRE_READ_BUDGET - parsed.header_len);
-    block.extend_from_slice(&buf[parsed.header_len..]);
-    let request = loop {
-        match git_credential::parse(&block) {
-            Ok(r) => break r,
-            Err(GitCredentialError::UnterminatedBlock) => {
-                if block.len() >= WIRE_READ_BUDGET - parsed.header_len {
-                    warn!(
-                        req_id = %req_id,
-                        evt = "mint_denied",
-                        reason = "malformed_request",
-                        client = %client.name,
-                        detail = "request_exceeds_cap",
-                    );
-                    return;
-                }
-                if !read_more(&mut stream, &mut block, &mut chunk).await {
-                    warn!(
-                        req_id = %req_id,
-                        evt = "mint_denied",
-                        reason = "malformed_request",
-                        client = %client.name,
-                        detail = "eof_before_terminator",
-                    );
-                    return;
-                }
-            }
-            Err(e) => {
-                warn!(
-                    req_id = %req_id,
-                    evt = "mint_denied",
-                    reason = "malformed_request",
-                    client = %client.name,
-                    error = %e,
-                );
-                return;
-            }
+    // ------ Phase 2b: Noise NNpsk0 responder handshake ------
+    let mut transport_state = match run_responder_handshake(&mut stream, &psk).await {
+        Ok(ts) => ts,
+        Err(reason) => {
+            warn!(
+                req_id = %req_id,
+                evt = "handshake_failed",
+                client = %client.name,
+                reason = reason,
+            );
+            return;
         }
     };
+
+    // ------ Phase 3: encrypted git-credential request ------
+    let request_bytes = match read_framed_decrypt(&mut stream, &mut transport_state).await {
+        Ok(b) => b,
+        Err(reason) => {
+            warn!(
+                req_id = %req_id,
+                evt = "mint_denied",
+                reason = "transport_read",
+                client = %client.name,
+                detail = reason,
+            );
+            return;
+        }
+    };
+    if request_bytes.len() > WIRE_READ_BUDGET {
+        warn!(
+            req_id = %req_id,
+            evt = "mint_denied",
+            reason = "malformed_request",
+            client = %client.name,
+            detail = "request_exceeds_cap",
+        );
+        return;
+    }
+    let request = match git_credential::parse(&request_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(
+                req_id = %req_id,
+                evt = "mint_denied",
+                reason = "malformed_request",
+                client = %client.name,
+                error = %e,
+            );
+            return;
+        }
+    };
+    drop(request_bytes);
 
     // ------ Phase 4: host dispatch ------
     let Some(provider) = state.providers.get(&request.host) else {
@@ -750,7 +792,7 @@ async fn handle_connection(mut stream: UnixStream, req_id: String, state: Rc<Sha
         }
     };
 
-    // ------ Phase 6: emit response ------
+    // ------ Phase 6: emit encrypted response ------
     let mut out = Vec::with_capacity(256);
     if let Err(e) = git_credential::write_response(&response, &mut out) {
         warn!(
@@ -762,13 +804,13 @@ async fn handle_connection(mut stream: UnixStream, req_id: String, state: Rc<Sha
         );
         return;
     }
-    if let Err(e) = write_all_buf(&mut stream, out).await {
+    if let Err(reason) = write_framed_encrypt(&mut stream, &mut transport_state, &out).await {
         warn!(
             req_id = %req_id,
             evt = "provider_error",
             reason = "response_write",
             provider = %request.host,
-            error = %e,
+            detail = reason,
         );
         return;
     }
@@ -901,36 +943,149 @@ fn log_mint_error(
     }
 }
 
-// Per-iteration `Vec` allocation. For our traffic (<<1 mint/s) the
-// alloc cost is invisible relative to network RTT. If profiling
-// ever shows otherwise, iggy reuses a single
-// Reads up to READ_CHUNK_BYTES into `chunk`, then appends what was
-// filled into `accumulated`. `chunk` is owned by the caller so its
-// allocation is reused across iterations (iggy pattern at
-// iggy/core/server/src/tcp/connection_handler.rs:49-81). compio's
-// `BufferPool` + `AsyncReadManaged` is the io_uring-native answer
-// for cross-connection reuse and is out of scope here.
-async fn read_more(
-    stream: &mut UnixStream,
-    accumulated: &mut Vec<u8>,
-    chunk: &mut Vec<u8>,
-) -> bool {
-    chunk.clear();
-    let BufResult(res, returned) = stream.read(std::mem::take(chunk)).await;
-    *chunk = returned;
-    match res {
-        Ok(0) => false,
-        Ok(_) => {
-            accumulated.extend_from_slice(chunk);
-            true
+// ----- TCP/Noise I/O helpers ---------------------------------------------
+//
+// All errors are surfaced as static `&'static str` reason codes so that
+// `handle_connection` can pass them straight into structured log fields
+// without leaking error formatting choices upstream. The Noise transport
+// itself never returns recoverable errors mid-stream: any failure here
+// drops the connection.
+
+/// Read EXACTLY `n` bytes from `stream` into a fresh `Vec`. Returns
+/// `None` on EOF or I/O error.
+async fn read_exact_n(stream: &mut TcpStream, n: usize) -> Option<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::with_capacity(n);
+    while out.len() < n {
+        let remaining = n - out.len();
+        let buf = Vec::with_capacity(remaining);
+        let BufResult(res, mut filled) = stream.read(buf).await;
+        match res {
+            Ok(0) => return None,
+            Ok(read) => {
+                filled.truncate(read);
+                out.extend_from_slice(&filled);
+            }
+            Err(_) => return None,
         }
-        Err(_) => false,
     }
+    Some(out)
 }
 
-async fn write_all_buf(stream: &mut UnixStream, buf: Vec<u8>) -> std::io::Result<()> {
-    let BufResult(res, _) = stream.write_all(buf).await;
+/// Write all bytes in `payload`, returning Ok on full write.
+async fn write_all_bytes(stream: &mut TcpStream, payload: Vec<u8>) -> std::io::Result<()> {
+    let BufResult(res, _) = stream.write_all(payload).await;
     res.map(|_| ())
+}
+
+/// Read the identity prelude: 6-byte header + identity bytes. Returns
+/// the owned identity string on success, or a static reason on failure.
+async fn read_prelude(stream: &mut TcpStream) -> Result<String, &'static str> {
+    let head = read_exact_n(stream, 6)
+        .await
+        .ok_or("eof_before_prelude_head")?;
+    // Validate magic + version + id_len without committing to a
+    // borrowing parse yet (we need a final &[u8] that contains the
+    // identity bytes too).
+    match transport::parse_prelude(&head) {
+        Err(PreludeError::Incomplete { .. }) => { /* expected — keep going */ }
+        Err(PreludeError::BadMagic { .. }) => return Err("bad_magic"),
+        Err(PreludeError::BadVersion { .. }) => return Err("bad_version"),
+        Err(PreludeError::BadIdentityLen { .. }) => return Err("bad_identity_len"),
+        // The 6-byte head can't have an invalid charset error.
+        Err(PreludeError::InvalidCharset { .. }) => return Err("invalid_charset"),
+        Ok(_) => unreachable!("6 bytes is never a complete prelude (min 7)"),
+    }
+    let id_len = head[5] as usize;
+    let tail = read_exact_n(stream, id_len)
+        .await
+        .ok_or("eof_before_identity")?;
+    let mut full = head;
+    full.extend_from_slice(&tail);
+    let (identity, _) = transport::parse_prelude(&full).map_err(|e| match e {
+        PreludeError::BadMagic { .. } => "bad_magic",
+        PreludeError::BadVersion { .. } => "bad_version",
+        PreludeError::BadIdentityLen { .. } => "bad_identity_len",
+        PreludeError::InvalidCharset { .. } => "invalid_charset",
+        PreludeError::Incomplete { .. } => "incomplete",
+    })?;
+    Ok(identity.as_str().to_string())
+}
+
+/// Run the responder side of `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s`.
+/// Consumes one inbound framed handshake message, writes one outbound,
+/// then transitions to transport mode.
+async fn run_responder_handshake(
+    stream: &mut TcpStream,
+    psk: &[u8; 32],
+) -> Result<TransportState, &'static str> {
+    let mut hs: HandshakeState = transport::responder(psk).map_err(|e| match e {
+        TransportError::BadPskLen { .. } => "bad_psk_len",
+        TransportError::Params(_) => "noise_params",
+        TransportError::Handshake(_) => "noise_build",
+        TransportError::Transition(_) | TransportError::Transport(_) => "noise_internal",
+        TransportError::OversizedFrame { .. } => "noise_oversize",
+    })?;
+    let mut scratch = vec![0u8; transport::MAX_MESSAGE_SIZE];
+
+    // -> psk, e (read one framed message)
+    let msg1 = read_framed_raw(stream).await?;
+    transport::handshake_read(&mut hs, &msg1, &mut scratch).map_err(|_| "handshake_read_failed")?;
+
+    // <- e, ee (write one framed message)
+    let n = transport::handshake_write(&mut hs, &[], &mut scratch)
+        .map_err(|_| "handshake_write_failed")?;
+    write_framed_raw(stream, &scratch[..n])
+        .await
+        .map_err(|_| "handshake_write_io")?;
+
+    transport::into_transport(hs).map_err(|_| "handshake_into_transport_failed")
+}
+
+/// Read a 16-bit BE length-prefixed framed payload from `stream`.
+async fn read_framed_raw(stream: &mut TcpStream) -> Result<Vec<u8>, &'static str> {
+    let len_buf_vec = read_exact_n(stream, 2)
+        .await
+        .ok_or("eof_before_frame_len")?;
+    let len_buf: [u8; 2] = len_buf_vec
+        .as_slice()
+        .try_into()
+        .map_err(|_| "frame_len_underflow")?;
+    let len = transport::read_frame_length(&len_buf).map_err(|_| "frame_too_big")?;
+    read_exact_n(stream, len)
+        .await
+        .ok_or("eof_before_frame_body")
+}
+
+/// Read one framed Noise transport message and decrypt it.
+async fn read_framed_decrypt(
+    stream: &mut TcpStream,
+    ts: &mut TransportState,
+) -> Result<Vec<u8>, &'static str> {
+    let ct = read_framed_raw(stream).await?;
+    let mut out = vec![0u8; transport::MAX_MESSAGE_SIZE];
+    let n = transport::transport_read(ts, &ct, &mut out).map_err(|_| "decrypt_failed")?;
+    out.truncate(n);
+    Ok(out)
+}
+
+/// Frame `payload` with a 16-bit BE length prefix and write to stream.
+async fn write_framed_raw(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
+    let framed = transport::frame(payload)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "frame too big"))?;
+    write_all_bytes(stream, framed).await
+}
+
+/// Encrypt `plaintext` through the transport, frame it, and send.
+async fn write_framed_encrypt(
+    stream: &mut TcpStream,
+    ts: &mut TransportState,
+    plaintext: &[u8],
+) -> Result<(), &'static str> {
+    let mut buf = vec![0u8; transport::MAX_MESSAGE_SIZE];
+    let n = transport::transport_write(ts, plaintext, &mut buf).map_err(|_| "encrypt_failed")?;
+    write_framed_raw(stream, &buf[..n])
+        .await
+        .map_err(|_| "write_io")
 }
 
 #[cfg(test)]
@@ -938,10 +1093,9 @@ mod tests {
     use super::*;
     use crate::config::ClientEntry;
 
-    fn entry(name: &str, ip: &str, providers: &[&str]) -> ClientEntry {
+    fn entry(name: &str, providers: &[&str]) -> ClientEntry {
         ClientEntry {
             name: name.to_string(),
-            ip: ip.parse().unwrap(),
             providers: providers.iter().map(|s| s.to_string()).collect(),
             enrolled_at: "2026-05-31T00:00:00Z".to_string(),
             note: None,
@@ -949,116 +1103,82 @@ mod tests {
     }
 
     #[test]
-    fn build_clients_table_indexes_by_ip() {
+    fn build_clients_table_indexes_by_name() {
         let file = ClientsFile {
-            version: 1,
-            clients: vec![
-                entry("vm-1", "192.168.122.10", &["github"]),
-                entry("vm-2", "192.168.122.11", &["github"]),
-            ],
+            version: 2,
+            clients: vec![entry("vm-1", &["github"]), entry("vm-2", &["github"])],
         };
         let table = build_clients_table(file).unwrap();
         assert_eq!(table.len(), 2);
-        let v1 = table.get(&"192.168.122.10".parse().unwrap()).unwrap();
+        let v1 = table.get("vm-1").unwrap();
         assert_eq!(v1.name, "vm-1");
         assert!(v1.providers.iter().any(|p| p == "github"));
     }
 
     #[test]
-    fn build_clients_table_rejects_duplicate_ip() {
+    fn build_clients_table_rejects_duplicate_name() {
         let file = ClientsFile {
-            version: 1,
-            clients: vec![
-                entry("vm-1", "192.168.122.10", &["github"]),
-                entry("vm-1-dup", "192.168.122.10", &["github"]),
-            ],
+            version: 2,
+            clients: vec![entry("vm-1", &["github"]), entry("vm-1", &["github"])],
         };
         let err = build_clients_table(file).unwrap_err();
-        assert!(matches!(err, DaemonError::DuplicateClientIp(_)));
+        assert!(matches!(err, DaemonError::DuplicateClientName(n) if n == "vm-1"));
     }
 
     #[test]
     fn build_clients_table_empty_is_ok() {
         let file = ClientsFile {
-            version: 1,
+            version: 2,
             clients: vec![],
         };
         assert_eq!(build_clients_table(file).unwrap().len(), 0);
     }
 
-    fn empty_state() -> Rc<SharedState> {
-        Rc::new(SharedState {
-            clients: RefCell::new(HashMap::new()),
-            providers: HashMap::new(),
-            psk_file_path: PathBuf::new(),
-            clients_file_path: PathBuf::new(),
-            stunnel: Rc::new(StunnelController::new(PathBuf::new())),
-            listen_socket_path: PathBuf::new(),
-            admin_socket_path: PathBuf::new(),
-            start_time: SystemTime::now(),
-            shutdown: CancelToken::new(),
-        })
-    }
-
-    // empty_state() builds a SharedState that contains a
-    // CancelToken; CancelToken::new() panics outside a compio
-    // runtime context. Tests that touch SharedState therefore run
-    // under #[compio::test] even when their bodies do no I/O.
+    // The previous `empty_state()` helper is gone; the one remaining
+    // test that needs a SharedState builds one inline so its setup
+    // is local and explicit.
 
     #[compio::test]
     async fn reload_clients_swaps_in_place() {
-        let state = empty_state();
-        // Seed with one entry.
-        state.clients.borrow_mut().insert(
-            "10.0.0.1".parse().unwrap(),
-            ResolvedClient {
-                name: "old".to_string(),
-                providers: Vec::new(),
-                enrolled_at: "x".to_string(),
-                note: None,
-            },
-        );
-        // Write a new clients.json containing a different IP.
-        let path =
+        let clients_path =
             std::env::temp_dir().join(format!("symbolon-reload-test-{}.json", ulid::Ulid::new()));
         std::fs::write(
-            &path,
-            r#"{"version":1,"clients":[{"name":"new","ip":"10.0.0.2","providers":["github"],"enrolled_at":"y","note":null}]}"#,
+            &clients_path,
+            r#"{"version":2,"clients":[{"name":"new","providers":["github"],"enrolled_at":"y","note":null}]}"#,
         )
         .unwrap();
-        state.reload_clients(&path).await;
+        // psk_file_path points at a nonexistent file; load_psk_store
+        // treats ENOENT as "fresh deployment" → empty PSK store.
+        let nonexistent_psk =
+            std::env::temp_dir().join(format!("symbolon-reload-test-psks-{}", ulid::Ulid::new()));
+        let state = Rc::new(SharedState {
+            clients: RefCell::new({
+                let mut m = HashMap::new();
+                m.insert(
+                    "old".to_string(),
+                    ResolvedClient {
+                        name: "old".to_string(),
+                        providers: Vec::new(),
+                        enrolled_at: "x".to_string(),
+                        note: None,
+                    },
+                );
+                m
+            }),
+            psks: RefCell::new(PskStore::empty()),
+            providers: HashMap::new(),
+            psk_file_path: nonexistent_psk,
+            clients_file_path: clients_path.clone(),
+            admin_socket_path: PathBuf::new(),
+            start_time: SystemTime::now(),
+            shutdown: CancelToken::new(),
+        });
+        state.reload_clients(&clients_path).await;
         let borrow = state.clients.borrow();
         assert_eq!(borrow.len(), 1);
-        assert!(borrow.get(&"10.0.0.2".parse().unwrap()).is_some());
-        assert!(borrow.get(&"10.0.0.1".parse().unwrap()).is_none());
+        assert!(borrow.contains_key("new"));
+        assert!(!borrow.contains_key("old"));
         drop(borrow);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn canonicalize_ip_collapses_v4_mapped_v6_to_v4() {
-        let mapped: IpAddr = "::ffff:192.0.2.1".parse().unwrap();
-        let plain: IpAddr = "192.0.2.1".parse().unwrap();
-        assert_eq!(canonicalize_ip(mapped), plain);
-        // Native V6 left alone.
-        let v6: IpAddr = "2001:db8::1".parse().unwrap();
-        assert_eq!(canonicalize_ip(v6), v6);
-        // Bare V4 left alone.
-        let v4: IpAddr = "10.0.0.1".parse().unwrap();
-        assert_eq!(canonicalize_ip(v4), v4);
-    }
-
-    #[test]
-    fn build_clients_table_collapses_v4_mapped_v6_against_v4() {
-        let file = ClientsFile {
-            version: 1,
-            clients: vec![entry("client-v4mapped", "::ffff:192.0.2.42", &["github"])],
-        };
-        let table = build_clients_table(file).unwrap();
-        let v4: IpAddr = "192.0.2.42".parse().unwrap();
-        assert!(
-            table.contains_key(&v4),
-            "::ffff:192.0.2.42 should land under the IPv4 key after canonicalization",
-        );
+        let _ = std::fs::remove_file(&clients_path);
     }
 }

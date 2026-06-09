@@ -2,7 +2,6 @@
 //! tracing for the daemon, hand off to [`symbolon::run_daemon`] or
 //! [`symbolon::cli_dispatch`].
 
-use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -200,15 +199,12 @@ enum GithubSub {
     Selfcheck(SelfcheckArgs),
 }
 
-/// enroll a client by source IP
+/// enroll a client; broker generates a PSK and prints provisioning steps
 #[derive(FromArgs)]
 #[argh(subcommand, name = "enroll")]
 struct EnrollArgs {
     #[argh(positional)]
     client: String,
-    /// source IP address (attested upstream)
-    #[argh(option)]
-    ip: IpAddr,
     /// free-form note
     #[argh(option)]
     note: Option<String>,
@@ -241,7 +237,6 @@ fn github_to_cli(g: GithubArgs) -> CliCommand {
     match g.cmd {
         GithubSub::Enroll(a) => CliCommand::GithubEnroll {
             client: a.client,
-            ip: a.ip,
             note: a.note,
         },
         GithubSub::Revoke(a) => CliCommand::GithubRevoke { client: a.client },

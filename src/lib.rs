@@ -34,11 +34,11 @@ pub(crate) mod loader;
 pub(crate) mod logging;
 pub(crate) mod mlock;
 pub(crate) mod providers;
-pub(crate) mod proxy_protocol;
+pub(crate) mod psk_store;
 pub(crate) mod ready;
 pub(crate) mod sandbox;
 pub(crate) mod signals;
-pub(crate) mod stunnel;
+pub mod transport;
 
 // Curated in-package surface. Cargo forces these to be `pub` because
 // main.rs / tests / fuzz are separate crates from the lib, even
@@ -51,7 +51,7 @@ pub use crate::admin::{CliCommand, cli_dispatch};
 #[doc(hidden)]
 pub use crate::config::{
     AdminConfig, ClientsConfig, Config, ListenConfig, LogLevel, LoggingConfig, MlockMode,
-    ProviderGithub, Providers, RuntimeConfig, SandboxMode, SecurityConfig, StunnelConfig,
+    ProviderGithub, Providers, RuntimeConfig, SandboxMode, SecurityConfig,
 };
 #[doc(hidden)]
 pub use crate::cpu_worker::CpuWorker;
@@ -74,4 +74,4 @@ pub use crate::signals::{spawn_shutdown_watcher, spawn_sighup_handler};
 #[doc(hidden)]
 pub use crate::git_credential::parse as parse_git_credential;
 #[doc(hidden)]
-pub use crate::proxy_protocol::parse as parse_proxy_protocol;
+pub use crate::transport::parse_prelude as parse_identity_prelude;

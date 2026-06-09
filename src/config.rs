@@ -6,7 +6,7 @@
 //! fields. No filesystem access — that lives in `crate::loader`.
 //! All deserializers carry `#[serde(deny_unknown_fields)]`.
 
-use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,6 @@ pub struct Config {
     pub listen: ListenConfig,
     pub admin: AdminConfig,
     pub clients: ClientsConfig,
-    pub stunnel: StunnelConfig,
     pub logging: LoggingConfig,
     #[serde(default)]
     pub security: SecurityConfig,
@@ -47,8 +46,14 @@ pub struct RuntimeConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListenConfig {
-    /// Unix-domain socket the daemon listens on; stunnel forwards here.
-    pub socket: PathBuf,
+    /// TCP address the daemon binds for inbound client connections.
+    /// Default deployment: `0.0.0.0:9418`. Symbolon terminates Noise NNpsk0
+    /// in-process; no stunnel layer.
+    pub bind: SocketAddr,
+    /// Path to the symbolon-owned PSK store (`identity:hex_psk` per line).
+    /// Read at startup and re-read on SIGHUP. Atomically rewritten by
+    /// enroll/revoke.
+    pub psk_file: PathBuf,
 }
 
 /// `[admin]` section.
@@ -65,19 +70,6 @@ pub struct AdminConfig {
 pub struct ClientsConfig {
     /// Path to the JSON file holding enrolled clients.
     pub file: PathBuf,
-}
-
-/// `[stunnel]` section.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StunnelConfig {
-    /// Path to stunnel's PSK secrets file. The daemon rewrites this
-    /// via the admin socket on enroll/revoke and then SIGHUPs stunnel.
-    pub psk_file: PathBuf,
-    /// stunnel's pidfile (stunnel writes it via its own `pid = …`
-    /// config). The daemon reads this to send SIGHUP after
-    /// enroll/revoke rewrites `psk_file`.
-    pub pidfile: PathBuf,
 }
 
 /// `[logging]` section.
@@ -214,7 +206,10 @@ fn default_user_agent() -> String {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientsFile {
-    /// Schema version. Only `1` is supported today.
+    /// Schema version. Only `2` is supported today. v1 carried an
+    /// `ip` field per client (used when stunnel fronted the daemon
+    /// and identity came from the source IP); v2 drops it — identity
+    /// now derives from the Noise handshake's PSK selection.
     pub version: u32,
     pub clients: Vec<ClientEntry>,
 }
@@ -224,7 +219,6 @@ pub struct ClientsFile {
 #[serde(deny_unknown_fields)]
 pub struct ClientEntry {
     pub name: String,
-    pub ip: IpAddr,
     pub providers: Vec<String>,
     /// RFC 3339 UTC timestamp. Kept as a `String`; consumers parse
     /// on use via `time::OffsetDateTime` if/when they need a typed
@@ -266,7 +260,9 @@ pub enum ConfigError {
         source: serde_json::Error,
     },
     /// `clients.json` has a schema version we don't know how to read.
-    #[error("clients file version unsupported: got {0}, expected 1")]
+    #[error(
+        "clients file version unsupported: got {0}, expected 2 (re-enroll all clients to upgrade from v1)"
+    )]
     UnsupportedClientsVersion(u32),
 }
 
@@ -284,7 +280,7 @@ pub fn parse_clients_file(text: &str, path: &Path) -> Result<ClientsFile, Config
         path: path.to_path_buf(),
         source,
     })?;
-    if parsed.version != 1 {
+    if parsed.version != 2 {
         return Err(ConfigError::UnsupportedClientsVersion(parsed.version));
     }
     Ok(parsed)
@@ -296,17 +292,14 @@ mod tests {
 
     const KNOWN_GOOD_CONFIG: &str = r#"
 [listen]
-socket = "/run/symbolon/daemon.sock"
+bind = "0.0.0.0:9418"
+psk_file = "/var/lib/symbolon/psks"
 
 [admin]
 socket_path = "/run/symbolon/admin.sock"
 
 [clients]
 file = "/var/lib/symbolon/clients.json"
-
-[stunnel]
-psk_file = "/etc/stunnel/symbolon.psk"
-pidfile = "/run/stunnel/stunnel.pid"
 
 [logging]
 level = "info"
@@ -323,10 +316,8 @@ selfcheck_timeout = "5s"
     #[test]
     fn config_known_good_round_trips() {
         let cfg: Config = toml::from_str(KNOWN_GOOD_CONFIG).unwrap();
-        assert_eq!(
-            cfg.listen.socket,
-            PathBuf::from("/run/symbolon/daemon.sock")
-        );
+        assert_eq!(cfg.listen.bind, "0.0.0.0:9418".parse().unwrap());
+        assert_eq!(cfg.listen.psk_file, PathBuf::from("/var/lib/symbolon/psks"));
         assert_eq!(
             cfg.admin.socket_path,
             PathBuf::from("/run/symbolon/admin.sock")
@@ -334,14 +325,6 @@ selfcheck_timeout = "5s"
         assert_eq!(
             cfg.clients.file,
             PathBuf::from("/var/lib/symbolon/clients.json")
-        );
-        assert_eq!(
-            cfg.stunnel.psk_file,
-            PathBuf::from("/etc/stunnel/symbolon.psk")
-        );
-        assert_eq!(
-            cfg.stunnel.pidfile,
-            PathBuf::from("/run/stunnel/stunnel.pid")
         );
         assert_eq!(cfg.logging.level, LogLevel::Info);
         let gh = cfg.provider.github.expect("github provider present");
@@ -368,8 +351,8 @@ selfcheck_timeout = "5s"
     #[test]
     fn config_rejects_unknown_field_in_listen() {
         let src = KNOWN_GOOD_CONFIG.replace(
-            "[listen]\nsocket = \"/run/symbolon/daemon.sock\"",
-            "[listen]\nsocket = \"/run/symbolon/daemon.sock\"\nport = 1234",
+            "[listen]\nbind = \"0.0.0.0:9418\"",
+            "[listen]\nbind = \"0.0.0.0:9418\"\nport = 1234",
         );
         assert!(toml::from_str::<Config>(&src).is_err());
     }
@@ -457,19 +440,18 @@ selfcheck_timeout = "5s"
 
     #[test]
     fn clients_empty_array_parses() {
-        let parsed: ClientsFile = serde_json::from_str(r#"{"version":1,"clients":[]}"#).unwrap();
-        assert_eq!(parsed.version, 1);
+        let parsed: ClientsFile = serde_json::from_str(r#"{"version":2,"clients":[]}"#).unwrap();
+        assert_eq!(parsed.version, 2);
         assert!(parsed.clients.is_empty());
     }
 
     #[test]
     fn clients_one_entry_parses() {
         let json = r#"{
-  "version": 1,
+  "version": 2,
   "clients": [
     {
       "name": "dev-vm-1",
-      "ip": "192.168.122.10",
       "providers": ["github"],
       "enrolled_at": "2026-05-26T12:34:56Z",
       "note": null
@@ -480,7 +462,6 @@ selfcheck_timeout = "5s"
         assert_eq!(parsed.clients.len(), 1);
         let c = &parsed.clients[0];
         assert_eq!(c.name, "dev-vm-1");
-        assert_eq!(c.ip, "192.168.122.10".parse::<IpAddr>().unwrap());
         assert_eq!(c.providers, vec!["github".to_string()]);
         assert_eq!(c.enrolled_at, "2026-05-26T12:34:56Z");
         assert!(c.note.is_none());
@@ -489,11 +470,10 @@ selfcheck_timeout = "5s"
     #[test]
     fn clients_unknown_field_on_entry_rejected() {
         let json = r#"{
-  "version": 1,
+  "version": 2,
   "clients": [
     {
       "name": "x",
-      "ip": "10.0.0.1",
       "providers": [],
       "enrolled_at": "2026-01-01T00:00:00Z",
       "note": null,
@@ -505,30 +485,37 @@ selfcheck_timeout = "5s"
     }
 
     #[test]
-    fn clients_version_two_returns_unsupported() {
-        let json = r#"{"version":2,"clients":[]}"#;
+    fn clients_v1_rejected_with_migration_hint() {
+        // v1 carried per-client `ip`; operators must re-enroll all clients
+        // when upgrading.
+        let json = r#"{"version":1,"clients":[]}"#;
         let err = parse_clients_file(json, Path::new("/test/clients.json")).unwrap_err();
         assert!(
-            matches!(err, ConfigError::UnsupportedClientsVersion(2)),
+            matches!(err, ConfigError::UnsupportedClientsVersion(1)),
             "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("re-enroll"),
+            "error should hint at the migration path: {err}"
         );
     }
 
     #[test]
-    fn clients_malformed_ip_returns_json_error() {
+    fn clients_v1_ip_field_now_rejected_as_unknown() {
+        // Belt-and-suspenders: even if someone forces version=2, the legacy
+        // `ip` field is rejected by deny_unknown_fields.
         let json = r#"{
-  "version": 1,
+  "version": 2,
   "clients": [
     {
       "name": "x",
-      "ip": "not-an-ip",
+      "ip": "10.0.0.1",
       "providers": [],
       "enrolled_at": "2026-01-01T00:00:00Z",
       "note": null
     }
   ]
 }"#;
-        let err = parse_clients_file(json, Path::new("/test/clients.json")).unwrap_err();
-        assert!(matches!(err, ConfigError::Json { .. }), "unexpected: {err}");
+        assert!(serde_json::from_str::<ClientsFile>(json).is_err());
     }
 }

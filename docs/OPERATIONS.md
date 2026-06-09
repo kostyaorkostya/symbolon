@@ -28,15 +28,17 @@ symbolon list
 ### GitHub provider
 
 ```
-symbolon github enroll <client> --ip <ip> [--note <text>]
-    Generate a per-client PSK, append to stunnel's psk file and
-    clients.json (both atomically), SIGHUP stunnel, and print a
+symbolon github enroll <client> [--note <text>]
+    Generate a per-client 32-byte PSK, append to the symbolon-owned
+    `psks` file and clients.json (both atomically), and print a
     paste-ready provisioning snippet to stdout.
 
 symbolon github revoke <client>
     Remove the client's GitHub enrollment. If the client has no
     remaining provider enrollments, remove from clients.json and
-    stunnel.psk entirely. SIGHUP stunnel.
+    `psks` entirely. The daemon owns the PSK store directly — no
+    external process to SIGHUP; the in-memory state swaps in lock-
+    step with the on-disk rewrite.
 
     NOTE: Outstanding tokens minted in the past hour are NOT
     revoked. They live out their full TTL.
@@ -120,32 +122,37 @@ sudo -u symbolon symbolon github selfcheck
 If `selfcheck` fails: the daemon can't reach the provider, the App
 key is wrong, or clock skew is large. The output names which.
 
-**2. Is stunnel listening, and is the daemon's socket present?**
+**2. Is the daemon listening?**
 
 ```sh
-rc-service stunnel status        # or `systemctl status stunnel`
-ss -tlnp | grep ':9418'          # stunnel should be listening here
-ls -l /run/symbolon/daemon.sock       # owner symbolon:symbolon, mode 0660
+ss -tlnp | grep ':9418'          # symbolon should be listening here
+ls -l /run/symbolon/admin.sock   # admin UDS, owner symbolon:symbolon, mode 0600
 ```
 
-If the socket is missing after a reboot: see [INSTALL.md §3.9](INSTALL.md)
-(`/run` is tmpfs, cleared at boot — `checkpath` / `tmpfiles.d` must
-recreate `/run/symbolon`). If the socket exists but stunnel can't connect,
-verify `stunnel` is in the `symbolon` group: `id stunnel`.
+If the admin socket is missing after a reboot: `/run` is tmpfs,
+cleared at boot — `checkpath` (OpenRC) or `tmpfiles.d` (systemd)
+must recreate `/run/symbolon`. See [INSTALL.md §3.8 / §3.9](INSTALL.md).
 
-**3. Can the client reach the broker over TLS-PSK?**
+**3. Can the client reach the broker over Noise?**
 
 From the client:
 
 ```sh
-openssl s_client -tls1_2 -cipher PSK \
-  -psk_identity dev-vm-1 -psk "$(cat /etc/symbolon/psk)" \
-  -connect broker.lan:9418 -quiet < /dev/null
+echo 'protocol=https
+host=github.com
+path=octocat/Spoon-Knife
+' | git-credential-symbolon \
+    --endpoint broker.lan:9418 \
+    --identity dev-vm-1 \
+    --psk-file /etc/symbolon/psk \
+    get
 ```
 
-A clean handshake with no output (and exit 0 given `< /dev/null`)
-means TLS is fine and the daemon closed because there was no request.
-If handshake fails: PSK mismatch, or network path blocked.
+A successful response prints `username=x-access-token`,
+`password=ghs_...`, and `password_expiry_utc=...` on stdout. If the
+helper exits non-zero with a stderr message, the cause is either a
+PSK mismatch, an unknown identity on the broker side, or a network
+path block.
 
 **4. Can a mint succeed end to end?**
 
@@ -170,10 +177,10 @@ points at the fix.
 
 ### Common failure causes
 
-- **`mint_denied reason=client_unknown`**: the source IP in the
-  PROXY v2 header didn't match any client in `clients.json`. Either
-  the client moved IPs (re-enroll with the new IP) or upstream IP
-  attestation isn't working as expected.
+- **`mint_denied reason=client_unknown`**: the PSK identity from
+  the Noise prelude didn't match any enrolled client. Either the
+  client's `--identity` flag is wrong, the client was revoked, or
+  the operator and client disagree about the spelling.
 - **`mint_denied reason=unknown_host`**: the credential helper sent
   a `host=` that isn't one of the configured providers. For GitHub
   it must be the value in `provider.github.host` exactly — no suffix
@@ -204,55 +211,40 @@ points at the fix.
 
 The broker self-sandboxes at startup with landlock (FS read/write
 allowlist + outbound TCP-connect restricted to port 443 + abstract
-Unix-socket scope) and a seccomp-BPF filter that confines the
-kill-family syscalls (`kill`, `tkill`, `tgkill`,
-`pidfd_send_signal`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`) so
-their `sig` argument must equal `SIGHUP` — every other signal is
-denied with EPERM.
+Unix-socket scope) and a seccomp-BPF filter that denies the full
+signal-sending syscall set (`kill`, `tkill`, `tgkill`,
+`rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `pidfd_send_signal`) with
+EPERM. Symbolon never sends signals to other processes.
 
 **What this prevents** if a dependency CVE ever lets code execute
 inside the daemon:
 - Re-reading the App PEM key off disk (the key was loaded once at
   startup and the PEM dir is unreachable post-sandbox).
 - Reading or modifying anything outside the small allowlist (state
-  files, stunnel pidfile, `/dev/urandom`, CA bundle, nameservice
-  files).
-- Binding a TCP listener, or connecting outbound to anywhere other
-  than port 443.
-- Sending any signal that isn't SIGHUP.
+  files, `/dev/urandom`, CA bundle, nameservice files).
+- Binding new TCP listeners, or connecting outbound to anywhere
+  other than port 443.
+- Sending any signal to any process.
 
 **Known limitations:**
-- The seccomp filter does NOT pin the *target* PID — it only checks
-  the signum. A compromised broker could still SIGHUP some other
-  process owned by the `symbolon` UID. In typical deployments stunnel is
-  the only such process, but operators co-locating daemons under
-  `symbolon` should be aware.
 - The atomic-write directory grant on `/var/lib/symbolon/` covers
   everything in that directory. A post-compromise process could
-  overwrite `clients.json` (which the daemon already self-rewrites).
-  The PEM key is protected because it lives outside this dir.
-- Landlock's `Scope::Signal` is deliberately omitted because stunnel
-  is started by init (outside the broker's Landlock domain) and the
-  broker must keep being able to SIGHUP it. The seccomp filter above
-  is the substitute for that piece of the protection.
+  overwrite `clients.json` or `psks` (which the daemon already
+  self-rewrites). The PEM key is protected because it lives
+  outside this dir.
 - If you want host-policy enforcement *in addition* to landlock
-  (per-target signal scoping, per-process syscall scope, etc.), layer
-  AppArmor or SELinux from the LXC config. This is out of scope for
-  the broker itself.
+  (per-process syscall scope, etc.), layer AppArmor or SELinux from
+  the LXC config. This is out of scope for the broker itself.
 
-## Audit caveat: stunnel does not forward PSK identity
+## Identity attribution
 
-The daemon attributes every connection to a client by looking up the
-source IP from the PROXY v2 header against `clients.json`. **stunnel
-does not place the negotiated PSK identity into a PROXY TLV**, so the
-daemon cannot cross-check that the PSK-authenticated identity matches
-the IP-resolved client name. The upstream IP-attestation layer (e.g.
-libvirt `clean-traffic`) is therefore load-bearing for correct
-attribution.
-
-If you suspect attribution drift, correlate stunnel's own logs
-(`/var/log/stunnel/stunnel.log` records PSK identities at debug
-levels) against `symbolon`'s `accept`/`mint` events by timestamp.
+Identity is the PSK identity surfaced by the Noise handshake. A
+connection only completes the handshake if the client presented an
+enrolled identity AND held the matching PSK; the `evt=accept` log
+field `psk_identity` reflects that authenticated value, not the
+client-claimed string. The TCP source address is logged as
+`peer` for audit only — never used for identity decisions
+(DHCP-friendly).
 
 ## Hardening recommendations
 
@@ -324,9 +316,10 @@ To revoke a single client:
 sudo -u symbolon symbolon github revoke <client>
 ```
 
-This removes the client's PSK entry from stunnel and removes the
-client from `clients.json`. The client can no longer establish a
-TLS-PSK connection.
+This removes the client's PSK entry from the daemon's PSK store and
+removes the client from `clients.json`. Subsequent Noise handshakes
+from that identity are rejected with `evt=mint_denied
+reason=client_unknown` before the handshake completes.
 
 **Important caveat:** outstanding tokens minted in the previous hour
 are NOT revoked. Tokens live their full TTL regardless. If you need
@@ -342,8 +335,8 @@ hard cutoff:
   daemon**: the App key is loaded at startup and is not
   hot-reloadable.
 
-To revoke all clients at once: stop `stunnel`. Clients can no longer
-connect. Restart when the situation is resolved.
+To revoke all clients at once: stop the symbolon daemon. Clients
+can no longer connect. Restart when the situation is resolved.
 
 ## Updating
 
@@ -379,10 +372,10 @@ What to back up:
   by re-enrolling but timestamps are useful for forensics.
 - `/etc/symbolon/github-app.pem` — the App private key. Treat as a secret;
   back up to a place at least as protected as the broker itself.
-- `/etc/stunnel/symbolon.psk` — per-client PSKs. Treat as a secret;
+- `/var/lib/symbolon/psks` — per-client PSKs. Treat as a secret;
   back up to a place at least as protected as the broker itself.
-  Restoring this alone is sufficient to keep existing clients
-  working without re-enrolling.
+  Restoring this alongside `clients.json` is sufficient to keep
+  existing clients working without re-enrolling.
 
 What NOT to back up:
 

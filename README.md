@@ -34,35 +34,31 @@ bounds the attacker to the broker's narrow per-mint scope for ≤1 hour
 ## Architecture
 
 ```
-┌──────────────┐                        ┌───────────────────────────┐
-│   client     │                        │       broker host         │
-│ (VM or       │                        │                           │
-│  container)  │                        │  stunnel :9418            │
-│              │  TLS-PSK ────────────► │  (terminates PSK,         │
-│  git +       │                        │   forwards w/ PROXY v2)   │
-│  helper +    │                        │       │                   │
-│  openssl     │                        │       ▼                   │
-│              │                        │  symbolon daemon          │
-│              │                        │   (Unix socket)           │
-│              │  ◄──── git creds ──────┤  parses git-credential,   │
-│              │                        │  dispatches to provider   │
-└──────────────┘                        │       │                   │
-                                        │       │ HTTPS             │
-                                        │       ▼                   │
-                                        │  provider API             │
-                                        │  (api.github.com today)   │
-                                        │  mints per-repo token     │
-                                        └───────────────────────────┘
+┌──────────────────────────┐                ┌───────────────────────────┐
+│   client                 │                │       broker host         │
+│ (VM or container)        │                │                           │
+│                          │                │  symbolon :9418           │
+│  git → git-credential-   │  Noise NNpsk0  │  (TCP listen,             │
+│        symbolon          ├──────────────► │   PSK identity →          │
+│           │              │                │   per-client lookup)      │
+│           │              │ ◄── git creds ─┤                           │
+└──────────────────────────┘                │       │ HTTPS             │
+                                            │       ▼                   │
+                                            │  provider API             │
+                                            │  (api.github.com today)   │
+                                            │  mints per-repo token     │
+                                            └───────────────────────────┘
 ```
 
-Per request: `git` invokes the credential helper on the client, which
-opens a TLS-PSK connection to the broker via system `openssl`. `stunnel`
-on the broker validates the PSK, decrypts, and forwards plain TCP over
-a Unix-domain socket with a PROXY v2 header. The daemon reads the
-PROXY header, resolves the source IP to a client name, dispatches to
-the appropriate provider, mints a single-repo token, returns it as a
-git-credential response, and logs the operation. The token expires
-within an hour. Nothing is persisted on either side.
+Per request: `git` invokes the bundled `git-credential-symbolon` helper
+on the client. The helper opens a TCP connection to the broker, sends a
+small identity prelude, and runs the responder side of `Noise_NNpsk0_
+25519_ChaChaPoly_BLAKE2s` against the PSK both sides hold. Handshake
+completion authenticates the connection; the daemon looks up the
+matching client metadata, dispatches the request to the configured
+provider, mints a single-repo token, and writes it back through the
+authenticated Noise transport. The token expires within an hour.
+Nothing is persisted on either side.
 
 ## Threat model (summary)
 
@@ -108,8 +104,9 @@ Full threat model and architectural decisions: see [AGENTS.md](./AGENTS.md).
 
 1. **Create a GitHub App** (Contents R/W + Metadata R only) and install
    it on the repos you want exposed.
-2. **Deploy `symbolon` to a trusted-network host** with `stunnel`. See
-   [docs/INSTALL.md](docs/INSTALL.md).
+2. **Deploy `symbolon` to a trusted-network host.** See
+   [docs/INSTALL.md](docs/INSTALL.md). No TLS proxy needed — the
+   daemon terminates Noise NNpsk0 in-process.
 3. **Enroll each client:** `symbolon github enroll <name> --ip <ip>`.
    The command prints a paste-ready snippet for the client.
 

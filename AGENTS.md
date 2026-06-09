@@ -93,20 +93,24 @@ accessible to the App.
 5. **App permissions are immutable.** Contents R/W + Metadata R only.
    `Workflows` MUST NOT be granted; its absence prevents a compromised
    client from pushing CI changes.
-6. **Transport: TLS-PSK via [stunnel](https://www.stunnel.org/).**
-   stunnel terminates the client connection and forwards plain TCP
-   over a Unix-domain socket with a
-   [PROXY protocol v2](https://www.haproxy.org/download/2.4/doc/proxy-protocol.txt)
-   header. The daemon never speaks TLS itself.
-7. **Identity: source IP, attested upstream.** The daemon trusts the
-   source IP in the PROXY v2 header and resolves it via
-   `clients.json`. stunnel does not forward the PSK identity in a
-   PROXY TLV, so the daemon cannot cross-check stunnel's PSK auth
-   against the IP-resolved name. The upstream IP attestation is
-   load-bearing — if it fails, attribution can be wrong (PSK auth
-   still gates access).
-8. **State is files.** `clients.json` + `symbolon.psk` only, written
-   atomically (tempfile + fsync + rename + fsync parent).
+6. **Transport: Noise NNpsk0 over TCP, terminated in-process** via
+   the [`snow`](https://github.com/mcginty/snow) crate. The daemon
+   listens directly on TCP (default `:9418`) and runs the responder
+   side of `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s` against the PSK
+   selected by the client's identity prelude. Clients use the
+   bundled `git-credential-symbolon` helper to run the matching
+   initiator. No TLS at any layer (preserves the no-TLS hard NOT);
+   no stunnel.
+7. **Identity: PSK identity from the Noise handshake.** The client
+   emits a small unencrypted identity prelude (`magic | version |
+   identity_len | identity`) before the handshake; the broker looks
+   up the PSK for that identity in its in-memory store and runs
+   Noise. Handshake completion is the identity proof. The source IP
+   is not used for identity at any point (DHCP-friendly); it is
+   logged as audit metadata only.
+8. **State is files.** `clients.json` + `psks` only, both owned and
+   atomically rewritten by the daemon (tempfile + fsync + rename +
+   fsync parent).
 9. **Admin surface = Unix-domain socket.** No HTTP admin endpoints.
 10. **Daemon is the sole writer** of state files. CLI commands talk
     to the daemon via the admin socket; the daemon serializes them.
@@ -187,13 +191,15 @@ Pinned in `Cargo.toml`:
   PKCS1-v1_5 with SHA-256 is one of the most thoroughly specified
   JOSE algorithms; the actual signing is a single `rsa::SigningKey`
   call.
-- `landlock` (Linux LSM sandboxing for FS + TCP-connect + abstract-UDS
-  scope at ABI 6. Applied in `src/sandbox.rs` after both Unix-domain
-  sockets are bound and before the accept loop; gated by `[security]
-  sandbox` in `config.toml` with default `best_effort`. Pure Rust +
-  `libc` only; works on musl. Used together with `seccompiler` —
-  landlock cannot enable `Scope::Signal` because the daemon must keep
-  SIGHUP-ing stunnel, which lives in a separate process tree.)
+- `landlock` (Linux LSM sandboxing for FS + TCP-connect/bind +
+  abstract-UDS scope at ABI 6. Applied in `src/sandbox.rs` after
+  the TCP listen socket + admin Unix socket are bound and before
+  the accept loops; gated by `[security] sandbox` in `config.toml`
+  with default `best_effort`. Pure Rust + `libc` only; works on
+  musl. Used together with `seccompiler` to also deny every
+  signal-sending syscall — landlock's `Scope::Signal` would
+  achieve the same but blocks the operator SIGHUP path
+  (clients.json reload), which we still want.)
 - `libc` (raw syscall numbers and signal constants for the
   `seccompiler` BPF filter, plus the `mlockall(MCL_CURRENT |
   MCL_FUTURE | MCL_ONFAULT)` call in `src/mlock.rs`. Transitively
@@ -205,12 +211,21 @@ Pinned in `Cargo.toml`:
   only `src/ready.rs` does, and `src/ready.rs` is called from
   `src/main.rs`.)
 - `seccompiler` (Firecracker's pure-Rust seccomp-BPF compiler. The
-  filter built in `src/sandbox.rs` denies `kill`/`tkill`/`tgkill`/
-  `rt_sigqueueinfo`/`rt_tgsigqueueinfo` outright and constrains
-  `pidfd_send_signal` to `SIGHUP`; `pidfd_open` is left allowed so
-  `StunnelController` can rebind to stunnel across restarts.
-  Substitutes for landlock's `Scope::Signal` while preserving the
-  legitimate SIGHUP-to-stunnel path.)
+  filter built in `src/sandbox.rs` denies the full signal-syscall
+  set — `kill` / `tkill` / `tgkill` / `rt_sigqueueinfo` /
+  `rt_tgsigqueueinfo` / `pidfd_send_signal`. Symbolon never
+  signals other processes; the prior stunnel-SIGHUP path was
+  deleted along with stunnel when Noise replaced it.)
+- `snow` with `default-features = false, features =
+  ["default-resolver", "use-chacha20poly1305", "use-blake2",
+  "use-curve25519", "use-getrandom", "std"]` (pure-Rust Noise
+  Protocol Framework implementation; tracks Noise spec rev 34,
+  forbids `unsafe_code` internally. Drives `Noise_NNpsk0_25519_
+  ChaChaPoly_BLAKE2s` in `src/transport.rs` — the responder side
+  in the daemon, the initiator side in the `git-credential-
+  symbolon` client binary. Feature trim drops aes-gcm / sha2 /
+  blake3 / p256 / pqcrypto since our pattern uses only
+  ChaCha20-Poly1305 + BLAKE2s + X25519.)
 - `serde`, `serde_json`, `toml` (config + provider responses)
 - `time` with `default-features = false, features = ["parsing",
   "formatting"]` (RFC3339 → `SystemTime` for GitHub's `expires_at`,
@@ -239,10 +254,9 @@ Pinned in `Cargo.toml`:
   pull it in the same way — see compio-0.18 `examples/tick.rs`).
 - `ulid` (request IDs)
 - `thiserror` (errors)
-- `rustix` with features `net,process`. `process` for the pidfd
-  dance in `src/stunnel.rs` (`pidfd_open` + `pidfd_send_signal`
-  with SIGHUP after enroll/revoke rewrites `symbolon.psk`) — closes the
-  PID-reuse TOCTOU window vs. the older `kill(2)` form. `net` for
+- `rustix` with features `net,process`. `process` for `geteuid` on
+  the admin path (used by the SO_PEERCRED gate in `admin.rs`).
+  `net` for
   `socket_peercred` on the admin UDS — the SO_PEERCRED check that
   rejects connections from UIDs other than root or the daemon's
   own (defense in depth against a loose `/run/symbolon/` ACL).
@@ -351,17 +365,19 @@ Addenda:
 
 ```
 src/
-  main.rs              # entry; dispatches daemon vs CLI vs subcommands
+  main.rs              # daemon entry; dispatches daemon vs CLI subcommands
+  bin/
+    git_credential_symbolon.rs  # client-side git-credential helper
   lib.rs               # crate-level docs, pub re-exports
-  config.rs            # config.toml + clients.json parsing
+  config.rs            # config.toml + clients.json (v2) parsing
   connection_tracker.rs# spawn / drain abstraction for accept loops
   cpu_worker.rs        # Dedicated OS thread for CPU-bound work
   git_credential.rs    # protocol parse/emit; CR/LF rejection mandatory
-  proxy_protocol.rs    # PROXY v2 parsing
-  daemon.rs            # accept loop, per-connection handler, Service shape
-  admin.rs             # Unix socket + CLI dispatch
+  transport.rs         # Noise NNpsk0 wrapper + identity prelude + framing
+  psk_store.rs         # in-memory identity → PSK store, file-backed
+  daemon.rs            # TCP accept loop, per-connection Noise handler, Service shape
+  admin.rs             # admin Unix socket + CLI dispatch (enroll/revoke/etc.)
   signals.rs           # signal-hook-registry handlers → CancelToken
-  stunnel.rs           # pidfd-based SIGHUP to stunnel
   ready.rs             # sd_notify + pidfile (atomic) at startup
   loader.rs            # async config/clients.json file reads
   logging.rs           # tracing-subscriber JSON setup (stdout/stderr split)
@@ -421,10 +437,12 @@ the submission/completion queue model), so the codebase's
 **Fuzzing** is set up for the two parsers that consume attacker-
 controlled bytes:
 
-- `symbolon::proxy_protocol::parse` — PROXY v2 from stunnel. Identity
-  attestation depends on it (AGENTS.md invariant #7).
-- `symbolon::git_credential::parse` — git-credential request block;
-  carries the CR/LF Clone2Leak defence (AGENTS.md invariant #12).
+- `symbolon::parse_identity_prelude` — the unencrypted prelude
+  bytes the client sends before the Noise handshake. Identity
+  selection depends on it (AGENTS.md invariant #7).
+- `symbolon::git_credential::parse` — git-credential request block
+  (decrypted out of the Noise transport before parsing); carries
+  the CR/LF Clone2Leak defence (AGENTS.md invariant #12).
 
 Fuzz targets live under `fuzz/fuzz_targets/`. The `fuzz/` subproject
 pins nightly via its own `rust-toolchain.toml`; the main project
@@ -434,7 +452,7 @@ stays on stable. Run ad-hoc:
 cargo install cargo-fuzz   # one-shot, no project change
 cd fuzz
 cargo fuzz run git_credential_parse -- -max_total_time=600
-cargo fuzz run proxy_protocol_parse -- -max_total_time=600
+cargo fuzz run identity_prelude_parse -- -max_total_time=600
 ```
 
 (The `+nightly` switch isn't needed because `fuzz/rust-toolchain.toml`

@@ -11,18 +11,17 @@ authoritative URLs are in [`REFERENCES.md`](REFERENCES.md).
 
 ```toml
 [listen]
-# Unix-domain socket the daemon listens on. stunnel forwards here.
-socket = "/run/symbolon/daemon.sock"
+# TCP address the daemon binds for inbound client connections.
+# Symbolon terminates Noise NNpsk0 in-process; no TLS proxy.
+bind = "0.0.0.0:9418"
+# Symbolon-owned PSK store. Mutated atomically on enroll/revoke.
+psk_file = "/var/lib/symbolon/psks"
 
 [admin]
 socket_path = "/run/symbolon/admin.sock"
 
 [clients]
 file = "/var/lib/symbolon/clients.json"
-
-[stunnel]
-psk_file = "/etc/stunnel/symbolon.psk"
-pidfile = "/run/stunnel/stunnel.pid"
 
 [logging]
 level = "info"   # trace | debug | info | warn | error
@@ -88,21 +87,20 @@ no extra read dirs.
 
 The PEM key path (`provider.github.private_key_path`) is read once
 at startup, **before** the sandbox is applied. The default sandbox
-ruleset deliberately omits `/etc/symbolon/` so a post-compromise process
-inside the daemon cannot re-open the key. Keep the PEM under
-`/etc/symbolon/` (or any other dir outside `/var/lib/symbolon/` and
-`/etc/stunnel/`); do not place it in either of the directories
-granted write access for atomic state-file writes.
+ruleset deliberately omits `/etc/symbolon/` so a post-compromise
+process inside the daemon cannot re-open the key. Keep the PEM
+under `/etc/symbolon/` (or any other dir outside
+`/var/lib/symbolon/`); do not place it in the directory granted
+write access for atomic state-file writes.
 
-### `/var/lib/symbolon/clients.json` — machine-authored
+### `/var/lib/symbolon/clients.json` — machine-authored (schema v2)
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "clients": [
     {
       "name": "dev-vm-1",
-      "ip": "192.168.122.10",
       "providers": ["github"],
       "enrolled_at": "2026-05-26T12:34:56Z",
       "note": null
@@ -112,21 +110,28 @@ granted write access for atomic state-file writes.
 ```
 
 The `providers` array allows multi-provider enrolment; for the
-GitHub-only build it's always `["github"]`.
+GitHub-only build it's always `["github"]`. Schema v1 (which carried
+a per-client `ip` field) is rejected at startup — operators
+upgrading from v1 must re-enroll all clients (the PSK changes
+shape too, see below).
 
-### `/etc/stunnel/symbolon.psk` — machine-authored
+### `/var/lib/symbolon/psks` — machine-authored
 
-stunnel's standard PSK file format, one identity per line:
+Symbolon-owned PSK store. One identity per line:
 
 ```
-client-name:hex-encoded-key
+client-name:hex-encoded-32-byte-key
 ```
 
-The daemon never reads this file directly; only stunnel does.
+The daemon parses this file at startup and on `SIGHUP` reload,
+and rewrites it atomically on every `enroll` / `revoke`. The
+on-disk format is identical to the prior `stunnel.psk` shape; only
+the location and ownership have changed (symbolon owns it now,
+mode `0600`).
 
 ## Atomic writes
 
-`clients.json` and `symbolon.psk` are mutated only by the daemon (the CLI
+`clients.json` and `psks` are mutated only by the daemon (the CLI
 talks to the daemon via the admin Unix socket; see AGENTS.md
 invariant #10). The daemon writes both files atomically:
 
@@ -142,59 +147,66 @@ makes them unnecessary.
 
 ## Wire formats
 
-### TLS-PSK termination (stunnel → daemon)
-
-[stunnel](https://www.stunnel.org/) terminates the client's TLS-PSK
-connection and forwards plain TCP to the daemon's Unix-domain socket
-with a PROXY v2 header. Sample stunnel service block:
+### Identity prelude (cleartext, sent before the Noise handshake)
 
 ```
-[symbolon]
-accept = 0.0.0.0:9418
-connect = /run/symbolon/daemon.sock
-PSKsecrets = /etc/stunnel/symbolon.psk
-ciphers = PSK
-sslVersion = TLSv1.2
-protocol = proxy
++--------+---+---+----------------+
+| "SBLN" | V | L | identity bytes |
++--------+---+---+----------------+
+   4      1   1       L (1..=64)
 ```
 
-Socket permissions: `/run/symbolon/daemon.sock` is owned by `symbolon:symbolon`,
-mode `0660`. The `stunnel` user must be a supplementary member of the
-`symbolon` group. The daemon unlinks any stale socket at startup before
-binding.
+- 4 bytes magic: ASCII `"SBLN"`. Daemon rejects with
+  `evt=prelude_invalid reason=bad_magic` otherwise.
+- 1 byte version: `0x01`. Future-proofing.
+- 1 byte identity length `L`. Must be 1..=64.
+- `L` bytes identity. Charset enforced to `[A-Za-z0-9._-]+` (same rule
+  as git-credential values; CR/LF/NUL rejected — AGENTS.md invariant
+  #12 in spirit).
 
-### PROXY protocol v2
+Prelude bytes are cleartext on the wire. An attacker passively
+observing the network learns which client identity is being used but
+cannot impersonate without the PSK and cannot decrypt anything.
 
-Reference:
-<https://www.haproxy.org/download/2.4/doc/proxy-protocol.txt>.
+### Noise NNpsk0 handshake (binary)
 
-Every connection accepted on `listen.socket` begins with a PROXY v2
-header:
+Pattern: `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s` (per
+[Noise spec rev 34](https://noiseprotocol.org/noise_rev34.html)),
+driven by the [`snow`](https://github.com/mcginty/snow) crate.
 
-- 12-byte signature: `0d 0a 0d 0a 00 0d 0a 51 55 49 54 0a`
-- 1 byte: version (high nibble = 2) | command (low: 0x0 LOCAL, 0x1 PROXY)
-- 1 byte: address family + transport (0x11 TCP/IPv4, 0x21 TCP/IPv6)
-- 2 bytes: address-block length (big-endian u16)
-- Address block: source IP, destination IP, source port, dest port
+After the prelude, both sides exchange exactly two framed messages:
 
-The Unix-domain transport between stunnel and the daemon is invisible
-in the header; the address family is the original client's TCP family.
+```
+1. initiator → responder: psk, e   (one framed Noise message)
+2. responder → initiator: e, ee    (one framed Noise message)
+```
 
-Parse the header before treating the stream as git-credential. If
-parsing fails, log `evt=proxy_header_invalid` with the bytes read and
-close the connection without reading further. Implementation in
-`src/proxy_protocol.rs`; pure parsing function with property tests
-against the format spec.
+Per-message framing on the TCP stream:
 
-stunnel does NOT populate any TLV with the PSK identity, so the
-daemon cannot cross-check stunnel's PSK auth against the IP-resolved
-client name. See AGENTS.md invariant #7.
+```
++-----------+--------------------+
+| len (u16) | message body bytes |
++-----------+--------------------+
+     2              len (≤ 65535)
+```
 
-### git-credential protocol
+Handshake completion authenticates the connection (PSK proof on both
+sides) and yields an AEAD transport state. Forward secrecy is
+provided by the ephemeral X25519 keys; replay protection is provided
+by the per-message AEAD nonce counter.
+
+On handshake failure (binder check, oversized frame, EOF mid-message),
+the daemon logs `evt=handshake_failed reason=...` and closes the
+connection.
+
+### git-credential protocol (inside the Noise transport)
 
 Reference: <https://git-scm.com/docs/gitcredentials>.
 
-Read after the PROXY v2 header.
+After the handshake, application-layer messages are encrypted-and-
+framed Noise transport messages. The first inbound message decrypts
+to a git-credential request block; the daemon's response is
+encrypted and framed the same way before being written back.
 
 **Request:**
 
@@ -275,7 +287,7 @@ client_already_enrolled | client_ip_collision | malformed_request |
 internal | repo_not_accessible | provider_4xx`.
 
 The daemon serialises admin requests, so file writes to
-`clients.json` / `symbolon.psk` do not race the listen-side accept loop
+`clients.json` / `psks` do not race the listen-side accept loop
 (AGENTS.md invariant #10).
 
 CR or embedded LF inside any string field is rejected (same
@@ -390,7 +402,7 @@ On any other signal except SIGHUP: terminate fast; do not drain.
 | File | Reload mechanism |
 |---|---|
 | `clients.json` | SIGHUP re-reads from disk. |
-| `symbolon.psk` | Read AND written by daemon: `symbolon github enroll`/`revoke` route through the admin socket; the daemon parses, appends/removes, atomically rewrites, then SIGHUPs stunnel. The file is the daemon's serialization target, not a notification surface. |
+| `psks` | Read AND written by daemon: `symbolon github enroll`/`revoke` route through the admin socket; the daemon parses, mutates the in-memory `PskStore`, and atomically rewrites the file. No external process to notify — symbolon owns the responder side of Noise NNpsk0 directly. |
 | `config.toml` | Restart required. |
 | App private key | Restart required. |
 
@@ -417,7 +429,7 @@ top-level keys.
 |---|---|
 | `startup` | `version`, `config_path`, `providers` |
 | `shutdown` | `signal`, `inflight_drained`, `drain_ms` |
-| `accept` | `src_ip` (from PROXY v2), `client` (resolved name) |
+| `accept` | `psk_identity` (from the Noise prelude), `peer` (TCP source addr, audit-only) |
 | `mint` | `provider`, `repo`, `repo_id`, `client`, `ttl_sec`, `expires_at_unix`, `provider_ms` |
 | `mint_denied` | `provider`, `client`, `repo`, `reason`, `provider_status` |
 | `proxy_header_invalid` | `bytes_read` |
@@ -435,7 +447,8 @@ top-level keys.
 | `ready_pidfile_write_failed` | `path`, `error` — emitted at `warn` lvl by `ready::notify` if the configured pidfile can't be written (typically a sandbox or permission issue) |
 | `admin_denied` | `peer_uid`, `peer_pid` — emitted at `warn` lvl when SO_PEERCRED on the admin socket shows a UID that is neither root nor the daemon's own |
 | `admin_peercred_failed` | `error` — emitted at `warn` lvl when SO_PEERCRED itself fails; the connection is still admitted (refusing on a transient kernel error would be a self-DoS) |
-| `stunnel_sighup_failed` | `error` — emitted at `warn` lvl when `StunnelController::sighup` fails after an enroll/revoke rewrote `symbolon.psk`. The state mutation is NOT rolled back; operator notices via `symbolon status` or stunnel logs |
+| `prelude_invalid` | `peer`, `reason` (`bad_magic` \| `bad_version` \| `bad_identity_len` \| `invalid_charset` \| `eof_before_prelude_head` \| `eof_before_identity`) — emitted when the identity prelude is malformed; connection dropped |
+| `handshake_failed` | `client`, `reason` (`handshake_read_failed` \| `handshake_write_failed` \| `handshake_into_transport_failed` \| `decrypt_failed` \| `frame_too_big`) — Noise handshake or transport error; connection dropped |
 | `drain_incomplete` | `inflight_drained`, `drain_ms` — emitted at `warn` lvl when the per-connection drain deadline elapses with handlers still in flight at shutdown |
 | `signal_registration_failed` | `signal`, `error` — emitted at `error` lvl by `main` when `signal-hook-registry::register` fails at startup. Treated as fatal (exit 1) — without it the daemon cannot honour SIGTERM/SIGINT/SIGHUP |
 | `mlock` | `status` (`applied` \| `skipped` \| `failed` \| `off`), `policy` (`required` \| `best_effort` \| `off`), `flags` (when applied) or `error` (when skipped/failed) — emitted once at startup by `main::run_daemon` after `setup_tracing`. `required` failure surfaces as the separate `mlock_required_failed` error event before exit |

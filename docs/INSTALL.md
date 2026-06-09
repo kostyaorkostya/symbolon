@@ -10,27 +10,28 @@ package versions, and provider UIs change. The stable design lives in
 
 ## 1. Prerequisites
 
-- A trusted LAN where the broker and clients can reach each other and
-  where source IP can be reasonably attested. This typically means
-  libvirt with [`clean-traffic` filterref](https://libvirt.org/firewall.html)
-  plus host-bridge nftables anti-rogue-DHCP, or an equivalent.
+- A trusted LAN where the broker and clients can reach each other.
+  Client identity is proven cryptographically (Noise NNpsk0), so
+  client IPs may change freely (DHCP is fine).
 - A GitHub account where you can create a GitHub App.
 - A host for the broker. Any small Linux environment works; an Alpine
   LXC is a common choice. The host needs:
-  - [`stunnel`](https://www.stunnel.org/) package available.
   - Outbound HTTPS to `api.github.com` (or your GHES API base).
-  - Enough headroom for a ~3 MiB daemon plus `stunnel`.
+  - Enough headroom for a ~3 MiB daemon. No TLS proxy needed —
+    symbolon terminates Noise NNpsk0 in-process.
   - **Linux kernel 6.10+** recommended. The broker self-sandboxes
-    with landlock (FS + TCP-connect + abstract-UDS scope at ABI 6)
-    plus a seccomp-BPF filter scoping the kill-family syscalls to
-    `SIGHUP` only. Older kernels degrade under the default
-    `[security] sandbox = "best_effort"` policy and the daemon emits
-    `evt=sandbox_applied lvl=warn status=partially_enforced` so the
-    operator notices. Check with `uname -r`; check landlock LSM is
-    enabled with `grep landlock /sys/kernel/security/lsm`. In an LXC
-    container, the host kernel is what counts.
-- On each client: `openssl`, `git`, and the ability to drop a small
-  shell script and a config file in place.
+    with landlock (FS + TCP-connect/bind + abstract-UDS scope at
+    ABI 6) plus a seccomp-BPF filter that denies the full
+    signal-sending syscall set. Older kernels degrade under the
+    default `[security] sandbox = "best_effort"` policy and the
+    daemon emits `evt=sandbox_applied lvl=warn
+    status=partially_enforced` so the operator notices. Check with
+    `uname -r`; check landlock LSM is enabled with `grep landlock
+    /sys/kernel/security/lsm`. In an LXC container, the host kernel
+    is what counts.
+- On each client: `git` and the ability to drop a small binary
+  (`git-credential-symbolon`) in `/usr/local/bin/` plus a single PSK
+  file at `/etc/symbolon/psk`.
 
 ## 2. Create the GitHub App
 
@@ -76,7 +77,7 @@ Examples below assume an Alpine LXC. Adapt commands for Debian/Ubuntu
 ### 3.1 Install packages
 
 ```sh
-apk add stunnel ca-certificates
+apk add ca-certificates
 ```
 
 ### 3.2 Create users, groups, directories
@@ -85,34 +86,20 @@ apk add stunnel ca-certificates
 addgroup -S symbolon
 adduser  -S -G symbolon -H -D -s /sbin/nologin symbolon
 
-# stunnel runs as user `stunnel` by default. Add stunnel to the symbolon
-# group so it can connect to the daemon's Unix socket.
-adduser  stunnel symbolon   # Alpine; Debian/Ubuntu: `usermod -aG symbolon stunnel`
-
-install -d -o symbolon -g symbolon     -m 0700 /etc/symbolon
-install -d -o symbolon -g symbolon     -m 0700 /var/lib/symbolon
-install -d -o symbolon -g symbolon     -m 0750 /run/symbolon
-install -d -o symbolon -g stunnel -m 0750 /etc/stunnel
+install -d -o symbolon -g symbolon -m 0700 /etc/symbolon
+install -d -o symbolon -g symbolon -m 0700 /var/lib/symbolon
+install -d -o symbolon -g symbolon -m 0750 /run/symbolon
 ```
 
-`/etc/symbolon/` holds the App PEM key and `config.toml` (read-only at
-runtime); `/var/lib/symbolon/` holds `clients.json` (mutated atomically by
-the daemon). They are kept separate because the daemon's landlock
-ruleset grants write access to `/var/lib/symbolon/` (needed for the
+`/etc/symbolon/` holds the App PEM key and `config.toml` (read-only
+at runtime); `/var/lib/symbolon/` holds `clients.json` AND the
+symbolon-owned `psks` file (both mutated atomically by the daemon).
+They are kept separate because the daemon's landlock ruleset grants
+write access to `/var/lib/symbolon/` (needed for the
 tempfile-then-rename atomic-write pattern); putting the PEM key
 under that dir would defeat the sandbox's protection of the key.
 
 The `/run/symbolon` directory is recreated on every boot — see §3.10.
-
-**Upgrading from a pre-`/var/lib/symbolon` layout:** if your existing
-deployment places `clients.json` under `/etc/symbolon/`, move it before
-restarting the daemon and update `clients.file` in `config.toml`:
-
-```sh
-install -d -o symbolon -g symbolon -m 0700 /var/lib/symbolon
-mv /etc/symbolon/clients.json /var/lib/symbolon/clients.json
-sed -i 's,/etc/symbolon/clients.json,/var/lib/symbolon/clients.json,' /etc/symbolon/config.toml
-```
 
 ### 3.3 Fetch and verify the binary
 
@@ -139,17 +126,19 @@ install -o symbolon -g symbolon -m 0400 /path/to/github-app.pem /etc/symbolon/gi
 
 ```toml
 [listen]
-socket = "/run/symbolon/daemon.sock"
+# TCP address the daemon binds for inbound client connections.
+# 0.0.0.0:9418 = git smart-http port; pick another if you're
+# already using 9418 for something else.
+bind = "0.0.0.0:9418"
+# Symbolon-owned PSK store (`identity:hex_psk` per line, mode 0600).
+# Mutated atomically on enroll/revoke.
+psk_file = "/var/lib/symbolon/psks"
 
 [admin]
 socket_path = "/run/symbolon/admin.sock"
 
 [clients]
 file = "/var/lib/symbolon/clients.json"
-
-[stunnel]
-psk_file = "/etc/stunnel/symbolon.psk"
-pidfile  = "/run/stunnel/stunnel.pid"   # must match `pid = …` in step 3.7
 
 [logging]
 level = "info"
@@ -183,55 +172,21 @@ chmod 0600    /etc/symbolon/config.toml
 ### 3.6 Initialize state files
 
 ```sh
-echo '{"version":1,"clients":[]}' > /var/lib/symbolon/clients.json
+echo '{"version":2,"clients":[]}' > /var/lib/symbolon/clients.json
 chown symbolon:symbolon /var/lib/symbolon/clients.json
 chmod 0600    /var/lib/symbolon/clients.json
 
-install -o symbolon -g stunnel -m 0640 /dev/null /etc/stunnel/symbolon.psk
+install -o symbolon -g symbolon -m 0600 /dev/null /var/lib/symbolon/psks
 ```
 
 Both files are mutated atomically by the daemon (tempfile + fsync +
 rename) — never hand-edit while the daemon is running unless
 recovering from corruption.
 
-### 3.7 Configure stunnel
+### 3.7 Lock down with nftables
 
-`/etc/stunnel/stunnel.conf`:
-
-```ini
-foreground = no
-pid = /run/stunnel/stunnel.pid
-output = /var/log/stunnel/stunnel.log
-
-[symbolon]
-accept = 0.0.0.0:9418
-# Daemon listens on a Unix-domain socket; stunnel forwards plain TCP
-# over the Unix socket and prepends a PROXY v2 header carrying the
-# original TCP client's IP and port.
-connect = /run/symbolon/daemon.sock
-PSKsecrets = /etc/stunnel/symbolon.psk
-ciphers = PSK
-sslVersion = TLSv1.2
-protocol = proxy
-```
-
-Enable and start:
-
-```sh
-rc-update add stunnel default
-rc-service stunnel start
-```
-
-(systemd: `systemctl enable --now stunnel.service`.)
-
-The path in `pid = …` must match `[stunnel] pidfile` in
-`/etc/symbolon/config.toml` — the daemon reads it to send `SIGHUP` after
-`symbolon github enroll`/`revoke` rewrites `symbolon.psk`.
-
-### 3.8 Lock down with nftables
-
-The daemon listens on a Unix socket inside `/run/symbolon`; only stunnel's
-TCP listen needs LAN-scoped firewall coverage.
+The daemon listens directly on TCP `:9418`; restrict accepts to your
+trusted LAN with nftables.
 
 Replace `<lan-cidr>` with your trusted LAN (e.g. `192.168.122.0/24`):
 
@@ -250,7 +205,7 @@ EOF
 
 Persist via your distro's nftables service.
 
-### 3.9 Install and start the daemon (OpenRC)
+### 3.8 Install and start the daemon (OpenRC)
 
 `/etc/init.d/symbolon`:
 
@@ -267,7 +222,7 @@ error_log="/var/log/symbolon.log"
 
 depend() {
     need net
-    after stunnel
+    after net
 }
 
 # /run is tmpfs and is cleared at every boot; re-create the daemon's
@@ -283,7 +238,7 @@ rc-update add symbolon default
 rc-service symbolon start
 ```
 
-### 3.10 systemd alternative
+### 3.9 systemd alternative
 
 If you deploy under systemd instead, the equivalent of `start_pre +
 checkpath` is `tmpfiles.d`. Drop `/usr/lib/tmpfiles.d/symbolon.conf`:
@@ -301,7 +256,7 @@ A minimal systemd unit (`/etc/systemd/system/symbolon.service`):
 ```ini
 [Unit]
 Description=git credentials broker
-After=network-online.target stunnel.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
@@ -346,7 +301,7 @@ is available.
 OpenRC operators, by contrast, **must** set `[runtime] pidfile` to
 match the init script's `pidfile=` (see §3.9).
 
-### 3.11 Verify
+### 3.10 Verify
 
 ```sh
 sudo -u symbolon symbolon status
@@ -362,19 +317,32 @@ good.
 ### 4.1 On the broker host
 
 ```sh
-sudo -u symbolon symbolon github enroll dev-vm-1 --ip 192.168.122.10
+sudo -u symbolon symbolon github enroll dev-vm-1
 ```
 
-Output is a paste-ready snippet showing:
+The output is a paste-ready snippet containing:
 
 - The PSK hex string (for the client's `/etc/symbolon/psk`).
-- The git-credential helper command line (for the client's
-  `~/.gitconfig` or `/etc/gitconfig`).
-- The host:port to use as `--endpoint`.
+- The exact `git config` command to install the helper.
 
 ### 4.2 On the client
 
-Place the PSK:
+Install the bundled helper binary (cross-compiled for musl, same
+release tarball as the daemon):
+
+```sh
+VERSION=v0.1.0
+TARGET=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl
+BASE=https://github.com/<you>/symbolon/releases/download/${VERSION}
+
+curl -fsSLO "${BASE}/git-credential-symbolon-${TARGET}"
+curl -fsSLO "${BASE}/git-credential-symbolon-${TARGET}.sha256"
+sha256sum -c "git-credential-symbolon-${TARGET}.sha256"
+install -o root -g root -m 0755 \
+  "git-credential-symbolon-${TARGET}" /usr/local/bin/git-credential-symbolon
+```
+
+Drop the PSK from the enroll output:
 
 ```sh
 install -d -o root -g root -m 0700 /etc/symbolon
@@ -382,35 +350,15 @@ echo '<HEX-PSK-FROM-ENROLL>' > /etc/symbolon/psk
 chmod 0400 /etc/symbolon/psk
 ```
 
-Install the credential helper:
-
-```sh
-cat > /usr/local/bin/git-credential-symbolon <<'EOF'
-#!/bin/sh
-endpoint= psk_file= identity= action=
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --endpoint)      endpoint=$2;  shift 2 ;;
-    --psk-file)      psk_file=$2;  shift 2 ;;
-    --identity)      identity=$2;  shift 2 ;;
-    get|store|erase) action=$1;    shift   ;;
-    *) shift ;;
-  esac
-done
-[ "$action" = get ] || exit 0
-exec openssl s_client -quiet -tls1_2 -cipher PSK \
-  -psk_identity "$identity" -psk "$(cat "$psk_file")" \
-  -connect "$endpoint" 2>/dev/null
-EOF
-chmod 0755 /usr/local/bin/git-credential-symbolon
-```
-
-Configure git to use the helper for github.com (replace values with
-those from the enroll output):
+Configure git to use the helper for github.com (replace `<broker-host>`
+and `dev-vm-1` with the values from the enroll output):
 
 ```sh
 git config --global credential.https://github.com.helper \
-  "/usr/local/bin/git-credential-symbolon --endpoint broker.lan:9418 --psk-file /etc/symbolon/psk --identity dev-vm-1"
+  "/usr/local/bin/git-credential-symbolon \
+   --endpoint <broker-host>:9418 \
+   --identity dev-vm-1 \
+   --psk-file /etc/symbolon/psk"
 ```
 
 ### 4.3 Verify

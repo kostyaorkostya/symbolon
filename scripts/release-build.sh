@@ -56,18 +56,23 @@ ${CRATES_REMAP} \
 --remap-path-prefix=${REPO}/=./"
 
 cd "${REPO}"
-cargo zigbuild --release --locked --target "${TARGET}"
+cargo zigbuild --release --locked --target "${TARGET}" \
+	--bin symbolon --bin git-credential-symbolon
 
 # Drop stack-unwind tables. Safe because panic = "abort" — see the
 # matching step in .github/workflows/release.yml for the full
-# rationale.
-BIN="target/${TARGET}/release/gcb"
-BEFORE="$(stat -c%s "${BIN}")"
-strip --strip-debug \
-	--remove-section=.eh_frame \
-	--remove-section=.eh_frame_hdr \
-	--remove-section=.gcc_except_table \
-	"${BIN}"
-AFTER="$(stat -c%s "${BIN}")"
-echo "Stripped ${BIN}: ${BEFORE} -> ${AFTER} bytes ($((BEFORE - AFTER)) saved)"
-ls -l "${BIN}"
+# rationale. Stripping is applied to both shipped binaries: the
+# daemon (`symbolon`) and the client helper
+# (`git-credential-symbolon`).
+for name in symbolon git-credential-symbolon; do
+	BIN="target/${TARGET}/release/${name}"
+	BEFORE="$(stat -c%s "${BIN}")"
+	strip --strip-debug \
+		--remove-section=.eh_frame \
+		--remove-section=.eh_frame_hdr \
+		--remove-section=.gcc_except_table \
+		"${BIN}"
+	AFTER="$(stat -c%s "${BIN}")"
+	echo "Stripped ${BIN}: ${BEFORE} -> ${AFTER} bytes ($((BEFORE - AFTER)) saved)"
+	ls -l "${BIN}"
+done

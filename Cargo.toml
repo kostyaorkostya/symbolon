@@ -39,6 +39,14 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = { version = "0.10", features = ["oid"] }
 signal-hook-registry = "1.4.8"
+snow = { version = "0.10", default-features = false, features = [
+  "default-resolver",
+  "use-chacha20poly1305",
+  "use-blake2",
+  "use-curve25519",
+  "use-getrandom",
+  "std",
+] }
 synchrony = { version = "0.1.8", features = ["async_flag", "event"] }
 thin-cell = "0.2.1"
 thiserror = "2.0.18"
@@ -75,3 +83,11 @@ strip = "symbols"
 
 [dev-dependencies]
 wiremock = "0.6.5"
+
+[[bin]]
+name = "symbolon"
+path = "src/main.rs"
+
+[[bin]]
+name = "git-credential-symbolon"
+path = "src/bin/git_credential_symbolon.rs"

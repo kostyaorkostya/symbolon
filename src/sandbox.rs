@@ -1,23 +1,14 @@
 //! Linux sandboxing layer: applies landlock (FS + TCP + abstract-UDS
 //! scope at ABI 6) and a seccomp-BPF filter that **denies** every
 //! PID-targeted signal syscall (`kill` / `tkill` / `tgkill` /
-//! `rt_sigqueueinfo` / `rt_tgsigqueueinfo`) and **constrains**
-//! `pidfd_send_signal` to `SIGHUP`. `pidfd_open` is allowed (any
-//! args) because `StunnelController` opens a fresh pidfd per
-//! enroll/revoke as stunnel's PID changes over restarts.
+//! `rt_sigqueueinfo` / `rt_tgsigqueueinfo` / `pidfd_send_signal`).
 //!
-//! Why the tightening matters: signal-sending syscalls' first arg
-//! is a `pid_t` that BPF cannot bind to a runtime value (stunnel's
-//! PID is dynamic). Moving SIGHUP delivery to `pidfd_send_signal`
-//! lets us delete the broad sig-arg-only filter and replace it
-//! with: "pidfd_send_signal allowed iff sig==SIGHUP, everything
-//! else EPERM." Knowing PIDs to target would require `/proc`
-//! enumeration, which landlock blocks; the residual capability is
-//! a SIGHUP to whichever pid lives in the stunnel pidfile.
-//!
-//! The seccomp filter substitutes for landlock's `Scope::Signal`, which
-//! cannot be enabled here: stunnel lives in a separate process tree
-//! and the broker must keep being able to SIGHUP it on enroll/revoke.
+//! Symbolon never signals other processes — the prior stunnel
+//! SIGHUP path was deleted along with stunnel itself (Noise NNpsk0
+//! is terminated in-process now). The complete signal-syscall deny
+//! is what `landlock::Scope::Signal` would give us if it could be
+//! enabled without breaking the SIGHUP-to-clients.json-reload path
+//! we still rely on; seccompfilter is the lever we have.
 //!
 //! Landlock is intentionally NOT given any rule for `/etc/symbolon/`,
 //! so the App PEM key (read once at startup before this module runs) is
@@ -34,14 +25,13 @@ use landlock::{
     Scope,
 };
 use seccompiler::{
-    BackendError, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
-    SeccompFilter, SeccompRule, TargetArch,
+    BackendError, BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch,
 };
 
 use crate::config::SandboxMode;
 
-/// Filesystem paths the daemon needs after restriction. Anything not
-/// listed here becomes unreachable.
+/// Filesystem paths and TCP ports the daemon needs after restriction.
+/// Anything not listed here becomes unreachable.
 pub(crate) struct SandboxPaths {
     /// Files needing `ReadFile` only.
     pub read_files: Vec<PathBuf>,
@@ -54,6 +44,12 @@ pub(crate) struct SandboxPaths {
     /// access bits to support the tempfile-create + fsync + rename +
     /// fsync-parent sequence in `src/admin.rs::atomic_write`.
     pub write_parent_dirs: Vec<PathBuf>,
+    /// TCP ports the daemon must be allowed to `bind` on after the
+    /// sandbox is applied. Empty by default; the listen-side TCP
+    /// port is bound before the sandbox closes, but post-sandbox
+    /// `bind` (e.g. for the admin loop's accepted streams' kernel
+    /// bookkeeping) needs an explicit rule on some kernels.
+    pub bind_tcp_ports: Vec<u16>,
 }
 
 /// What `apply` actually managed to put in place. Reported back so the
@@ -216,6 +212,11 @@ fn apply_landlock(
     created = created
         .add_rule(NetPort::new(443, AccessNet::ConnectTcp))
         .map_err(SandboxError::Ruleset)?;
+    for &port in &paths.bind_tcp_ports {
+        created = created
+            .add_rule(NetPort::new(port, AccessNet::BindTcp))
+            .map_err(SandboxError::Ruleset)?;
+    }
 
     let status = created.restrict_self().map_err(SandboxError::Restrict)?;
     let status_str = match status.ruleset {
@@ -258,30 +259,21 @@ fn build_signal_filter(arch: TargetArch) -> Result<SeccompFilter, SandboxError> 
     let mut rules: std::collections::BTreeMap<i64, Vec<SeccompRule>> =
         std::collections::BTreeMap::new();
 
-    // Unconditional deny. The daemon never calls these — SIGHUP to
-    // stunnel goes through `pidfd_send_signal` (see
-    // `src/stunnel.rs`). An empty rule chain matches every call,
-    // routing it to `match_action = EPERM`.
+    // Unconditional deny. The daemon never calls any of these — and
+    // since the stunnel SIGHUP path is gone (Noise terminated
+    // in-process), there is no legitimate sender of signals to other
+    // processes. An empty rule chain matches every call, routing it
+    // to `match_action = EPERM`.
     for nr in [
         libc::SYS_kill,
         libc::SYS_tkill,
         libc::SYS_tgkill,
         libc::SYS_rt_sigqueueinfo,
         libc::SYS_rt_tgsigqueueinfo,
+        libc::SYS_pidfd_send_signal,
     ] {
         rules.insert(nr, Vec::new());
     }
-
-    // Conditional allow: `pidfd_send_signal(pidfd, sig, ...)` is
-    // EPERM'd unless sig == SIGHUP. `pidfd_open` is not listed at
-    // all, so it falls through `mismatch_action = Allow` (needed
-    // because stunnel's PID is dynamic across restarts).
-    let sighup = libc::SIGHUP as u64;
-    let cond = SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, sighup)
-        .map_err(|e| SandboxError::SeccompBuild(seccompiler::Error::Backend(e)))?;
-    let rule = SeccompRule::new(vec![cond])
-        .map_err(|e| SandboxError::SeccompBuild(seccompiler::Error::Backend(e)))?;
-    rules.insert(libc::SYS_pidfd_send_signal, vec![rule]);
 
     SeccompFilter::new(
         rules,
@@ -317,6 +309,7 @@ mod tests {
             read_dirs: vec![],
             resolv_files: vec![],
             write_parent_dirs: write_dirs,
+            bind_tcp_ports: vec![],
         }
     }
 
@@ -370,11 +363,11 @@ mod tests {
 
     #[test]
     fn seccomp_blocks_kill_even_with_sighup() {
-        // After the Q3 tightening, SYS_kill is denied unconditionally
-        // — even kill(getpid(), SIGHUP). The legitimate SIGHUP path
-        // goes through pidfd_send_signal in src/stunnel.rs. This test
-        // asserts that the legacy kill(2) entry-point is fully
-        // closed.
+        // SYS_kill is denied unconditionally. Symbolon no longer
+        // sends signals to any other process (the prior stunnel
+        // SIGHUP path was removed when Noise replaced stunnel).
+        // This test asserts that the legacy kill(2) entry-point is
+        // fully closed.
         let blocked = run_isolated(|| {
             let paths = make_paths(vec![], vec![]);
             let _ = apply(SandboxMode::BestEffort, &paths).expect("sandbox apply");
@@ -433,6 +426,7 @@ mod tests {
                 read_dirs: vec![],
                 resolv_files: vec![PathBuf::from("/definitely/does/not/exist/symbolon-test")],
                 write_parent_dirs: vec![],
+                bind_tcp_ports: vec![],
             };
             // Should not error on the missing resolv file.
             let _ = apply(SandboxMode::BestEffort, &paths).expect("apply with missing resolv ok");

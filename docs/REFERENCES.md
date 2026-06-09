@@ -11,7 +11,9 @@ the URL changes here, not in 5 different files.
 
 ## Protocols
 
-- [PROXY protocol v2](https://www.haproxy.org/download/2.4/doc/proxy-protocol.txt)
+- [Noise Protocol Framework, revision 34](https://noiseprotocol.org/noise_rev34.html)
+  — the cryptographic protocol family `symbolon` uses for its
+  client-server transport (pattern `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s`).
 - [git-credential](https://git-scm.com/docs/git-credential) — the helper
   invocation interface.
 - [gitcredentials(7)](https://git-scm.com/docs/gitcredentials) — config
@@ -20,16 +22,15 @@ the URL changes here, not in 5 different files.
 ## RFCs
 
 - [JWT (RFC 7519)](https://www.rfc-editor.org/rfc/rfc7519)
-- [TLS-PSK (RFC 4279)](https://www.rfc-editor.org/rfc/rfc4279)
 
 ## Tools
 
 - [compio](https://docs.rs/compio/) — async runtime.
 - [cyper](https://docs.rs/cyper/) — HTTPS client on compio.
-- [jsonwebtoken](https://docs.rs/jsonwebtoken/) — RS256 signing.
-- [stunnel](https://www.stunnel.org/docs.html) — TLS-PSK terminator.
-- [libvirt firewall (clean-traffic etc.)](https://libvirt.org/firewall.html)
-  — upstream IP attestation mechanism this design assumes.
+- [snow](https://github.com/mcginty/snow) — pure-Rust Noise Protocol
+  implementation; drives the transport in `src/transport.rs`.
+- [rsa](https://docs.rs/rsa/) — RSASSA-PKCS1-v1_5 RS256 signing for
+  the GitHub App JWT.
 
 ## Build & reproducibility
 

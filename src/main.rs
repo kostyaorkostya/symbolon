@@ -53,6 +53,16 @@ async fn run_daemon(config_path: PathBuf) -> ExitCode {
     };
     gcb::setup_tracing(cfg.logging.level);
 
+    // Belt-and-suspenders anti-swap hardening. Called BEFORE
+    // Service::prepare so the PEM key load + CpuWorker stack
+    // allocation both fault into locked pages. Primary defence
+    // is operator-disabled swap on the broker host — see
+    // docs/INSTALL.md. Required-mode failure is fatal.
+    if let Err(e) = gcb::mlock_apply(cfg.security.mlock) {
+        tracing::error!(evt = "mlock_required_failed", error = %e);
+        return ExitCode::from(1);
+    }
+
     let shutdown = compio::runtime::CancelToken::new();
     let shutdown_watcher = match gcb::spawn_shutdown_watcher(shutdown.clone()) {
         Ok(h) => h,

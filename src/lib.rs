@@ -27,6 +27,7 @@ pub(crate) mod daemon;
 pub(crate) mod git_credential;
 pub(crate) mod loader;
 pub(crate) mod logging;
+pub(crate) mod mlock;
 pub(crate) mod providers;
 pub(crate) mod proxy_protocol;
 pub(crate) mod ready;
@@ -44,8 +45,8 @@ pub(crate) mod stunnel;
 pub use crate::admin::{CliCommand, cli_dispatch};
 #[doc(hidden)]
 pub use crate::config::{
-    AdminConfig, ClientsConfig, Config, ListenConfig, LogLevel, LoggingConfig, ProviderGithub,
-    Providers, RuntimeConfig, SandboxMode, SecurityConfig, StunnelConfig,
+    AdminConfig, ClientsConfig, Config, ListenConfig, LogLevel, LoggingConfig, MlockMode,
+    ProviderGithub, Providers, RuntimeConfig, SandboxMode, SecurityConfig, StunnelConfig,
 };
 #[doc(hidden)]
 pub use crate::cpu_worker::CpuWorker;
@@ -55,6 +56,8 @@ pub use crate::daemon::{Service, ServiceHandle, run as run_daemon};
 pub use crate::loader::load_config;
 #[doc(hidden)]
 pub use crate::logging::setup_tracing;
+#[doc(hidden)]
+pub use crate::mlock::{MlockRequiredFailed, apply as mlock_apply};
 #[doc(hidden)]
 pub use crate::providers::github::{GitHubProvider, GithubError};
 #[doc(hidden)]

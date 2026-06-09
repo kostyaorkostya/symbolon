@@ -309,9 +309,25 @@ Type=notify
 ExecStart=/usr/local/bin/gcb daemon
 User=gcb
 Group=gcb
+# Required for `[security] mlock = "best_effort"` (the default).
+# Without it, mlockall fails with EAGAIN under the per-user
+# 64 KB default ulimit; daemon logs `evt=mlock status=skipped`
+# and continues without anti-swap hardening.
+LimitMEMLOCK=infinity
 
 [Install]
 WantedBy=multi-user.target
+```
+
+**Primary anti-swap defence: disable swap on the broker host.**
+This is industry standard for daemons holding long-lived
+secrets (nginx, haproxy, envoy all assume it). `gcb`'s
+`[security] mlock` is belt-and-suspenders on top of swap-disable,
+not a substitute. To disable swap:
+
+```sh
+sudo swapoff -a
+# Comment out swap entries in /etc/fstab so it stays off across reboots.
 ```
 
 `Type=notify` makes systemd wait for the daemon's `sd_notify(READY=1)`

@@ -15,8 +15,8 @@ use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use compio::net::UnixStream;
 use gcb::{
     AdminConfig, ClientsConfig, Config, CpuWorker, GitHubProvider, ListenConfig, LogLevel,
-    LoggingConfig, ProviderGithub, Providers, RuntimeConfig, SandboxMode, SecurityConfig,
-    StunnelConfig,
+    LoggingConfig, MlockMode, ProviderGithub, Providers, RuntimeConfig, SandboxMode,
+    SecurityConfig, StunnelConfig,
 };
 use serde_json::Value;
 use wiremock::matchers::{method, path as wm_path};
@@ -153,6 +153,7 @@ pub fn build_config(socket_path: PathBuf, clients_path: PathBuf, api_base: Strin
         security: SecurityConfig {
             sandbox: SandboxMode::Off,
             extra_read_dirs: vec![],
+            mlock: MlockMode::Off,
         },
         runtime: RuntimeConfig::default(),
         provider: Providers {
@@ -191,6 +192,7 @@ pub fn build_full_config(paths: &TempPaths, api_base: String) -> Config {
         security: SecurityConfig {
             sandbox: SandboxMode::Off,
             extra_read_dirs: vec![],
+            mlock: MlockMode::Off,
         },
         runtime: RuntimeConfig::default(),
         provider: Providers {

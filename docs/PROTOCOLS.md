@@ -42,6 +42,18 @@ sandbox = "best_effort"
 # default ruleset already includes /etc/ssl/certs; RHEL/Fedora hosts
 # typically also need /etc/pki/tls/certs for OpenSSL CA roots.
 extra_read_dirs = []
+# mlockall(MCL_CURRENT|MCL_FUTURE|MCL_ONFAULT) policy at startup.
+# Belt-and-suspenders against secret exfiltration via swap; the
+# primary defence is disabling swap on the broker host (see
+# docs/INSTALL.md).
+#
+#   required    – call mlockall; exit 1 on failure (e.g. RLIMIT_MEMLOCK too small).
+#   best_effort – default. Try; on failure log `evt=mlock status=skipped` and continue.
+#   off         – skip the syscall.
+#
+# Requires `LimitMEMLOCK=infinity` in the systemd unit (or
+# CAP_IPC_LOCK) for the syscall to succeed under a non-root user.
+mlock = "best_effort"
 
 [runtime]
 # Optional pidfile. When set, the daemon writes its PID here once
@@ -423,6 +435,8 @@ top-level keys.
 | `stunnel_sighup_failed` | `error` — emitted at `warn` lvl when `StunnelController::sighup` fails after an enroll/revoke rewrote `gcb.psk`. The state mutation is NOT rolled back; operator notices via `gcb status` or stunnel logs |
 | `drain_incomplete` | `inflight_drained`, `drain_ms` — emitted at `warn` lvl when the per-connection drain deadline elapses with handlers still in flight at shutdown |
 | `signal_registration_failed` | `signal`, `error` — emitted at `error` lvl by `main` when `signal-hook-registry::register` fails at startup. Treated as fatal (exit 1) — without it the daemon cannot honour SIGTERM/SIGINT/SIGHUP |
+| `mlock` | `status` (`applied` \| `skipped` \| `failed` \| `off`), `policy` (`required` \| `best_effort` \| `off`), `flags` (when applied) or `error` (when skipped/failed) — emitted once at startup by `main::run_daemon` after `setup_tracing`. `required` failure surfaces as the separate `mlock_required_failed` error event before exit |
+| `mlock_required_failed` | `error` — emitted at `error` lvl by `main` when `[security] mlock = "required"` and `mlockall` failed. Fatal (exit 1); operator should add `LimitMEMLOCK=infinity` to the systemd unit |
 | `admin_request` | `req_id`, `op` — emitted by the admin loop at entry of each request. The `req_id` (ULID) ties downstream `provider_call` / `mint` / `selfcheck` events back to this admin invocation |
 | `provider_call` | `req_id`, `out_req_id`, `endpoint` (`resolve_repo_id` \| `mint_token` \| `selfcheck`), `provider`, `timeout_ms` — emitted before each outbound HTTPS call |
 | `provider_call_done` | `req_id`, `out_req_id`, `status` (HTTP status code, 0 if no response), `gh_req_id` (X-GitHub-Request-Id, empty if absent), `elapsed_ms`, optional `error` — emitted after each outbound HTTPS call |

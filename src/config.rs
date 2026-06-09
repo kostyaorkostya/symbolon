@@ -113,6 +113,11 @@ pub struct SecurityConfig {
     /// roots.
     #[serde(default)]
     pub extra_read_dirs: Vec<PathBuf>,
+    /// `mlockall` policy at startup. See `MlockMode` for semantics.
+    /// Belt-and-suspenders on top of the primary defence (disable
+    /// swap on the broker host — see docs/INSTALL.md).
+    #[serde(default)]
+    pub mlock: MlockMode,
 }
 
 /// Sandbox enforcement policy, controlling landlock + seccomp.
@@ -125,6 +130,25 @@ pub enum SandboxMode {
     #[default]
     BestEffort,
     /// Skip sandboxing entirely. Not recommended; useful in tests.
+    Off,
+}
+
+/// `mlockall` policy at daemon startup. We call
+/// `mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)` so the App
+/// private key and in-flight tokens never reach swap. Needs
+/// `LimitMEMLOCK=infinity` in the systemd unit (or
+/// CAP_IPC_LOCK) — see docs/INSTALL.md.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MlockMode {
+    /// Call mlockall; exit 1 if it fails.
+    Required,
+    /// Call mlockall; on failure log `evt=mlock status=skipped`
+    /// and continue. Zero-config friendly default.
+    #[default]
+    BestEffort,
+    /// Don't call mlockall. For containers/CI where the syscall
+    /// would noisily fail and the operator doesn't want it.
     Off,
 }
 

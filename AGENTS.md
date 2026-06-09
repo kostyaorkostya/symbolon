@@ -157,13 +157,19 @@ Pinned in `Cargo.toml`:
   TLS so a keep-alive connection from a preceding resolve call is
   reused for the follow-up mint without a fresh handshake. The
   crypto provider (`ring`) is enabled via the `compio` dep above.)
-- `rsa` + `sha2` (with `oid` feature) + `base64` — the trio
-  underneath `src/providers/jwt_rs256.rs`, our minimal RS256
-  signer. Replaces `jsonwebtoken`, whose monolithic `Algorithm`
-  enum kept ed25519-dalek / curve25519-dalek / p256 / p384 / hmac
-  in the binary even though we only call RS256; the linker can't
-  prove the unused enum arms unreachable. Byte-equivalence with
-  the prior jsonwebtoken output is pinned by
+- `rsa` with `default-features = false, features = ["pem", "std",
+  "u64_digit"]` + `sha2` (with `oid` feature) + `base64` — the
+  trio underneath `src/providers/jwt_rs256.rs`, our minimal RS256
+  signer. The explicit rsa feature list matches its current
+  defaults but is spelled out so future contributors see the
+  audit: `pem` for PKCS#8 / PKCS#1 parsing, `std` for the
+  digest/signature trait `std` glue, `u64_digit` for the 64-bit
+  num-bigint backend (~2× faster RSA-2048 sign on x86_64/aarch64).
+  Replaces `jsonwebtoken`, whose monolithic `Algorithm` enum kept
+  ed25519-dalek / curve25519-dalek / p256 / p384 / hmac in the
+  binary even though we only call RS256; the linker can't prove
+  the unused enum arms unreachable. Byte-equivalence with the
+  prior jsonwebtoken output is pinned by
   `tests::known_vector_matches_jsonwebtoken_baseline`. RSASSA-
   PKCS1-v1_5 with SHA-256 is one of the most thoroughly specified
   JOSE algorithms; the actual signing is a single `rsa::SigningKey`
@@ -176,8 +182,10 @@ Pinned in `Cargo.toml`:
   landlock cannot enable `Scope::Signal` because the daemon must keep
   SIGHUP-ing stunnel, which lives in a separate process tree.)
 - `libc` (raw syscall numbers and signal constants for the
-  `seccompiler` BPF filter; transitively required by landlock and
-  seccompiler anyway, so the explicit dep adds no surface.)
+  `seccompiler` BPF filter, plus the `mlockall(MCL_CURRENT |
+  MCL_FUTURE | MCL_ONFAULT)` call in `src/mlock.rs`. Transitively
+  required by landlock and seccompiler anyway, so the explicit
+  dep adds no surface.)
 - `sd-notify` (pure-Rust `sd_notify(READY=1)` so `Type=notify`
   systemd units mark the service active when `src/ready.rs::notify`
   fires. No-op outside systemd. Daemon code never imports this —

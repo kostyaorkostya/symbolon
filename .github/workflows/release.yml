@@ -70,12 +70,10 @@ jobs:
           else
             CRATES_REMAP="--remap-path-prefix=${CARGO_REG_SRC}/="
           fi
-          # F2 size levers (all stable; revertable individually).
-          # See scripts/release-build.sh for per-flag rationale.
-          # `-Wl,--icf=safe` is NOT included: zigcc's linker-arg
-          # allowlist rejects --icf (rust-cross/cargo-zigbuild#162).
-          LLVM_PASSES="-C llvm-args=--enable-machine-outliner -C llvm-args=--enable-linkonceodr-outlining -C llvm-args=--enable-global-merge-func -C llvm-args=--inline-threshold=50"
-          export CARGO_BUILD_RUSTFLAGS="--remap-path-scope=all ${CRATES_REMAP} --remap-path-prefix=${HOME}/.rustup/toolchains/=tc/ --remap-path-prefix=${GITHUB_WORKSPACE}/=./ ${LLVM_PASSES}"
+          # No LLVM-args size levers — tried + reverted; gains
+          # were small and the flag-name churn between LLVM
+          # versions adds operational cost. See scripts/release-build.sh.
+          export CARGO_BUILD_RUSTFLAGS="--remap-path-scope=all ${CRATES_REMAP} --remap-path-prefix=${HOME}/.rustup/toolchains/=tc/ --remap-path-prefix=${GITHUB_WORKSPACE}/=./"
           cargo zigbuild --release --locked --target ${{ matrix.target }}
       # Drop stack-unwind tables. `panic = "abort"` in the release
       # profile means we never unwind, but rustc still emits

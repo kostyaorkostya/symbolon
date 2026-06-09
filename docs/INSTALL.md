@@ -314,6 +314,13 @@ Group=gcb
 # 64 KB default ulimit; daemon logs `evt=mlock status=skipped`
 # and continues without anti-swap hardening.
 LimitMEMLOCK=infinity
+# Suppress coredumps so the App private key, in-flight JWTs, and
+# freshly-minted installation tokens can't leak via core files in
+# /var/lib/systemd/coredump/ after a process crash. Complements
+# LimitMEMLOCK=infinity above on the secrets-don't-touch-disk
+# axis: that one prevents pages reaching swap, this one prevents
+# them reaching dump files.
+LimitCORE=0
 
 [Install]
 WantedBy=multi-user.target

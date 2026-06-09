@@ -115,6 +115,14 @@ accessible to the App.
     exact rule.
 13. **Logging: structured JSON to stdout** (warn/error to stderr).
     The operator routes from there.
+14. **Secrets stay off disk.** In-process defence:
+    `mlockall(MCL_CURRENT|MCL_FUTURE|MCL_ONFAULT)` at startup
+    (`src/mlock.rs`) prevents pages reaching swap; controlled
+    by `[security] mlock = required | best_effort (default) |
+    off`. Operator-side complements (per docs/INSTALL.md):
+    disable swap on the broker host, and set `LimitCORE=0` in
+    the systemd unit so coredumps can't leak page contents
+    via dump files.
 
 ## Hard NOTs
 

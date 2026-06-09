@@ -14,7 +14,7 @@
 //!
 //! State writes are atomic per PROTOCOLS.md § "Atomic writes":
 //! tempfile → fsync → rename → fsync parent. `clients.json` lands
-//! with mode `0o640`, `gcb.psk` with `0o600`. After every `gcb.psk`
+//! with mode `0o640`, `symbolon.psk` with `0o600`. After every `symbolon.psk`
 //! write the daemon sends `SIGHUP` to stunnel via
 //! [`rustix::process::kill_process`].
 
@@ -366,7 +366,7 @@ async fn handle_enroll(
         .map_err(|e| error_response("internal", &format!("rng: {e}")))?;
     let psk_hex = hex_encode(&key_bytes);
 
-    // Update gcb.psk: read existing, append new line, atomic write.
+    // Update symbolon.psk: read existing, append new line, atomic write.
     let mut psk_entries = read_psk_file(&state.psk_file_path)
         .await
         .map_err(|e| error_response("internal", &e))?;
@@ -410,7 +410,7 @@ async fn handle_enroll(
     );
 
     // SIGHUP stunnel. A failure here is logged but does NOT undo the
-    // enroll — operator notices via `gcb status` or stunnel logs.
+    // enroll — operator notices via `symbolon status` or stunnel logs.
     if let Err(e) = state.stunnel.sighup().await {
         warn!(evt = "stunnel_sighup_failed", error = %e);
     }
@@ -466,7 +466,7 @@ async fn handle_revoke(
         .await
         .map_err(|e| error_response("internal", &format!("write clients.json: {e}")))?;
 
-    // Rewrite gcb.psk without the matching identity.
+    // Rewrite symbolon.psk without the matching identity.
     let mut psk_entries = read_psk_file(&state.psk_file_path)
         .await
         .map_err(|e| error_response("internal", &e))?;
@@ -609,7 +609,7 @@ pub async fn cli_dispatch(socket_path: &Path, command: CliCommand) -> Result<i32
             .get("error")
             .and_then(|s| s.as_str())
             .unwrap_or("(no error message)");
-        eprintln!("gcb: error: {msg}");
+        eprintln!("symbolon: error: {msg}");
         return Ok(1);
     }
 
@@ -678,15 +678,15 @@ fn print_success(command: &CliCommand, response: &serde_json::Value) {
             println!();
             println!("# Paste-ready snippet for the client VM:");
             println!("#");
-            println!("# /etc/stunnel/gcb-client.conf");
-            println!("[gcb]");
+            println!("# /etc/stunnel/symbolon-client.conf");
+            println!("[symbolon]");
             println!("client = yes");
             println!("accept = 127.0.0.1:9418");
             println!("connect = <broker-host>:9418");
-            println!("PSKsecrets = /etc/stunnel/gcb-client.psk");
+            println!("PSKsecrets = /etc/stunnel/symbolon-client.psk");
             println!("ciphers = PSK");
             println!();
-            println!("# /etc/stunnel/gcb-client.psk (mode 0600)");
+            println!("# /etc/stunnel/symbolon-client.psk (mode 0600)");
             println!("{client}:{psk_hex}");
         }
         CliCommand::GithubRevoke { client } => {
@@ -1012,7 +1012,7 @@ mod tests {
 
     #[compio::test]
     async fn atomic_write_round_trip_with_mode() {
-        let dir = std::env::temp_dir().join(format!("gcb-aw-{}", ulid::Ulid::new()));
+        let dir = std::env::temp_dir().join(format!("symbolon-aw-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.bin");
         atomic_write(&path, b"hello\n".to_vec(), 0o600)
@@ -1038,9 +1038,9 @@ mod tests {
         ];
         let rendered = render_psk_file(&entries);
         assert_eq!(rendered, "vm-1:a1b2\nvm-2:ccdd\n");
-        let dir = std::env::temp_dir().join(format!("gcb-psk-{}", ulid::Ulid::new()));
+        let dir = std::env::temp_dir().join(format!("symbolon-psk-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("gcb.psk");
+        let path = dir.join("symbolon.psk");
         atomic_write(&path, rendered.into_bytes(), 0o600)
             .await
             .unwrap();
@@ -1051,7 +1051,7 @@ mod tests {
 
     #[compio::test]
     async fn read_psk_file_missing_returns_empty() {
-        let path = std::env::temp_dir().join(format!("gcb-nope-{}", ulid::Ulid::new()));
+        let path = std::env::temp_dir().join(format!("symbolon-nope-{}", ulid::Ulid::new()));
         assert!(read_psk_file(&path).await.unwrap().is_empty());
     }
 

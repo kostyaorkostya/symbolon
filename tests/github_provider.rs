@@ -8,8 +8,8 @@ mod common;
 
 use std::time::UNIX_EPOCH;
 
-use gcb::GithubError;
 use serde_json::json;
+use symbolon::GithubError;
 use wiremock::matchers::{body_bytes, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -83,7 +83,7 @@ async fn mint_request_headers_and_body_exact() {
         .and(path(mint_path()))
         .and(header("Accept", "application/vnd.github+json"))
         .and(header("X-GitHub-Api-Version", "2022-11-28"))
-        .and(header("User-Agent", "gcb"))
+        .and(header("User-Agent", "symbolon"))
         .and(header("Content-Type", "application/json"))
         // X-Request-ID is a per-call ULID; just assert presence
         // (per-call value is non-deterministic).

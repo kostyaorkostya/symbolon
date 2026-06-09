@@ -20,7 +20,7 @@ async fn daemon_happy_path() {
     let cfg = build_config(socket_path.clone(), clients_path.clone(), server.uri());
 
     compio::runtime::spawn(async move {
-        let _ = gcb::run_daemon(&cfg, std::path::Path::new("/test/config.toml")).await;
+        let _ = symbolon::run_daemon(&cfg, std::path::Path::new("/test/config.toml")).await;
     })
     .detach();
     wait_for_socket(&socket_path).await;
@@ -49,7 +49,7 @@ async fn daemon_rejects_unknown_client_ip() {
     let cfg = build_config(socket_path.clone(), clients_path.clone(), server.uri());
 
     compio::runtime::spawn(async move {
-        let _ = gcb::run_daemon(&cfg, std::path::Path::new("/test/config.toml")).await;
+        let _ = symbolon::run_daemon(&cfg, std::path::Path::new("/test/config.toml")).await;
     })
     .detach();
     wait_for_socket(&socket_path).await;
@@ -73,7 +73,7 @@ async fn daemon_rejects_unknown_host() {
     let cfg = build_config(socket_path.clone(), clients_path.clone(), server.uri());
 
     compio::runtime::spawn(async move {
-        let _ = gcb::run_daemon(&cfg, std::path::Path::new("/test/config.toml")).await;
+        let _ = symbolon::run_daemon(&cfg, std::path::Path::new("/test/config.toml")).await;
     })
     .detach();
     wait_for_socket(&socket_path).await;
@@ -95,7 +95,7 @@ async fn daemon_rejects_malformed_request() {
     let cfg = build_config(socket_path.clone(), clients_path.clone(), server.uri());
 
     compio::runtime::spawn(async move {
-        let _ = gcb::run_daemon(&cfg, std::path::Path::new("/test/config.toml")).await;
+        let _ = symbolon::run_daemon(&cfg, std::path::Path::new("/test/config.toml")).await;
     })
     .detach();
     wait_for_socket(&socket_path).await;
@@ -121,7 +121,7 @@ async fn daemon_rejects_cr_in_host_value() {
     let cfg = build_config(socket_path.clone(), clients_path.clone(), server.uri());
 
     compio::runtime::spawn(async move {
-        let _ = gcb::run_daemon(&cfg, std::path::Path::new("/test/config.toml")).await;
+        let _ = symbolon::run_daemon(&cfg, std::path::Path::new("/test/config.toml")).await;
     })
     .detach();
     wait_for_socket(&socket_path).await;

@@ -206,7 +206,7 @@ impl Service {
         // There is a microsecond-scale race between bind(2) and
         // chmod() where the socket inode briefly carries umask-
         // default perms. Per INSTALL.md the parent directories
-        // (/run/gcb, /etc/gcb) are 0o750 owned by group `gcb`, so a
+        // (/run/symbolon, /etc/symbolon) are 0o750 owned by group `symbolon`, so a
         // world-mode socket inside them is still unreachable from
         // outside that group — the race has no observer in our
         // deployment. A process-wide umask(0o077) would close even
@@ -222,7 +222,7 @@ impl Service {
                     path: listen_path.clone(),
                     source,
                 })?;
-        // 0660: stunnel (running as group `gcb` per INSTALL.md) needs
+        // 0660: stunnel (running as group `symbolon` per INSTALL.md) needs
         // write access to forward into us. World access is removed so
         // a loose parent-dir ACL alone cannot expose the listen socket.
         chmod_socket(listen_path, 0o660)?;
@@ -246,7 +246,8 @@ impl Service {
         // Post-sandbox: spawn the shared CPU worker (its OS thread
         // inherits the seccomp filter via clone(2) and the landlock
         // ruleset via TGID-wide application).
-        let cpu_worker = Rc::new(CpuWorker::new("gcb-cpu-worker").map_err(DaemonError::CpuWorker)?);
+        let cpu_worker =
+            Rc::new(CpuWorker::new("symbolon-cpu-worker").map_err(DaemonError::CpuWorker)?);
 
         // Post-sandbox: construct providers with pre-loaded keys.
         let mut providers: HashMap<String, GitHubProvider> = HashMap::new();
@@ -1018,7 +1019,8 @@ mod tests {
             },
         );
         // Write a new clients.json containing a different IP.
-        let path = std::env::temp_dir().join(format!("gcb-reload-test-{}.json", ulid::Ulid::new()));
+        let path =
+            std::env::temp_dir().join(format!("symbolon-reload-test-{}.json", ulid::Ulid::new()));
         std::fs::write(
             &path,
             r#"{"version":1,"clients":[{"name":"new","ip":"10.0.0.2","providers":["github"],"enrolled_at":"y","note":null}]}"#,

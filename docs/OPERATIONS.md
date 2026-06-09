@@ -1,4 +1,4 @@
-# Operating `gcb`
+# Operating `symbolon`
 
 Day-to-day operator reference. For a fresh deployment, see
 [INSTALL.md](INSTALL.md). For design rationale, see
@@ -7,20 +7,20 @@ Day-to-day operator reference. For a fresh deployment, see
 
 ## Commands
 
-All commands run on the broker host as the `gcb` user (or via
-`sudo -u gcb`).
+All commands run on the broker host as the `symbolon` user (or via
+`sudo -u symbolon`).
 
 ### Provider-agnostic
 
 ```
-gcb [--config /etc/gcb/config.toml]
+symbolon [--config /etc/symbolon/config.toml]
     Run the daemon. Default when invoked with no subcommand.
 
-gcb status
+symbolon status
     Print daemon health: uptime, last successful mint, last error,
     cached-repo-id count, configured providers.
 
-gcb list
+symbolon list
     Print all enrolled clients across providers, with the providers
     each is enrolled for and the enrollment timestamp.
 ```
@@ -28,12 +28,12 @@ gcb list
 ### GitHub provider
 
 ```
-gcb github enroll <client> --ip <ip> [--note <text>]
+symbolon github enroll <client> --ip <ip> [--note <text>]
     Generate a per-client PSK, append to stunnel's psk file and
     clients.json (both atomically), SIGHUP stunnel, and print a
     paste-ready provisioning snippet to stdout.
 
-gcb github revoke <client>
+symbolon github revoke <client>
     Remove the client's GitHub enrollment. If the client has no
     remaining provider enrollments, remove from clients.json and
     stunnel.psk entirely. SIGHUP stunnel.
@@ -41,13 +41,13 @@ gcb github revoke <client>
     NOTE: Outstanding tokens minted in the past hour are NOT
     revoked. They live out their full TTL.
 
-gcb github mint <client> <owner/repo>
+symbolon github mint <client> <owner/repo>
     Test path: run the full mint flow as if <client> requested a
     token for <owner/repo>. Prints token and expiry to stdout.
     Useful for verifying provider-side state without spinning up
     a client.
 
-gcb github selfcheck
+symbolon github selfcheck
     Verify the App private key parses, the App ID matches the JWT,
     api.github.com (or your GHES api_base) is reachable, and clock
     skew is bounded. Exits non-zero on any failed check.
@@ -61,14 +61,14 @@ catalog: [PROTOCOLS.md §"Logging schema"](PROTOCOLS.md#logging-schema).
 Useful one-liners:
 
 ```sh
-tail -f /var/log/gcb.log | jq -c .
+tail -f /var/log/symbolon.log | jq -c .
 
-jq -c 'select(.evt == "mint" and .client == "dev-vm-1")' < /var/log/gcb.log
+jq -c 'select(.evt == "mint" and .client == "dev-vm-1")' < /var/log/symbolon.log
 
 jq -c 'select(.evt == "mint_denied") | {timestamp, client, repo, reason}' \
-  < /var/log/gcb.log
+  < /var/log/symbolon.log
 
-jq -c 'select(.evt == "provider_error")' < /var/log/gcb.log | tail -100
+jq -c 'select(.evt == "provider_error")' < /var/log/symbolon.log | tail -100
 ```
 
 Hook into your log shipper as you would for any structured-JSON
@@ -99,7 +99,7 @@ landlock + seccomp.
 To verify the running process is actually sandboxed:
 
 ```sh
-PID=$(pgrep -f 'gcb$')
+PID=$(pgrep -f 'symbolon$')
 grep -E 'Seccomp|NoNewPrivs' /proc/$PID/status
 # Expect: Seccomp: 2  and  NoNewPrivs: 1
 ```
@@ -113,8 +113,8 @@ Walk the chain end to end.
 **1. Is the daemon running and healthy?**
 
 ```sh
-sudo -u gcb gcb status
-sudo -u gcb gcb github selfcheck
+sudo -u symbolon symbolon status
+sudo -u symbolon symbolon github selfcheck
 ```
 
 If `selfcheck` fails: the daemon can't reach the provider, the App
@@ -125,13 +125,13 @@ key is wrong, or clock skew is large. The output names which.
 ```sh
 rc-service stunnel status        # or `systemctl status stunnel`
 ss -tlnp | grep ':9418'          # stunnel should be listening here
-ls -l /run/gcb/daemon.sock       # owner gcb:gcb, mode 0660
+ls -l /run/symbolon/daemon.sock       # owner symbolon:symbolon, mode 0660
 ```
 
 If the socket is missing after a reboot: see [INSTALL.md §3.9](INSTALL.md)
 (`/run` is tmpfs, cleared at boot — `checkpath` / `tmpfiles.d` must
-recreate `/run/gcb`). If the socket exists but stunnel can't connect,
-verify `stunnel` is in the `gcb` group: `id stunnel`.
+recreate `/run/symbolon`). If the socket exists but stunnel can't connect,
+verify `stunnel` is in the `symbolon` group: `id stunnel`.
 
 **3. Can the client reach the broker over TLS-PSK?**
 
@@ -139,7 +139,7 @@ From the client:
 
 ```sh
 openssl s_client -tls1_2 -cipher PSK \
-  -psk_identity dev-vm-1 -psk "$(cat /etc/gcb/psk)" \
+  -psk_identity dev-vm-1 -psk "$(cat /etc/symbolon/psk)" \
   -connect broker.lan:9418 -quiet < /dev/null
 ```
 
@@ -152,7 +152,7 @@ If handshake fails: PSK mismatch, or network path blocked.
 From the broker:
 
 ```sh
-sudo -u gcb gcb github mint dev-vm-1 octocat/Spoon-Knife
+sudo -u symbolon symbolon github mint dev-vm-1 octocat/Spoon-Knife
 ```
 
 This bypasses the client transport and runs the mint logic directly.
@@ -161,7 +161,7 @@ If this fails, the issue is provider-side, not transport-side.
 **5. What does the daemon log say?**
 
 ```sh
-tail -f /var/log/gcb.log | jq -c .
+tail -f /var/log/symbolon.log | jq -c .
 ```
 
 Find the `req_id` of the failing request and trace it from `accept`
@@ -224,10 +224,10 @@ inside the daemon:
 **Known limitations:**
 - The seccomp filter does NOT pin the *target* PID — it only checks
   the signum. A compromised broker could still SIGHUP some other
-  process owned by the `gcb` UID. In typical deployments stunnel is
+  process owned by the `symbolon` UID. In typical deployments stunnel is
   the only such process, but operators co-locating daemons under
-  `gcb` should be aware.
-- The atomic-write directory grant on `/var/lib/gcb/` covers
+  `symbolon` should be aware.
+- The atomic-write directory grant on `/var/lib/symbolon/` covers
   everything in that directory. A post-compromise process could
   overwrite `clients.json` (which the daemon already self-rewrites).
   The PEM key is protected because it lives outside this dir.
@@ -252,7 +252,7 @@ attribution.
 
 If you suspect attribution drift, correlate stunnel's own logs
 (`/var/log/stunnel/stunnel.log` records PSK identities at debug
-levels) against `gcb`'s `accept`/`mint` events by timestamp.
+levels) against `symbolon`'s `accept`/`mint` events by timestamp.
 
 ## Hardening recommendations
 
@@ -321,7 +321,7 @@ upgraded.
 To revoke a single client:
 
 ```sh
-sudo -u gcb gcb github revoke <client>
+sudo -u symbolon symbolon github revoke <client>
 ```
 
 This removes the client's PSK entry from stunnel and removes the
@@ -338,7 +338,7 @@ hard cutoff:
 - If a compromise is suspected, regenerate the App private key on
   github.com (this revokes the App's ability to issue new tokens
   entirely; existing minted tokens still live out their TTL). Then
-  update `/etc/gcb/github-app.pem` on the broker and **restart the
+  update `/etc/symbolon/github-app.pem` on the broker and **restart the
   daemon**: the App key is loaded at startup and is not
   hot-reloadable.
 
@@ -352,14 +352,14 @@ To deploy a new release:
 ```sh
 VERSION=v0.2.0
 TARGET=x86_64-unknown-linux-musl
-BASE=https://github.com/<you>/gcb/releases/download/${VERSION}
-curl -fsSLO "${BASE}/gcb-${TARGET}"
-curl -fsSLO "${BASE}/gcb-${TARGET}.sha256"
-sha256sum -c "gcb-${TARGET}.sha256"
+BASE=https://github.com/<you>/symbolon/releases/download/${VERSION}
+curl -fsSLO "${BASE}/symbolon-${TARGET}"
+curl -fsSLO "${BASE}/symbolon-${TARGET}.sha256"
+sha256sum -c "symbolon-${TARGET}.sha256"
 
-install -o root -g root -m 0755 "gcb-${TARGET}" /usr/local/bin/gcb
-rc-service gcb restart
-sudo -u gcb gcb github selfcheck
+install -o root -g root -m 0755 "symbolon-${TARGET}" /usr/local/bin/symbolon
+rc-service symbolon restart
+sudo -u symbolon symbolon github selfcheck
 ```
 
 The daemon's shutdown is graceful: on SIGTERM it stops accepting
@@ -374,18 +374,18 @@ format changes will be called out there.
 
 What to back up:
 
-- `/etc/gcb/config.toml` — operator-authored.
-- `/var/lib/gcb/clients.json` — machine-authored; can be regenerated
+- `/etc/symbolon/config.toml` — operator-authored.
+- `/var/lib/symbolon/clients.json` — machine-authored; can be regenerated
   by re-enrolling but timestamps are useful for forensics.
-- `/etc/gcb/github-app.pem` — the App private key. Treat as a secret;
+- `/etc/symbolon/github-app.pem` — the App private key. Treat as a secret;
   back up to a place at least as protected as the broker itself.
-- `/etc/stunnel/gcb.psk` — per-client PSKs. Treat as a secret;
+- `/etc/stunnel/symbolon.psk` — per-client PSKs. Treat as a secret;
   back up to a place at least as protected as the broker itself.
   Restoring this alone is sufficient to keep existing clients
   working without re-enrolling.
 
 What NOT to back up:
 
-- Logs in `/var/log/gcb.log` — useful for forensics but not for
+- Logs in `/var/log/symbolon.log` — useful for forensics but not for
   recovery. Ship them off-host via your log pipeline if you want
   retention.

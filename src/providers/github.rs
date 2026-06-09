@@ -1194,10 +1194,10 @@ mod tests {
             private_key_path: fixture_pem_path(),
             selfcheck_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(10),
-            user_agent: "gcb".to_string(),
+            user_agent: "symbolon".to_string(),
         };
         let key = GitHubProvider::load_key(&cfg).await.unwrap();
-        let worker = Rc::new(CpuWorker::new("gcb-test-jwt").unwrap());
+        let worker = Rc::new(CpuWorker::new("symbolon-test-jwt").unwrap());
         let cancel = compio::runtime::CancelToken::new();
         let p = GitHubProvider::new(&cfg, key, worker, cancel).unwrap();
         assert_eq!(p.api_base, "https://api.github.com");

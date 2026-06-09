@@ -1,8 +1,9 @@
 [package]
-name = "gcb"
+name = "symbolon"
 version = "0.1.0"
 edition = "2024"
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
+description = "Daemon that mints short-lived, single-repository git credentials on demand."
 
 [dependencies]
 argh = { version = "0.1.19", default-features = false, features = ["help"] }

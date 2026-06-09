@@ -839,40 +839,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gcb"
-version = "0.1.0"
-dependencies = [
- "argh",
- "base64",
- "compio",
- "cyper",
- "futures-channel",
- "futures-util",
- "humantime-serde",
- "landlock",
- "libc",
- "percent-encoding",
- "rsa",
- "rustix",
- "sd-notify",
- "seccompiler",
- "serde",
- "serde_json",
- "sha2",
- "signal-hook-registry",
- "synchrony",
- "thin-cell",
- "thiserror",
- "time",
- "toml",
- "tracing",
- "tracing-subscriber",
- "ulid",
- "url",
- "wiremock",
-]
-
-[[package]]
 name = "generator"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2146,6 +2112,40 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "symbolon"
+version = "0.1.0"
+dependencies = [
+ "argh",
+ "base64",
+ "compio",
+ "cyper",
+ "futures-channel",
+ "futures-util",
+ "humantime-serde",
+ "landlock",
+ "libc",
+ "percent-encoding",
+ "rsa",
+ "rustix",
+ "sd-notify",
+ "seccompiler",
+ "serde",
+ "serde_json",
+ "sha2",
+ "signal-hook-registry",
+ "synchrony",
+ "thin-cell",
+ "thiserror",
+ "time",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "ulid",
+ "url",
+ "wiremock",
+]
 
 [[package]]
 name = "syn"

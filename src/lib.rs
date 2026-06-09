@@ -1,5 +1,10 @@
-//! `gcb` — a Rust daemon that mints short-lived, single-repository git
-//! credentials on demand.
+//! `symbolon` — a Rust daemon that mints short-lived, single-repository
+//! git credentials on demand.
+//!
+//! *symbolon* (σύμβολον): in Ancient Greek, an object broken in two
+//! halves; each party kept one, and matching them proved identity.
+//! Fits a daemon that authenticates clients by PSK and hands them
+//! short-lived, single-repository git credentials.
 //!
 //! Currently implements GitHub via GitHub App installation tokens. The
 //! broker holds the provider's private key on a trusted host and hands
@@ -12,7 +17,7 @@
 //!
 //! # Public surface
 //!
-//! `gcb` ships as a daemon binary, not as a library. The items
+//! `symbolon` ships as a daemon binary, not as a library. The items
 //! re-exported below are needed by `src/main.rs`, `tests/`, and
 //! `fuzz/fuzz_targets/`, which Cargo treats as separate crates and
 //! therefore cannot see `pub(crate)` items. They are marked

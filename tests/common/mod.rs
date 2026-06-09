@@ -13,12 +13,12 @@ use std::time::{Duration, SystemTime};
 use compio::BufResult;
 use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use compio::net::UnixStream;
-use gcb::{
+use serde_json::Value;
+use symbolon::{
     AdminConfig, ClientsConfig, Config, CpuWorker, GitHubProvider, ListenConfig, LogLevel,
     LoggingConfig, MlockMode, ProviderGithub, Providers, RuntimeConfig, SandboxMode,
     SecurityConfig, StunnelConfig,
 };
-use serde_json::Value;
 use wiremock::matchers::{method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -67,11 +67,11 @@ pub fn unique_paths_full() -> TempPaths {
     let pid = std::process::id();
     let t = std::env::temp_dir();
     TempPaths {
-        listen: t.join(format!("gcb-test-{pid}-{id}.sock")),
-        admin: t.join(format!("gcb-test-{pid}-{id}-admin.sock")),
-        clients: t.join(format!("gcb-test-{pid}-{id}-clients.json")),
-        psk: t.join(format!("gcb-test-{pid}-{id}-gcb.psk")),
-        pidfile: t.join(format!("gcb-test-{pid}-{id}-stunnel.pid")),
+        listen: t.join(format!("symbolon-test-{pid}-{id}.sock")),
+        admin: t.join(format!("symbolon-test-{pid}-{id}-admin.sock")),
+        clients: t.join(format!("symbolon-test-{pid}-{id}-clients.json")),
+        psk: t.join(format!("symbolon-test-{pid}-{id}-symbolon.psk")),
+        pidfile: t.join(format!("symbolon-test-{pid}-{id}-stunnel.pid")),
     }
 }
 
@@ -104,10 +104,10 @@ pub async fn build_provider(api_base: String) -> GitHubProvider {
         private_key_path: fixture_pem_path(),
         selfcheck_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(10),
-        user_agent: "gcb".to_string(),
+        user_agent: "symbolon".to_string(),
     };
     let key = GitHubProvider::load_key(&cfg).await.unwrap();
-    let worker = Rc::new(CpuWorker::new("gcb-test-jwt-signer").unwrap());
+    let worker = Rc::new(CpuWorker::new("symbolon-test-jwt-signer").unwrap());
     let cancel = compio::runtime::CancelToken::new();
     GitHubProvider::with_overrides(&cfg, key, worker, cancel, None, SystemTime::now).unwrap()
 }
@@ -140,12 +140,12 @@ pub fn build_config(socket_path: PathBuf, clients_path: PathBuf, api_base: Strin
             socket: socket_path,
         },
         admin: AdminConfig {
-            socket_path: t.join(format!("gcb-test-{pid}-{id}-admin.sock")),
+            socket_path: t.join(format!("symbolon-test-{pid}-{id}-admin.sock")),
         },
         clients: ClientsConfig { file: clients_path },
         stunnel: StunnelConfig {
-            psk_file: t.join(format!("gcb-test-{pid}-{id}-gcb.psk")),
-            pidfile: t.join(format!("gcb-test-{pid}-{id}-stunnel.pid")),
+            psk_file: t.join(format!("symbolon-test-{pid}-{id}-symbolon.psk")),
+            pidfile: t.join(format!("symbolon-test-{pid}-{id}-stunnel.pid")),
         },
         logging: LoggingConfig {
             level: LogLevel::Info,
@@ -165,7 +165,7 @@ pub fn build_config(socket_path: PathBuf, clients_path: PathBuf, api_base: Strin
                 private_key_path: fixture_pem_path(),
                 selfcheck_timeout: Duration::from_secs(5),
                 request_timeout: Duration::from_secs(10),
-                user_agent: "gcb".to_string(),
+                user_agent: "symbolon".to_string(),
             }),
         },
     }
@@ -204,7 +204,7 @@ pub fn build_full_config(paths: &TempPaths, api_base: String) -> Config {
                 private_key_path: fixture_pem_path(),
                 selfcheck_timeout: Duration::from_secs(5),
                 request_timeout: Duration::from_secs(10),
-                user_agent: "gcb".to_string(),
+                user_agent: "symbolon".to_string(),
             }),
         },
     }
@@ -291,7 +291,7 @@ pub async fn admin_request(admin_socket: &Path, request: Value) -> Value {
 pub async fn spawn_daemon(paths: &TempPaths, api_base: String) {
     let cfg = build_full_config(paths, api_base);
     compio::runtime::spawn(async move {
-        let _ = gcb::run_daemon(&cfg, std::path::Path::new("/test/config.toml")).await;
+        let _ = symbolon::run_daemon(&cfg, std::path::Path::new("/test/config.toml")).await;
     })
     .detach();
     wait_for_socket(&paths.admin).await;

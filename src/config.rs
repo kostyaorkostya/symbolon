@@ -191,7 +191,7 @@ pub struct ProviderGithub {
     #[serde(with = "humantime_serde", default = "default_request_timeout")]
     pub request_timeout: std::time::Duration,
     /// HTTP `User-Agent` sent to the provider API. GitHub rejects
-    /// requests without one (403). Default `"gcb"` — no version
+    /// requests without one (403). Default `"symbolon"` — no version
     /// number is appended, since leaking the patch level narrows
     /// the CVE list applicable to this binary. Operators can
     /// override to e.g. their org name.
@@ -204,7 +204,7 @@ fn default_request_timeout() -> std::time::Duration {
 }
 
 fn default_user_agent() -> String {
-    "gcb".to_string()
+    "symbolon".to_string()
 }
 
 /// Top-level parsed `clients.json`. Serialize side is used by
@@ -296,16 +296,16 @@ mod tests {
 
     const KNOWN_GOOD_CONFIG: &str = r#"
 [listen]
-socket = "/run/gcb/daemon.sock"
+socket = "/run/symbolon/daemon.sock"
 
 [admin]
-socket_path = "/run/gcb/admin.sock"
+socket_path = "/run/symbolon/admin.sock"
 
 [clients]
-file = "/var/lib/gcb/clients.json"
+file = "/var/lib/symbolon/clients.json"
 
 [stunnel]
-psk_file = "/etc/stunnel/gcb.psk"
+psk_file = "/etc/stunnel/symbolon.psk"
 pidfile = "/run/stunnel/stunnel.pid"
 
 [logging]
@@ -316,17 +316,29 @@ host = "github.com"
 api_base = "https://api.github.com"
 client_id = "Iv23liABCDEFGHIJklmn"
 installation_id = 789012
-private_key_path = "/etc/gcb/github-app.pem"
+private_key_path = "/etc/symbolon/github-app.pem"
 selfcheck_timeout = "5s"
 "#;
 
     #[test]
     fn config_known_good_round_trips() {
         let cfg: Config = toml::from_str(KNOWN_GOOD_CONFIG).unwrap();
-        assert_eq!(cfg.listen.socket, PathBuf::from("/run/gcb/daemon.sock"));
-        assert_eq!(cfg.admin.socket_path, PathBuf::from("/run/gcb/admin.sock"));
-        assert_eq!(cfg.clients.file, PathBuf::from("/var/lib/gcb/clients.json"));
-        assert_eq!(cfg.stunnel.psk_file, PathBuf::from("/etc/stunnel/gcb.psk"));
+        assert_eq!(
+            cfg.listen.socket,
+            PathBuf::from("/run/symbolon/daemon.sock")
+        );
+        assert_eq!(
+            cfg.admin.socket_path,
+            PathBuf::from("/run/symbolon/admin.sock")
+        );
+        assert_eq!(
+            cfg.clients.file,
+            PathBuf::from("/var/lib/symbolon/clients.json")
+        );
+        assert_eq!(
+            cfg.stunnel.psk_file,
+            PathBuf::from("/etc/stunnel/symbolon.psk")
+        );
         assert_eq!(
             cfg.stunnel.pidfile,
             PathBuf::from("/run/stunnel/stunnel.pid")
@@ -339,7 +351,7 @@ selfcheck_timeout = "5s"
         assert_eq!(gh.installation_id, 789_012);
         assert_eq!(
             gh.private_key_path,
-            PathBuf::from("/etc/gcb/github-app.pem")
+            PathBuf::from("/etc/symbolon/github-app.pem")
         );
     }
 
@@ -356,8 +368,8 @@ selfcheck_timeout = "5s"
     #[test]
     fn config_rejects_unknown_field_in_listen() {
         let src = KNOWN_GOOD_CONFIG.replace(
-            "[listen]\nsocket = \"/run/gcb/daemon.sock\"",
-            "[listen]\nsocket = \"/run/gcb/daemon.sock\"\nport = 1234",
+            "[listen]\nsocket = \"/run/symbolon/daemon.sock\"",
+            "[listen]\nsocket = \"/run/symbolon/daemon.sock\"\nport = 1234",
         );
         assert!(toml::from_str::<Config>(&src).is_err());
     }

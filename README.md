@@ -1,8 +1,13 @@
-# gcb — git credentials broker
+# Symbolon — git credentials broker
 
-**`gcb` keeps long-lived GitHub credentials off your dev VMs.** It holds
-the GitHub App private key on a trusted broker host and mints ≤1-hour,
-single-repository tokens to clients on demand.
+*Symbolon* (σύμβολον): in Ancient Greek, an object broken in two
+halves; each party kept one, and matching them proved identity. Fits
+a daemon that authenticates clients by PSK and hands them
+short-lived, single-repository git credentials.
+
+**Symbolon keeps long-lived GitHub credentials off your dev VMs.** It
+holds the GitHub App private key on a trusted broker host and mints
+≤1-hour, single-repository tokens to clients on demand.
 
 Currently supports GitHub (including GitHub Enterprise Server). Designed
 so additional providers (e.g. GitLab) can be added without disturbing
@@ -19,7 +24,7 @@ OAuth tokens are all "good for everything the user can do" — a client
 compromise leaks them and the attacker has account-wide access for as
 long as the credential lives.
 
-`gcb` holds the platform's privileged identity (e.g. a GitHub App's
+Symbolon holds the platform's privileged identity (e.g. a GitHub App's
 private key) on a trusted broker host and mints short-lived,
 repository-scoped tokens to clients on demand. A client compromise
 bounds the attacker to the broker's narrow per-mint scope for ≤1 hour
@@ -37,7 +42,8 @@ bounds the attacker to the broker's narrow per-mint scope for ≤1 hour
 │  git +       │                        │   forwards w/ PROXY v2)   │
 │  helper +    │                        │       │                   │
 │  openssl     │                        │       ▼                   │
-│              │                        │  gcb daemon (Unix socket) │
+│              │                        │  symbolon daemon          │
+│              │                        │   (Unix socket)           │
 │              │  ◄──── git creds ──────┤  parses git-credential,   │
 │              │                        │  dispatches to provider   │
 └──────────────┘                        │       │                   │
@@ -94,7 +100,7 @@ Full threat model and architectural decisions: see [AGENTS.md](./AGENTS.md).
 - **Hot-reload of provider private keys.** Restart the daemon to
   rotate keys.
 - **Real-time provider-side change detection.** Webhooks are not
-  consumed; `gcb github selfcheck` is the on-demand check.
+  consumed; `symbolon github selfcheck` is the on-demand check.
 - **Token persistence or caching.** Every token is freshly minted;
   none are stored anywhere.
 
@@ -102,10 +108,10 @@ Full threat model and architectural decisions: see [AGENTS.md](./AGENTS.md).
 
 1. **Create a GitHub App** (Contents R/W + Metadata R only) and install
    it on the repos you want exposed.
-2. **Deploy `gcb` to a trusted-network host** with `stunnel`. See
+2. **Deploy `symbolon` to a trusted-network host** with `stunnel`. See
    [docs/INSTALL.md](docs/INSTALL.md).
-3. **Enroll each client:** `gcb github enroll <name> --ip <ip>`. The
-   command prints a paste-ready snippet for the client.
+3. **Enroll each client:** `symbolon github enroll <name> --ip <ip>`.
+   The command prints a paste-ready snippet for the client.
 
 ## Documentation
 
@@ -119,11 +125,20 @@ Full threat model and architectural decisions: see [AGENTS.md](./AGENTS.md).
   schemas, daemon lifecycle, logging schema.
 - **[docs/REFERENCES.md](./docs/REFERENCES.md)** — authoritative URLs.
 
-## Status
-
-Early. Single developer. Semver pre-1.0 — minor versions may have
-breaking changes in config format or CLI shape.
-
 ## License
 
-[Your choice.]
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or
+  <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in the work by you, as defined in the
+Apache-2.0 license, shall be dual licensed as above, without any
+additional terms or conditions.

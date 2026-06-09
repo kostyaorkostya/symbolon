@@ -1,4 +1,4 @@
-# Installing `gcb`
+# Installing `symbolon`
 
 This guide covers a fresh deployment: setting up the GitHub App, the
 broker host, and a first client. Adapt to your environment as needed.
@@ -82,36 +82,36 @@ apk add stunnel ca-certificates
 ### 3.2 Create users, groups, directories
 
 ```sh
-addgroup -S gcb
-adduser  -S -G gcb -H -D -s /sbin/nologin gcb
+addgroup -S symbolon
+adduser  -S -G symbolon -H -D -s /sbin/nologin symbolon
 
-# stunnel runs as user `stunnel` by default. Add stunnel to the gcb
+# stunnel runs as user `stunnel` by default. Add stunnel to the symbolon
 # group so it can connect to the daemon's Unix socket.
-adduser  stunnel gcb   # Alpine; Debian/Ubuntu: `usermod -aG gcb stunnel`
+adduser  stunnel symbolon   # Alpine; Debian/Ubuntu: `usermod -aG symbolon stunnel`
 
-install -d -o gcb -g gcb     -m 0700 /etc/gcb
-install -d -o gcb -g gcb     -m 0700 /var/lib/gcb
-install -d -o gcb -g gcb     -m 0750 /run/gcb
-install -d -o gcb -g stunnel -m 0750 /etc/stunnel
+install -d -o symbolon -g symbolon     -m 0700 /etc/symbolon
+install -d -o symbolon -g symbolon     -m 0700 /var/lib/symbolon
+install -d -o symbolon -g symbolon     -m 0750 /run/symbolon
+install -d -o symbolon -g stunnel -m 0750 /etc/stunnel
 ```
 
-`/etc/gcb/` holds the App PEM key and `config.toml` (read-only at
-runtime); `/var/lib/gcb/` holds `clients.json` (mutated atomically by
+`/etc/symbolon/` holds the App PEM key and `config.toml` (read-only at
+runtime); `/var/lib/symbolon/` holds `clients.json` (mutated atomically by
 the daemon). They are kept separate because the daemon's landlock
-ruleset grants write access to `/var/lib/gcb/` (needed for the
+ruleset grants write access to `/var/lib/symbolon/` (needed for the
 tempfile-then-rename atomic-write pattern); putting the PEM key
 under that dir would defeat the sandbox's protection of the key.
 
-The `/run/gcb` directory is recreated on every boot — see §3.10.
+The `/run/symbolon` directory is recreated on every boot — see §3.10.
 
-**Upgrading from a pre-`/var/lib/gcb` layout:** if your existing
-deployment places `clients.json` under `/etc/gcb/`, move it before
+**Upgrading from a pre-`/var/lib/symbolon` layout:** if your existing
+deployment places `clients.json` under `/etc/symbolon/`, move it before
 restarting the daemon and update `clients.file` in `config.toml`:
 
 ```sh
-install -d -o gcb -g gcb -m 0700 /var/lib/gcb
-mv /etc/gcb/clients.json /var/lib/gcb/clients.json
-sed -i 's,/etc/gcb/clients.json,/var/lib/gcb/clients.json,' /etc/gcb/config.toml
+install -d -o symbolon -g symbolon -m 0700 /var/lib/symbolon
+mv /etc/symbolon/clients.json /var/lib/symbolon/clients.json
+sed -i 's,/etc/symbolon/clients.json,/var/lib/symbolon/clients.json,' /etc/symbolon/config.toml
 ```
 
 ### 3.3 Fetch and verify the binary
@@ -119,36 +119,36 @@ sed -i 's,/etc/gcb/clients.json,/var/lib/gcb/clients.json,' /etc/gcb/config.toml
 ```sh
 VERSION=v0.1.0
 TARGET=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl
-BASE=https://github.com/<you>/gcb/releases/download/${VERSION}
+BASE=https://github.com/<you>/symbolon/releases/download/${VERSION}
 
-curl -fsSLO "${BASE}/gcb-${TARGET}"
-curl -fsSLO "${BASE}/gcb-${TARGET}.sha256"
-sha256sum -c "gcb-${TARGET}.sha256"
-install -o root -g root -m 0755 "gcb-${TARGET}" /usr/local/bin/gcb
+curl -fsSLO "${BASE}/symbolon-${TARGET}"
+curl -fsSLO "${BASE}/symbolon-${TARGET}.sha256"
+sha256sum -c "symbolon-${TARGET}.sha256"
+install -o root -g root -m 0755 "symbolon-${TARGET}" /usr/local/bin/symbolon
 ```
 
 ### 3.4 Place the GitHub App private key
 
 ```sh
-install -o gcb -g gcb -m 0400 /path/to/github-app.pem /etc/gcb/github-app.pem
+install -o symbolon -g symbolon -m 0400 /path/to/github-app.pem /etc/symbolon/github-app.pem
 ```
 
 ### 3.5 Write `config.toml`
 
-`/etc/gcb/config.toml` (schema in [PROTOCOLS.md](PROTOCOLS.md)):
+`/etc/symbolon/config.toml` (schema in [PROTOCOLS.md](PROTOCOLS.md)):
 
 ```toml
 [listen]
-socket = "/run/gcb/daemon.sock"
+socket = "/run/symbolon/daemon.sock"
 
 [admin]
-socket_path = "/run/gcb/admin.sock"
+socket_path = "/run/symbolon/admin.sock"
 
 [clients]
-file = "/var/lib/gcb/clients.json"
+file = "/var/lib/symbolon/clients.json"
 
 [stunnel]
-psk_file = "/etc/stunnel/gcb.psk"
+psk_file = "/etc/stunnel/symbolon.psk"
 pidfile  = "/run/stunnel/stunnel.pid"   # must match `pid = …` in step 3.7
 
 [logging]
@@ -170,24 +170,24 @@ host = "github.com"
 api_base = "https://api.github.com"
 client_id = "Iv23liABCDEFGHIJklmn"   # from step 2 (App settings page)
 installation_id = 789012             # from step 2
-private_key_path = "/etc/gcb/github-app.pem"
+private_key_path = "/etc/symbolon/github-app.pem"
 selfcheck_timeout = "5s"             # required; tune to your network's p99 to api.github.com
 # request_timeout = "10s"            # optional; default 10s
 ```
 
 ```sh
-chown gcb:gcb /etc/gcb/config.toml
-chmod 0600    /etc/gcb/config.toml
+chown symbolon:symbolon /etc/symbolon/config.toml
+chmod 0600    /etc/symbolon/config.toml
 ```
 
 ### 3.6 Initialize state files
 
 ```sh
-echo '{"version":1,"clients":[]}' > /var/lib/gcb/clients.json
-chown gcb:gcb /var/lib/gcb/clients.json
-chmod 0600    /var/lib/gcb/clients.json
+echo '{"version":1,"clients":[]}' > /var/lib/symbolon/clients.json
+chown symbolon:symbolon /var/lib/symbolon/clients.json
+chmod 0600    /var/lib/symbolon/clients.json
 
-install -o gcb -g stunnel -m 0640 /dev/null /etc/stunnel/gcb.psk
+install -o symbolon -g stunnel -m 0640 /dev/null /etc/stunnel/symbolon.psk
 ```
 
 Both files are mutated atomically by the daemon (tempfile + fsync +
@@ -203,13 +203,13 @@ foreground = no
 pid = /run/stunnel/stunnel.pid
 output = /var/log/stunnel/stunnel.log
 
-[gcb]
+[symbolon]
 accept = 0.0.0.0:9418
 # Daemon listens on a Unix-domain socket; stunnel forwards plain TCP
 # over the Unix socket and prepends a PROXY v2 header carrying the
 # original TCP client's IP and port.
-connect = /run/gcb/daemon.sock
-PSKsecrets = /etc/stunnel/gcb.psk
+connect = /run/symbolon/daemon.sock
+PSKsecrets = /etc/stunnel/symbolon.psk
 ciphers = PSK
 sslVersion = TLSv1.2
 protocol = proxy
@@ -225,19 +225,19 @@ rc-service stunnel start
 (systemd: `systemctl enable --now stunnel.service`.)
 
 The path in `pid = …` must match `[stunnel] pidfile` in
-`/etc/gcb/config.toml` — the daemon reads it to send `SIGHUP` after
-`gcb github enroll`/`revoke` rewrites `gcb.psk`.
+`/etc/symbolon/config.toml` — the daemon reads it to send `SIGHUP` after
+`symbolon github enroll`/`revoke` rewrites `symbolon.psk`.
 
 ### 3.8 Lock down with nftables
 
-The daemon listens on a Unix socket inside `/run/gcb`; only stunnel's
+The daemon listens on a Unix socket inside `/run/symbolon`; only stunnel's
 TCP listen needs LAN-scoped firewall coverage.
 
 Replace `<lan-cidr>` with your trusted LAN (e.g. `192.168.122.0/24`):
 
 ```sh
 nft -f - <<'EOF'
-table inet gcb {
+table inet symbolon {
   chain input {
     type filter hook input priority 0; policy drop;
     iif lo accept
@@ -252,18 +252,18 @@ Persist via your distro's nftables service.
 
 ### 3.9 Install and start the daemon (OpenRC)
 
-`/etc/init.d/gcb`:
+`/etc/init.d/symbolon`:
 
 ```sh
 #!/sbin/openrc-run
-name="gcb"
-command="/usr/local/bin/gcb"
+name="symbolon"
+command="/usr/local/bin/symbolon"
 command_args="daemon"
-command_user="gcb:gcb"
+command_user="symbolon:symbolon"
 command_background=yes
-pidfile="/run/gcb/gcb.pid"
-output_log="/var/log/gcb.log"
-error_log="/var/log/gcb.log"
+pidfile="/run/symbolon/symbolon.pid"
+output_log="/var/log/symbolon.log"
+error_log="/var/log/symbolon.log"
 
 depend() {
     need net
@@ -273,30 +273,30 @@ depend() {
 # /run is tmpfs and is cleared at every boot; re-create the daemon's
 # runtime directory before starting. checkpath is idempotent.
 start_pre() {
-    checkpath -d -m 0750 -o gcb:gcb /run/gcb
+    checkpath -d -m 0750 -o symbolon:symbolon /run/symbolon
 }
 ```
 
 ```sh
-chmod +x /etc/init.d/gcb
-rc-update add gcb default
-rc-service gcb start
+chmod +x /etc/init.d/symbolon
+rc-update add symbolon default
+rc-service symbolon start
 ```
 
 ### 3.10 systemd alternative
 
 If you deploy under systemd instead, the equivalent of `start_pre +
-checkpath` is `tmpfiles.d`. Drop `/usr/lib/tmpfiles.d/gcb.conf`:
+checkpath` is `tmpfiles.d`. Drop `/usr/lib/tmpfiles.d/symbolon.conf`:
 
 ```
-d /run/gcb 0750 gcb gcb -
+d /run/symbolon 0750 symbolon symbolon -
 ```
 
 systemd-tmpfiles creates the directory at boot and on demand. Without
 this entry, the daemon will fail to start after a reboot with a
 permission error when binding its socket.
 
-A minimal systemd unit (`/etc/systemd/system/gcb.service`):
+A minimal systemd unit (`/etc/systemd/system/symbolon.service`):
 
 ```ini
 [Unit]
@@ -306,9 +306,9 @@ Wants=network-online.target
 
 [Service]
 Type=notify
-ExecStart=/usr/local/bin/gcb daemon
-User=gcb
-Group=gcb
+ExecStart=/usr/local/bin/symbolon daemon
+User=symbolon
+Group=symbolon
 # Required for `[security] mlock = "best_effort"` (the default).
 # Without it, mlockall fails with EAGAIN under the per-user
 # 64 KB default ulimit; daemon logs `evt=mlock status=skipped`
@@ -328,7 +328,7 @@ WantedBy=multi-user.target
 
 **Primary anti-swap defence: disable swap on the broker host.**
 This is industry standard for daemons holding long-lived
-secrets (nginx, haproxy, envoy all assume it). `gcb`'s
+secrets (nginx, haproxy, envoy all assume it). `symbolon`'s
 `[security] mlock` is belt-and-suspenders on top of swap-disable,
 not a substitute. To disable swap:
 
@@ -349,8 +349,8 @@ match the init script's `pidfile=` (see §3.9).
 ### 3.11 Verify
 
 ```sh
-sudo -u gcb gcb status
-sudo -u gcb gcb github selfcheck
+sudo -u symbolon symbolon status
+sudo -u symbolon symbolon github selfcheck
 ```
 
 `selfcheck` should report the App ID matches the JWT, GitHub is
@@ -362,12 +362,12 @@ good.
 ### 4.1 On the broker host
 
 ```sh
-sudo -u gcb gcb github enroll dev-vm-1 --ip 192.168.122.10
+sudo -u symbolon symbolon github enroll dev-vm-1 --ip 192.168.122.10
 ```
 
 Output is a paste-ready snippet showing:
 
-- The PSK hex string (for the client's `/etc/gcb/psk`).
+- The PSK hex string (for the client's `/etc/symbolon/psk`).
 - The git-credential helper command line (for the client's
   `~/.gitconfig` or `/etc/gitconfig`).
 - The host:port to use as `--endpoint`.
@@ -377,15 +377,15 @@ Output is a paste-ready snippet showing:
 Place the PSK:
 
 ```sh
-install -d -o root -g root -m 0700 /etc/gcb
-echo '<HEX-PSK-FROM-ENROLL>' > /etc/gcb/psk
-chmod 0400 /etc/gcb/psk
+install -d -o root -g root -m 0700 /etc/symbolon
+echo '<HEX-PSK-FROM-ENROLL>' > /etc/symbolon/psk
+chmod 0400 /etc/symbolon/psk
 ```
 
 Install the credential helper:
 
 ```sh
-cat > /usr/local/bin/git-credential-broker <<'EOF'
+cat > /usr/local/bin/git-credential-symbolon <<'EOF'
 #!/bin/sh
 endpoint= psk_file= identity= action=
 while [ $# -gt 0 ]; do
@@ -402,7 +402,7 @@ exec openssl s_client -quiet -tls1_2 -cipher PSK \
   -psk_identity "$identity" -psk "$(cat "$psk_file")" \
   -connect "$endpoint" 2>/dev/null
 EOF
-chmod 0755 /usr/local/bin/git-credential-broker
+chmod 0755 /usr/local/bin/git-credential-symbolon
 ```
 
 Configure git to use the helper for github.com (replace values with
@@ -410,7 +410,7 @@ those from the enroll output):
 
 ```sh
 git config --global credential.https://github.com.helper \
-  "/usr/local/bin/git-credential-broker --endpoint broker.lan:9418 --psk-file /etc/gcb/psk --identity dev-vm-1"
+  "/usr/local/bin/git-credential-symbolon --endpoint broker.lan:9418 --psk-file /etc/symbolon/psk --identity dev-vm-1"
 ```
 
 ### 4.3 Verify

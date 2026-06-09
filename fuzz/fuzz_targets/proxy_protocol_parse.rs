@@ -14,7 +14,7 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    if let Ok(parsed) = gcb::parse_proxy_protocol(data) {
+    if let Ok(parsed) = symbolon::parse_proxy_protocol(data) {
         assert!(
             parsed.header_len <= data.len(),
             "header_len {} > input len {}",

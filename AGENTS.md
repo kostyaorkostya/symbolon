@@ -1,4 +1,9 @@
-# AGENTS.md — `gcb`, the git credentials broker
+# AGENTS.md — `symbolon`, the git credentials broker
+
+*Symbolon* (σύμβολον): in Ancient Greek, an object broken in two
+halves; each party kept one, and matching them proved identity.
+Fits a daemon that authenticates clients by PSK and hands them
+short-lived, single-repository git credentials.
 
 Single source of truth for design decisions and conventions. Read it top
 to bottom before writing or modifying code. If anything here conflicts
@@ -14,7 +19,7 @@ Detail lives in sibling documents:
 
 ## Purpose
 
-`gcb` is a Rust daemon that mints short-lived, single-repository git
+`symbolon` is a Rust daemon that mints short-lived, single-repository git
 credentials on demand. Currently implements **GitHub** via GitHub App
 installation tokens. Structured to add other providers (e.g. GitLab) by
 dropping a new module under `src/providers/` and a new `[provider.X]`
@@ -100,7 +105,7 @@ accessible to the App.
    against the IP-resolved name. The upstream IP attestation is
    load-bearing — if it fails, attribution can be wrong (PSK auth
    still gates access).
-8. **State is files.** `clients.json` + `gcb.psk` only, written
+8. **State is files.** `clients.json` + `symbolon.psk` only, written
    atomically (tempfile + fsync + rename + fsync parent).
 9. **Admin surface = Unix-domain socket.** No HTTP admin endpoints.
 10. **Daemon is the sole writer** of state files. CLI commands talk
@@ -146,7 +151,7 @@ Pinned in `Cargo.toml`:
 
 - `argh` (derive-based argv parser used by `src/main.rs`. Picked over
   `clap` for code-size and over hand-rolled parsing for maintainability.
-  Daemon mode is preserved on bare `gcb` by synthesising a hidden
+  Daemon mode is preserved on bare `symbolon` by synthesising a hidden
   `daemon` subcommand in `main`; everything else is regular argh.)
 - `compio` with features `runtime,macros,net,fs,time,io-uring,ring`
   (async runtime; `macros` for `#[compio::main]`; `net`+`fs`+`time`
@@ -236,11 +241,11 @@ Pinned in `Cargo.toml`:
 - `thiserror` (errors)
 - `rustix` with features `net,process`. `process` for the pidfd
   dance in `src/stunnel.rs` (`pidfd_open` + `pidfd_send_signal`
-  with SIGHUP after enroll/revoke rewrites `gcb.psk`) — closes the
+  with SIGHUP after enroll/revoke rewrites `symbolon.psk`) — closes the
   PID-reuse TOCTOU window vs. the older `kill(2)` form. `net` for
   `socket_peercred` on the admin UDS — the SO_PEERCRED check that
   rejects connections from UIDs other than root or the daemon's
-  own (defense in depth against a loose `/run/gcb/` ACL).
+  own (defense in depth against a loose `/run/symbolon/` ACL).
 - `signal-hook-registry` (long-lived OS-level signal handler
   installed once at startup. Replaces `compio::signal::unix::signal`
   which is one-shot and reverts the kernel disposition to `SigDfl`
@@ -394,7 +399,7 @@ For CPU work, two options:
   `worker.run(move || do_cpu_work()).await?`. The in-tree example
   is `src/providers/github.rs::JwtSigner`, which holds an
   `Arc<EncodingKey>` and dispatches each `sign_jwt_blocking` call
-  to a `gcb-jwt-signer`-named worker thread.
+  to a `symbolon-jwt-signer`-named worker thread.
 - **`compio::runtime::spawn_blocking(f)`** for one-off CPU bursts.
   Compio's pool lazily spawns up to 256 threads, 60 s idle reap.
   Good fit when work is occasional; bad fit for high-frequency
@@ -410,15 +415,15 @@ For long-but-async work, sprinkle explicit yield points via
 (in a `src/sandbox.rs` test calling `libc::kill`); production code
 is entirely safe Rust where Miri has nothing to find. Compio's
 io_uring backend additionally cannot run under Miri (no shim for
-the submission/completion queue model), so the ~28 `#[compio::test]`
-tests would be unrunnable regardless. Skipping miri.
+the submission/completion queue model), so the codebase's
+`#[compio::test]` tests would be unrunnable regardless. Skipping miri.
 
 **Fuzzing** is set up for the two parsers that consume attacker-
 controlled bytes:
 
-- `gcb::proxy_protocol::parse` — PROXY v2 from stunnel. Identity
+- `symbolon::proxy_protocol::parse` — PROXY v2 from stunnel. Identity
   attestation depends on it (AGENTS.md invariant #7).
-- `gcb::git_credential::parse` — git-credential request block;
+- `symbolon::git_credential::parse` — git-credential request block;
   carries the CR/LF Clone2Leak defence (AGENTS.md invariant #12).
 
 Fuzz targets live under `fuzz/fuzz_targets/`. The `fuzz/` subproject
@@ -455,11 +460,11 @@ Known omissions, not oversights:
 - **Metrics endpoint** (Prometheus / OpenMetrics). Logs are the
   observability surface today. Add when there's a consumer.
 - **Webhook handling.** No live notification when the App's
-  permissions change provider-side; `gcb github selfcheck` is the
+  permissions change provider-side; `symbolon github selfcheck` is the
   on-demand check.
 - **Emergency offline state mutation.** Operator commands talk to
   the admin socket of a running daemon. No CLI path that mutates
-  `clients.json` or `gcb.psk` directly.
+  `clients.json` or `symbolon.psk` directly.
 - **App-key hot reload.** Restart the daemon to pick up a new key.
 - **`provider_error` `endpoint` / `body_snippet` fields.**
   PROTOCOLS.md lists them in the logging schema; the daemon does

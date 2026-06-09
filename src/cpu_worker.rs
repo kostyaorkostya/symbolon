@@ -108,14 +108,14 @@ mod tests {
 
     #[compio::test]
     async fn run_returns_closure_result() {
-        let w = CpuWorker::new("gcb-test-worker").unwrap();
+        let w = CpuWorker::new("symbolon-test-worker").unwrap();
         let r: i32 = w.run(|| 1 + 2).await.unwrap();
         assert_eq!(r, 3);
     }
 
     #[compio::test]
     async fn run_moves_captured_state() {
-        let w = CpuWorker::new("gcb-test-worker-2").unwrap();
+        let w = CpuWorker::new("symbolon-test-worker-2").unwrap();
         let v: [u8; 3] = [1, 2, 3];
         let sum: u8 = w.run(move || v.iter().sum()).await.unwrap();
         assert_eq!(sum, 6);
@@ -129,7 +129,7 @@ mod tests {
         // during unwind, surfacing as `WorkerDead` to the awaiter.
         // A subsequent `run` also fails because the receiver is
         // gone with the thread.
-        let w = CpuWorker::new("gcb-test-worker-3").unwrap();
+        let w = CpuWorker::new("symbolon-test-worker-3").unwrap();
         let res: Result<(), WorkerDead> = w.run(|| panic!("boom")).await;
         assert!(res.is_err());
         let res2: Result<i32, WorkerDead> = w.run(|| 1).await;

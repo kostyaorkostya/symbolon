@@ -1,6 +1,6 @@
 //! Binary entry: parse argv (daemon mode or CLI subcommand), set up
-//! tracing for the daemon, hand off to [`gcb::run_daemon`] or
-//! [`gcb::cli_dispatch`].
+//! tracing for the daemon, hand off to [`symbolon::run_daemon`] or
+//! [`symbolon::cli_dispatch`].
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -8,14 +8,14 @@ use std::process::ExitCode;
 
 use argh::FromArgs;
 
-use gcb::CliCommand;
+use symbolon::CliCommand;
 
-const DEFAULT_CONFIG_PATH: &str = "/etc/gcb/config.toml";
+const DEFAULT_CONFIG_PATH: &str = "/etc/symbolon/config.toml";
 
 #[compio::main]
 async fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
-    let cmd_name = argv.first().map(String::as_str).unwrap_or("gcb");
+    let cmd_name = argv.first().map(String::as_str).unwrap_or("symbolon");
     let rest: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
     let args = match Args::from_args(&[cmd_name], &rest) {
         Ok(a) => a,
@@ -44,27 +44,27 @@ async fn main() -> ExitCode {
 }
 
 async fn run_daemon(config_path: PathBuf) -> ExitCode {
-    let cfg = match gcb::load_config(&config_path).await {
+    let cfg = match symbolon::load_config(&config_path).await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("gcb: {e}");
+            eprintln!("symbolon: {e}");
             return ExitCode::from(1);
         }
     };
-    gcb::setup_tracing(cfg.logging.level);
+    symbolon::setup_tracing(cfg.logging.level);
 
     // Belt-and-suspenders anti-swap hardening. Called BEFORE
     // Service::prepare so the PEM key load + CpuWorker stack
     // allocation both fault into locked pages. Primary defence
     // is operator-disabled swap on the broker host — see
     // docs/INSTALL.md. Required-mode failure is fatal.
-    if let Err(e) = gcb::mlock_apply(cfg.security.mlock) {
+    if let Err(e) = symbolon::mlock_apply(cfg.security.mlock) {
         tracing::error!(evt = "mlock_required_failed", error = %e);
         return ExitCode::from(1);
     }
 
     let shutdown = compio::runtime::CancelToken::new();
-    let shutdown_watcher = match gcb::spawn_shutdown_watcher(shutdown.clone()) {
+    let shutdown_watcher = match symbolon::spawn_shutdown_watcher(shutdown.clone()) {
         Ok(h) => h,
         Err(e) => {
             tracing::error!(evt = "signal_registration_failed", signal = "SIGTERM/SIGINT", error = %e);
@@ -72,7 +72,7 @@ async fn run_daemon(config_path: PathBuf) -> ExitCode {
         }
     };
 
-    let service = match gcb::Service::prepare(&cfg, &config_path, shutdown.clone()).await {
+    let service = match symbolon::Service::prepare(&cfg, &config_path, shutdown.clone()).await {
         Ok(v) => v,
         Err(e) => {
             tracing::error!(error = %e, "prepare failed");
@@ -81,7 +81,7 @@ async fn run_daemon(config_path: PathBuf) -> ExitCode {
     };
 
     let handle = service.handle();
-    let sighup = match gcb::spawn_sighup_handler(
+    let sighup = match symbolon::spawn_sighup_handler(
         move || {
             let h = handle.clone();
             async move { h.reload_clients().await }
@@ -106,7 +106,7 @@ async fn run_daemon(config_path: PathBuf) -> ExitCode {
     // starts the accept loop; any connections the kernel queued
     // between this notification and the first `accept()` syscall
     // (microseconds) are processed normally.
-    gcb::ready_notify(cfg.runtime.pidfile.as_deref()).await;
+    symbolon::ready_notify(cfg.runtime.pidfile.as_deref()).await;
     tracing::info!(evt = "ready", pid = std::process::id());
 
     let run_result = service.run().await;
@@ -132,26 +132,26 @@ async fn run_daemon(config_path: PathBuf) -> ExitCode {
 }
 
 async fn run_cli(config_path: PathBuf, command: CliCommand) -> ExitCode {
-    let cfg = match gcb::load_config(&config_path).await {
+    let cfg = match symbolon::load_config(&config_path).await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("gcb: {e}");
+            eprintln!("symbolon: {e}");
             return ExitCode::from(1);
         }
     };
-    match gcb::cli_dispatch(&cfg.admin.socket_path, command).await {
+    match symbolon::cli_dispatch(&cfg.admin.socket_path, command).await {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
-            eprintln!("gcb: {e}");
+            eprintln!("symbolon: {e}");
             ExitCode::from(1)
         }
     }
 }
 
-/// gcb — git credentials broker. With no subcommand, runs as a daemon.
+/// symbolon — git credentials broker. With no subcommand, runs as a daemon.
 #[derive(FromArgs)]
 struct Args {
-    /// path to config.toml (default /etc/gcb/config.toml)
+    /// path to config.toml (default /etc/symbolon/config.toml)
     #[argh(option)]
     config: Option<PathBuf>,
 

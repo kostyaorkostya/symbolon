@@ -1,27 +1,27 @@
 # Protocols & file formats
 
-Wire formats and on-disk schemas for `gcb`. Design rationale and
+Wire formats and on-disk schemas for `symbolon`. Design rationale and
 conventions are in [`../AGENTS.md`](../AGENTS.md); operator material is
 in [`OPERATIONS.md`](OPERATIONS.md) and [`INSTALL.md`](INSTALL.md);
 authoritative URLs are in [`REFERENCES.md`](REFERENCES.md).
 
 ## File formats
 
-### `/etc/gcb/config.toml` — operator-authored
+### `/etc/symbolon/config.toml` — operator-authored
 
 ```toml
 [listen]
 # Unix-domain socket the daemon listens on. stunnel forwards here.
-socket = "/run/gcb/daemon.sock"
+socket = "/run/symbolon/daemon.sock"
 
 [admin]
-socket_path = "/run/gcb/admin.sock"
+socket_path = "/run/symbolon/admin.sock"
 
 [clients]
-file = "/var/lib/gcb/clients.json"
+file = "/var/lib/symbolon/clients.json"
 
 [stunnel]
-psk_file = "/etc/stunnel/gcb.psk"
+psk_file = "/etc/stunnel/symbolon.psk"
 pidfile = "/run/stunnel/stunnel.pid"
 
 [logging]
@@ -65,7 +65,7 @@ mlock = "best_effort"
 #
 # The parent directory of this path is added to the sandbox
 # write-allowlist automatically.
-pidfile = "/run/gcb/gcb.pid"
+pidfile = "/run/symbolon/symbolon.pid"
 
 [provider.github]
 # For github.com, keep defaults below.
@@ -76,7 +76,7 @@ host = "github.com"
 api_base = "https://api.github.com"
 client_id = "Iv23liABCDEFGHIJklmn"
 installation_id = 789012
-private_key_path = "/etc/gcb/github-app.pem"
+private_key_path = "/etc/symbolon/github-app.pem"
 selfcheck_timeout = "5s"
 # request_timeout = "10s"   # optional; default 10s
 ```
@@ -88,13 +88,13 @@ no extra read dirs.
 
 The PEM key path (`provider.github.private_key_path`) is read once
 at startup, **before** the sandbox is applied. The default sandbox
-ruleset deliberately omits `/etc/gcb/` so a post-compromise process
+ruleset deliberately omits `/etc/symbolon/` so a post-compromise process
 inside the daemon cannot re-open the key. Keep the PEM under
-`/etc/gcb/` (or any other dir outside `/var/lib/gcb/` and
+`/etc/symbolon/` (or any other dir outside `/var/lib/symbolon/` and
 `/etc/stunnel/`); do not place it in either of the directories
 granted write access for atomic state-file writes.
 
-### `/var/lib/gcb/clients.json` — machine-authored
+### `/var/lib/symbolon/clients.json` — machine-authored
 
 ```json
 {
@@ -114,7 +114,7 @@ granted write access for atomic state-file writes.
 The `providers` array allows multi-provider enrolment; for the
 GitHub-only build it's always `["github"]`.
 
-### `/etc/stunnel/gcb.psk` — machine-authored
+### `/etc/stunnel/symbolon.psk` — machine-authored
 
 stunnel's standard PSK file format, one identity per line:
 
@@ -126,7 +126,7 @@ The daemon never reads this file directly; only stunnel does.
 
 ## Atomic writes
 
-`clients.json` and `gcb.psk` are mutated only by the daemon (the CLI
+`clients.json` and `symbolon.psk` are mutated only by the daemon (the CLI
 talks to the daemon via the admin Unix socket; see AGENTS.md
 invariant #10). The daemon writes both files atomically:
 
@@ -149,18 +149,18 @@ connection and forwards plain TCP to the daemon's Unix-domain socket
 with a PROXY v2 header. Sample stunnel service block:
 
 ```
-[gcb]
+[symbolon]
 accept = 0.0.0.0:9418
-connect = /run/gcb/daemon.sock
-PSKsecrets = /etc/stunnel/gcb.psk
+connect = /run/symbolon/daemon.sock
+PSKsecrets = /etc/stunnel/symbolon.psk
 ciphers = PSK
 sslVersion = TLSv1.2
 protocol = proxy
 ```
 
-Socket permissions: `/run/gcb/daemon.sock` is owned by `gcb:gcb`,
+Socket permissions: `/run/symbolon/daemon.sock` is owned by `symbolon:symbolon`,
 mode `0660`. The `stunnel` user must be a supplementary member of the
-`gcb` group. The daemon unlinks any stale socket at startup before
+`symbolon` group. The daemon unlinks any stale socket at startup before
 binding.
 
 ### PROXY protocol v2
@@ -275,7 +275,7 @@ client_already_enrolled | client_ip_collision | malformed_request |
 internal | repo_not_accessible | provider_4xx`.
 
 The daemon serialises admin requests, so file writes to
-`clients.json` / `gcb.psk` do not race the listen-side accept loop
+`clients.json` / `symbolon.psk` do not race the listen-side accept loop
 (AGENTS.md invariant #10).
 
 CR or embedded LF inside any string field is rejected (same
@@ -300,8 +300,11 @@ References: [REST API for App installations][gh-installs],
 - `exp`: now + 540 s (9 minutes; GitHub max is 10).
 - Signing key: PEM at `provider.github.private_key_path`, loaded once
   at daemon startup, held in memory. To rotate, restart the daemon.
-- Implementation: `jsonwebtoken::encode` with
-  `EncodingKey::from_rsa_pem`.
+- Implementation: in-tree RS256 signer at
+  `src/providers/jwt_rs256.rs` (RSASSA-PKCS1-v1_5 with SHA-256),
+  built directly on the `rsa` and `sha2` crates. Replaces a prior
+  dependency on `jsonwebtoken`; the byte-exact JWT output is pinned
+  by `tests::known_vector_matches_jsonwebtoken_baseline`.
 
 **Token mint:**
 
@@ -310,7 +313,7 @@ References: [REST API for App installations][gh-installs],
   - `Authorization: Bearer <jwt>`
   - `Accept: application/vnd.github+json`
   - `X-GitHub-Api-Version: <current>`
-  - `User-Agent: <provider.github.user_agent>` — defaults to `gcb` if
+  - `User-Agent: <provider.github.user_agent>` — defaults to `symbolon` if
     unset; configurable by the operator. Required by GitHub (missing
     UA → 403). Intentionally carries no version number so an
     attacker can't narrow the applicable CVE list.
@@ -357,7 +360,7 @@ join the broker's log to GitHub's side when filing a ticket.
 1. Parse `config.toml`. Fail fast on schema errors.
 2. Load App private key(s) into memory. Fail fast on parse error.
 3. Unlink any stale `listen.socket` and `admin.socket_path`.
-4. Bind both Unix sockets; set mode `0660`, owner `gcb:gcb`.
+4. Bind both Unix sockets; set mode `0660`, owner `symbolon:symbolon`.
 5. Load `clients.json`. Fail fast on schema errors.
 6. Apply sandbox (landlock + seccomp). Per `[security] sandbox`:
    `required` aborts on missing kernel features; `best_effort`
@@ -387,7 +390,7 @@ On any other signal except SIGHUP: terminate fast; do not drain.
 | File | Reload mechanism |
 |---|---|
 | `clients.json` | SIGHUP re-reads from disk. |
-| `gcb.psk` | Read AND written by daemon: `gcb github enroll`/`revoke` route through the admin socket; the daemon parses, appends/removes, atomically rewrites, then SIGHUPs stunnel. The file is the daemon's serialization target, not a notification surface. |
+| `symbolon.psk` | Read AND written by daemon: `symbolon github enroll`/`revoke` route through the admin socket; the daemon parses, appends/removes, atomically rewrites, then SIGHUPs stunnel. The file is the daemon's serialization target, not a notification surface. |
 | `config.toml` | Restart required. |
 | App private key | Restart required. |
 
@@ -432,7 +435,7 @@ top-level keys.
 | `ready_pidfile_write_failed` | `path`, `error` — emitted at `warn` lvl by `ready::notify` if the configured pidfile can't be written (typically a sandbox or permission issue) |
 | `admin_denied` | `peer_uid`, `peer_pid` — emitted at `warn` lvl when SO_PEERCRED on the admin socket shows a UID that is neither root nor the daemon's own |
 | `admin_peercred_failed` | `error` — emitted at `warn` lvl when SO_PEERCRED itself fails; the connection is still admitted (refusing on a transient kernel error would be a self-DoS) |
-| `stunnel_sighup_failed` | `error` — emitted at `warn` lvl when `StunnelController::sighup` fails after an enroll/revoke rewrote `gcb.psk`. The state mutation is NOT rolled back; operator notices via `gcb status` or stunnel logs |
+| `stunnel_sighup_failed` | `error` — emitted at `warn` lvl when `StunnelController::sighup` fails after an enroll/revoke rewrote `symbolon.psk`. The state mutation is NOT rolled back; operator notices via `symbolon status` or stunnel logs |
 | `drain_incomplete` | `inflight_drained`, `drain_ms` — emitted at `warn` lvl when the per-connection drain deadline elapses with handlers still in flight at shutdown |
 | `signal_registration_failed` | `signal`, `error` — emitted at `error` lvl by `main` when `signal-hook-registry::register` fails at startup. Treated as fatal (exit 1) — without it the daemon cannot honour SIGTERM/SIGINT/SIGHUP |
 | `mlock` | `status` (`applied` \| `skipped` \| `failed` \| `off`), `policy` (`required` \| `best_effort` \| `off`), `flags` (when applied) or `error` (when skipped/failed) — emitted once at startup by `main::run_daemon` after `setup_tracing`. `required` failure surfaces as the separate `mlock_required_failed` error event before exit |

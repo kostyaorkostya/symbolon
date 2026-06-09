@@ -19,10 +19,10 @@
 //! cannot be enabled here: stunnel lives in a separate process tree
 //! and the broker must keep being able to SIGHUP it on enroll/revoke.
 //!
-//! Landlock is intentionally NOT given any rule for `/etc/gcb/`, so
-//! the App PEM key (read once at startup before this module runs) is
+//! Landlock is intentionally NOT given any rule for `/etc/symbolon/`,
+//! so the App PEM key (read once at startup before this module runs) is
 //! unreachable post-restriction. State files live under
-//! `/var/lib/gcb/`; the parent-dir rule there is required by the
+//! `/var/lib/symbolon/`; the parent-dir rule there is required by the
 //! tempfile-then-rename atomic-write pattern.
 
 use std::io;
@@ -336,11 +336,13 @@ mod tests {
     #[test]
     fn apply_best_effort_blocks_unlisted_reads() {
         let outcome = run_isolated(|| {
-            let allowed =
-                std::env::temp_dir().join(format!("gcb-sandbox-test-allow-{}", std::process::id()));
+            let allowed = std::env::temp_dir().join(format!(
+                "symbolon-sandbox-test-allow-{}",
+                std::process::id()
+            ));
             fs::write(&allowed, b"hello").unwrap();
-            let other =
-                std::env::temp_dir().join(format!("gcb-sandbox-test-deny-{}", std::process::id()));
+            let other = std::env::temp_dir()
+                .join(format!("symbolon-sandbox-test-deny-{}", std::process::id()));
             fs::write(&other, b"secret").unwrap();
 
             let paths = make_paths(vec![allowed.clone()], vec![]);
@@ -429,7 +431,7 @@ mod tests {
             let paths = SandboxPaths {
                 read_files: vec![],
                 read_dirs: vec![],
-                resolv_files: vec![PathBuf::from("/definitely/does/not/exist/gcb-test")],
+                resolv_files: vec![PathBuf::from("/definitely/does/not/exist/symbolon-test")],
                 write_parent_dirs: vec![],
             };
             // Should not error on the missing resolv file.

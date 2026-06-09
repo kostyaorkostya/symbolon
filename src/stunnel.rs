@@ -1,5 +1,5 @@
 //! stunnel control surface: send SIGHUP to the running stunnel
-//! process after we rewrite `gcb.psk`.
+//! process after we rewrite `symbolon.psk`.
 //!
 //! Sequence (Linux 5.1+):
 //!
@@ -132,7 +132,8 @@ mod tests {
     use std::time::Duration;
 
     fn write_pidfile(pid: i32) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("gcb-stunnel-test-{}.pid", ulid::Ulid::new()));
+        let path =
+            std::env::temp_dir().join(format!("symbolon-stunnel-test-{}.pid", ulid::Ulid::new()));
         std::fs::write(&path, format!("{pid}\n")).unwrap();
         path
     }
@@ -164,7 +165,8 @@ mod tests {
 
     #[compio::test]
     async fn sighup_returns_error_for_missing_pidfile() {
-        let path = std::env::temp_dir().join(format!("gcb-stunnel-nope-{}.pid", ulid::Ulid::new()));
+        let path =
+            std::env::temp_dir().join(format!("symbolon-stunnel-nope-{}.pid", ulid::Ulid::new()));
         let controller = StunnelController::new(path);
         let res = controller.sighup().await;
         assert!(
@@ -175,7 +177,8 @@ mod tests {
 
     #[compio::test]
     async fn sighup_returns_error_for_malformed_pidfile() {
-        let path = std::env::temp_dir().join(format!("gcb-stunnel-bad-{}.pid", ulid::Ulid::new()));
+        let path =
+            std::env::temp_dir().join(format!("symbolon-stunnel-bad-{}.pid", ulid::Ulid::new()));
         std::fs::write(&path, "not-a-pid\n").unwrap();
         let controller = StunnelController::new(path.clone());
         let res = controller.sighup().await;

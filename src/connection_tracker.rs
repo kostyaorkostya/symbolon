@@ -16,9 +16,8 @@
 //! Per-handler shutdown observation is NOT delivered through this
 //! tracker — handlers reach into `GitHubProvider.cancel` (a clone
 //! of the same shutdown token) for the HTTPS calls that dominate
-//! their wall-clock time. Short-running UDS reads are bounded by
-//! `per_handler_timeout` and by stunnel closing the upstream
-//! connection on its own shutdown.
+//! their wall-clock time. Short-running reads are bounded by
+//! `per_handler_timeout`.
 
 use std::rc::Rc;
 use std::time::{Duration, Instant};

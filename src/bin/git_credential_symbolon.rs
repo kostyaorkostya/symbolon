@@ -178,36 +178,25 @@ fn load_psk(path: &PathBuf) -> Result<[u8; 32], ClientError> {
         path: path.clone(),
         source,
     })?;
-    let hex = text.trim();
-    if hex.len() != 64 {
+    let hex_str = text.trim();
+    if hex_str.len() != 64 {
         return Err(ClientError::BadPskLen {
             path: path.clone(),
-            got: hex.len(),
+            got: hex_str.len(),
         });
     }
     let mut out = [0u8; 32];
-    let bytes = hex.as_bytes();
-    for i in 0..32 {
-        let hi = decode_nibble(bytes[2 * i]).ok_or_else(|| ClientError::BadPskHex {
+    hex::decode_to_slice(hex_str, &mut out).map_err(|e| match e {
+        hex::FromHexError::InvalidHexCharacter { c, .. } => ClientError::BadPskHex {
             path: path.clone(),
-            byte: bytes[2 * i],
-        })?;
-        let lo = decode_nibble(bytes[2 * i + 1]).ok_or_else(|| ClientError::BadPskHex {
+            byte: c as u8,
+        },
+        _ => ClientError::BadPskLen {
             path: path.clone(),
-            byte: bytes[2 * i + 1],
-        })?;
-        out[i] = (hi << 4) | lo;
-    }
+            got: hex_str.len(),
+        },
+    })?;
     Ok(out)
-}
-
-fn decode_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(10 + b - b'a'),
-        b'A'..=b'F' => Some(10 + b - b'A'),
-        _ => None,
-    }
 }
 
 #[derive(Debug, thiserror::Error)]

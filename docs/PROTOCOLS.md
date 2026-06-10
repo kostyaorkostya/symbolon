@@ -124,10 +124,8 @@ client-name:hex-encoded-32-byte-key
 ```
 
 The daemon parses this file at startup and on `SIGHUP` reload,
-and rewrites it atomically on every `enroll` / `revoke`. The
-on-disk format is identical to the prior `stunnel.psk` shape; only
-the location and ownership have changed (symbolon owns it now,
-mode `0600`).
+and rewrites it atomically on every `enroll` / `revoke`. Owner is
+the `symbolon` user, mode `0600`.
 
 ## Atomic writes
 
@@ -426,23 +424,31 @@ top-level keys.
 
 **Per-event additional fields:**
 
+Every event additionally carries `req_id` when one is in scope,
+plus `out_req_id` + `gh_req_id` for provider-call-derived events
+(`mint`, `selfcheck`, `mint_denied`, `provider_error`,
+`cache_invalidated`). These are not repeated per row.
+
+The closed-set catalog of `evt` values is encoded in
+`src/events.rs::EventKind`; adding a new event name requires
+extending the enum and adding a row below.
+
 | evt | additional fields |
 |---|---|
-| `startup` | `version`, `config_path`, `providers` |
-| `shutdown` | `signal`, `inflight_drained`, `drain_ms` |
+| `startup` | `providers` |
+| `shutdown` | `signal`, `inflight_drained`, `drain_ms`, `drain_complete` |
 | `accept` | `psk_identity` (from the Noise prelude), `peer` (TCP source addr, audit-only) |
 | `mint` | `provider`, `repo`, `repo_id`, `client`, `ttl_sec`, `expires_at_unix`, `provider_ms` |
 | `mint_denied` | `provider`, `client`, `repo`, `reason`, `provider_status` |
-| `proxy_header_invalid` | `bytes_read` |
 | `provider_error` | `provider`, `endpoint`, `status`, `body_snippet` |
 | `selfcheck` | `provider`, `ok`, `clock_skew_sec` |
-| `enroll` | `provider`, `client`, `ip` |
+| `enroll` | `provider`, `client` |
 | `revoke` | `provider`, `client` |
 | `config_reload` | `triggered_by` (`sighup`) |
 | `cache_invalidated` | `provider`, `repo`, `cause` (`404` \| `ttl_expired`) |
 | `sandbox_applied` | `policy` (`required` \| `best_effort` \| `off`), `abi` (Landlock ABI requested; `0` if off), `status` (`fully_enforced` \| `partially_enforced` \| `not_enforced` \| `off`), `fs`, `tcp`, `scope` (bool per Landlock layer actually engaged) |
 | `sandbox_path_skipped` | `path`, `reason` (`enoent` \| `open_failed`), `error` (when applicable) — emitted at `debug` for nameservice / CA-bundle paths absent on this host |
-| `prepare` | `version`, `config_path`, `listen_socket`, `admin_socket` — emitted by `Service::prepare` once config is loaded and sockets are bound (before selfcheck and readiness) |
+| `prepare` | `version`, `config_path`, `listen_addr`, `admin_socket` — emitted by `Service::prepare` once config is loaded and sockets are bound (before selfcheck and readiness) |
 | `ready` | `pid` — emitted by `main` after `service.selfcheck()` returns and `ready::notify` has sent `READY=1` to systemd (if applicable) and written the pidfile (if configured) |
 | `run_failed` | `signal`, `error` — emitted at `error` lvl by `main` when `Service::run` returns `Err`. Mutually exclusive with `shutdown` (one or the other fires) |
 | `ready_pidfile_write_failed` | `path`, `error` — emitted at `warn` lvl by `ready::notify` if the configured pidfile can't be written (typically a sandbox or permission issue) |
@@ -457,12 +463,6 @@ top-level keys.
 | `admin_request` | `req_id`, `op` — emitted by the admin loop at entry of each request. The `req_id` (ULID) ties downstream `provider_call` / `mint` / `selfcheck` events back to this admin invocation |
 | `provider_call` | `req_id`, `out_req_id`, `endpoint` (`resolve_repo_id` \| `mint_token` \| `selfcheck`), `provider`, `timeout_ms` — emitted before each outbound HTTPS call |
 | `provider_call_done` | `req_id`, `out_req_id`, `status` (HTTP status code, 0 if no response), `gh_req_id` (X-GitHub-Request-Id, empty if absent), `elapsed_ms`, optional `error` — emitted after each outbound HTTPS call |
-
-The `mint`, `selfcheck`, and (when available) `mint_denied` /
-`provider_error` / `cache_invalidated` events also carry
-`out_req_id` and `gh_req_id` fields when the underlying outbound
-call yielded them, so a grep on `req_id` or `out_req_id` returns
-the full chain.
 
 `reason` values for `mint_denied`:
 `client_unknown | unknown_host | repo_not_accessible | provider_4xx | malformed_request`.

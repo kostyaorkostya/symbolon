@@ -1,6 +1,6 @@
 //! Linux sandboxing layer: applies Landlock at ABI 6 (FS allowlist +
-//! per-port TCP bind/connect + abstract-UDS scope + cross-process
-//! signal scope).
+//! outbound TCP-connect to port 443 + abstract-UDS scope +
+//! cross-process signal scope).
 //!
 //! `Scope::Signal` (Linux 6.12+, Landlock ABI 6) denies sending any
 //! signal to a process outside the broker's Landlock domain.
@@ -8,9 +8,8 @@
 //! thread-local plumbing) remain permitted — which is correct,
 //! because the things we want to *prevent* (a compromised broker
 //! attacking other processes via signals) all involve crossing the
-//! domain boundary. Symbolon does not legitimately send any signal:
-//! the prior stunnel-SIGHUP path was deleted with stunnel itself
-//! (Noise NNpsk0 is terminated in-process now).
+//! domain boundary. Symbolon does not legitimately send any
+//! cross-process signal.
 //!
 //! Landlock is intentionally NOT given any rule for `/etc/symbolon/`,
 //! so the App PEM key (read once at startup before this module runs) is
@@ -28,9 +27,10 @@ use landlock::{
 };
 
 use crate::config::SandboxMode;
+use crate::events::EventKind;
 
-/// Filesystem paths and TCP ports the daemon needs after restriction.
-/// Anything not listed here becomes unreachable.
+/// Filesystem paths the daemon needs after restriction. Anything
+/// not listed here becomes unreachable.
 pub(crate) struct SandboxPaths {
     /// Files needing `ReadFile` only.
     pub read_files: Vec<PathBuf>,
@@ -43,13 +43,11 @@ pub(crate) struct SandboxPaths {
     /// access bits to support the tempfile-create + fsync + rename +
     /// fsync-parent sequence in `src/admin.rs::atomic_write`.
     pub write_parent_dirs: Vec<PathBuf>,
-    /// TCP ports the daemon must be allowed to `bind` on after the
-    /// sandbox is applied. Empty by default; the listen-side TCP
-    /// port is bound before the sandbox closes, but post-sandbox
-    /// `bind` (e.g. for the admin loop's accepted streams' kernel
-    /// bookkeeping) needs an explicit rule on some kernels.
-    pub bind_tcp_ports: Vec<u16>,
 }
+
+// The listen-side TCP socket is bound BEFORE the sandbox closes,
+// so the Landlock ruleset never needs `BindTcp` rules. Only
+// `ConnectTcp` to port 443 (for outbound provider HTTPS) is added.
 
 /// What `apply` actually managed to put in place. Reported back so the
 /// daemon can log a structured `sandbox_applied` event.
@@ -152,7 +150,7 @@ fn apply_landlock(
                 // tolerable on best-effort and we surface it at debug
                 // so an operator running `--required` can chase it.
                 tracing::debug!(
-                    evt = "sandbox_path_skipped",
+                    evt = %EventKind::SandboxPathSkipped,
                     path = %d.display(),
                     reason = "open_failed",
                     error = %e,
@@ -175,7 +173,7 @@ fn apply_landlock(
                 if source.kind() == io::ErrorKind::NotFound =>
             {
                 tracing::debug!(
-                    evt = "sandbox_path_skipped",
+                    evt = %EventKind::SandboxPathSkipped,
                     path = %f.display(),
                     reason = "enoent",
                 );
@@ -193,11 +191,6 @@ fn apply_landlock(
     created = created
         .add_rule(NetPort::new(443, AccessNet::ConnectTcp))
         .map_err(SandboxError::Ruleset)?;
-    for &port in &paths.bind_tcp_ports {
-        created = created
-            .add_rule(NetPort::new(port, AccessNet::BindTcp))
-            .map_err(SandboxError::Ruleset)?;
-    }
 
     let status = created.restrict_self().map_err(SandboxError::Restrict)?;
     let status_str = match status.ruleset {
@@ -248,7 +241,6 @@ mod tests {
             read_dirs: vec![],
             resolv_files: vec![],
             write_parent_dirs: write_dirs,
-            bind_tcp_ports: vec![],
         }
     }
 
@@ -305,7 +297,6 @@ mod tests {
                 read_dirs: vec![],
                 resolv_files: vec![PathBuf::from("/definitely/does/not/exist/symbolon-test")],
                 write_parent_dirs: vec![],
-                bind_tcp_ports: vec![],
             };
             // Should not error on the missing resolv file.
             let _ = apply(SandboxMode::BestEffort, &paths).expect("apply with missing resolv ok");

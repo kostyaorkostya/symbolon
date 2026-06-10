@@ -10,6 +10,8 @@ use std::path::Path;
 
 use sd_notify::NotifyState;
 
+use crate::events::EventKind;
+
 /// Call once main has decided the daemon is ready: config loaded,
 /// key in memory, sockets bound, sandbox applied, selfcheck done.
 ///
@@ -23,7 +25,7 @@ pub async fn notify(pidfile: Option<&Path>) {
     if let Some(path) = pidfile {
         let contents = format!("{}\n", std::process::id()).into_bytes();
         if let Err(e) = crate::admin::atomic_write(path, contents, 0o644).await {
-            tracing::warn!(evt = "ready_pidfile_write_failed", path = %path.display(), error = %e);
+            tracing::warn!(evt = %EventKind::ReadyPidfileWriteFailed, path = %path.display(), error = %e);
         }
     }
 }

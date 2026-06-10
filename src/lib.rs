@@ -29,6 +29,7 @@ pub(crate) mod config;
 pub(crate) mod connection_tracker;
 pub(crate) mod cpu_worker;
 pub(crate) mod daemon;
+pub(crate) mod events;
 pub(crate) mod git_credential;
 pub(crate) mod loader;
 pub(crate) mod logging;
@@ -57,6 +58,8 @@ pub use crate::config::{
 pub use crate::cpu_worker::CpuWorker;
 #[doc(hidden)]
 pub use crate::daemon::{Service, ServiceHandle, run as run_daemon};
+#[doc(hidden)]
+pub use crate::events::EventKind;
 #[doc(hidden)]
 pub use crate::loader::load_config;
 #[doc(hidden)]

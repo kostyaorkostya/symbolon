@@ -99,8 +99,7 @@ accessible to the App.
    side of `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s` against the PSK
    selected by the client's identity prelude. Clients use the
    bundled `git-credential-symbolon` helper to run the matching
-   initiator. No TLS at any layer (preserves the no-TLS hard NOT);
-   no stunnel.
+   initiator. No TLS at any layer (preserves the no-TLS hard NOT).
 7. **Identity: PSK identity from the Noise handshake.** The client
    emits a small unencrypted identity prelude (`magic | version |
    identity_len | identity`) before the handshake; the broker looks
@@ -190,7 +189,21 @@ Pinned in `Cargo.toml`:
   `tests::known_vector_matches_jsonwebtoken_baseline`. RSASSA-
   PKCS1-v1_5 with SHA-256 is one of the most thoroughly specified
   JOSE algorithms; the actual signing is a single `rsa::SigningKey`
-  call.
+  call. `rsa` 0.9 carries `zeroize` as a non-optional transitive
+  dep, so `RsaPrivateKey` zeroes its key material on drop with no
+  feature opt-in needed.
+- `zeroize` (the `Zeroizing<[u8; 32]>` wrapper used in
+  `src/psk_store.rs` so per-client PSKs are wiped from memory on
+  `revoke` / drop, complementing the `mlockall` + `LimitCORE=0`
+  secrets-off-disk story per AGENTS.md invariant #14. The
+  freshly-generated PSK in `src/admin.rs::generate_psk_key` and
+  the per-connection stack copy in `src/daemon.rs::handle_connection`
+  use the same wrapper so the bytes never linger on a stack frame.)
+- `hex` (encode/decode for the per-line PSK file format in
+  `src/psk_store.rs`, the enroll output's `psk_hex` field in
+  `src/admin.rs`, and the client binary's PSK file load in
+  `src/bin/git_credential_symbolon.rs`. Pure-Rust, zero runtime
+  deps, dual MIT/Apache. Replaces three hand-rolled hex codecs.)
 - `landlock` (Linux LSM sandboxing at ABI 6: FS allowlist +
   TCP-connect/bind + abstract-UDS scope + `Scope::Signal`
   (Linux 6.12+) denying cross-domain signal-sending. Applied in
@@ -246,6 +259,12 @@ Pinned in `Cargo.toml`:
 - `futures-util` (`select!` and `FutureExt::fuse()` for the
   accept-vs-signal race in `daemon::run`; compio's own examples
   pull it in the same way — see compio-0.18 `examples/tick.rs`).
+- `futures-channel` (`oneshot` for the result hand-back in
+  `src/cpu_worker.rs`; the dedicated OS thread sends the
+  computed value back to the awaiting compio task.)
+- `base64` (URL-safe-no-pad encoding in `src/providers/jwt_rs256.rs`
+  for the JWT header / payload / signature segments. Listed as a
+  top-level dep so the audit surface is explicit.)
 - `ulid` (request IDs)
 - `thiserror` (errors)
 - `rustix` with features `net,process`. `process` for `geteuid` on

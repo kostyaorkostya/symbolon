@@ -23,6 +23,7 @@ cyper = { version = "0.9", default-features = false, features = [
 ] }
 futures-channel = "0.3"
 futures-util = "0.3.32"
+hex = "0.4.3"
 humantime-serde = "1.1.1"
 landlock = "0.4.5"
 libc = "0.2.186"
@@ -66,6 +67,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 ] }
 ulid = "1.2.1"
 url = { version = "2.5.8", default-features = false }
+zeroize = "1.8.2"
 
 [profile.release]
 opt-level = "z"

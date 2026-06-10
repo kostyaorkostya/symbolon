@@ -18,6 +18,7 @@
 use tracing::{error, info, warn};
 
 use crate::config::MlockMode;
+use crate::events::EventKind;
 
 #[derive(Debug, thiserror::Error)]
 #[error("mlockall(MCL_CURRENT|MCL_FUTURE|MCL_ONFAULT) failed (security.mlock = \"required\")")]
@@ -25,7 +26,7 @@ pub struct MlockRequiredFailed(#[source] pub std::io::Error);
 
 pub fn apply(mode: MlockMode) -> Result<(), MlockRequiredFailed> {
     if mode == MlockMode::Off {
-        info!(evt = "mlock", status = "off", policy = "off");
+        info!(evt = %EventKind::Mlock, status = "off", policy = "off");
         return Ok(());
     }
     let flags = libc::MCL_CURRENT | libc::MCL_FUTURE | libc::MCL_ONFAULT;
@@ -35,7 +36,7 @@ pub fn apply(mode: MlockMode) -> Result<(), MlockRequiredFailed> {
     let rc = unsafe { libc::mlockall(flags) };
     if rc == 0 {
         info!(
-            evt = "mlock",
+            evt = %EventKind::Mlock,
             status = "applied",
             policy = ?mode,
             flags = "current|future|onfault",
@@ -46,7 +47,7 @@ pub fn apply(mode: MlockMode) -> Result<(), MlockRequiredFailed> {
     match mode {
         MlockMode::Required => {
             error!(
-                evt = "mlock",
+                evt = %EventKind::Mlock,
                 status = "failed",
                 policy = "required",
                 error = %err,
@@ -55,7 +56,7 @@ pub fn apply(mode: MlockMode) -> Result<(), MlockRequiredFailed> {
         }
         MlockMode::BestEffort => {
             warn!(
-                evt = "mlock",
+                evt = %EventKind::Mlock,
                 status = "skipped",
                 policy = "best_effort",
                 error = %err,

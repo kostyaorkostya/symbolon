@@ -4,8 +4,7 @@
 
 //! In-memory PSK store backed by the on-disk `psks` file.
 //!
-//! File format (unchanged from the prior `stunnel.psk`, just renamed and
-//! relocated):
+//! File format:
 //! ```text
 //! identity:hex_psk
 //! identity:hex_psk
@@ -24,6 +23,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+use zeroize::Zeroizing;
 
 const PSK_LEN: usize = 32;
 const MAX_IDENTITY_LEN: usize = 64;
@@ -77,10 +78,13 @@ pub enum PskStoreError {
     },
 }
 
-/// In-memory map from identity → 32-byte PSK.
+/// In-memory map from identity → 32-byte PSK. Values are wrapped in
+/// `Zeroizing` so they are wiped from memory on remove and on store
+/// drop, defence-in-depth with `mlockall` (anti-swap) and
+/// `LimitCORE=0` (anti-coredump) per AGENTS.md invariant #14.
 #[derive(Debug, Default)]
 pub struct PskStore {
-    entries: HashMap<String, [u8; PSK_LEN]>,
+    entries: HashMap<String, Zeroizing<[u8; PSK_LEN]>>,
 }
 
 impl PskStore {
@@ -93,7 +97,7 @@ impl PskStore {
     /// Parse a PSK file's contents into a store. Caller passes `path` only for
     /// error context.
     pub fn parse(text: &str, path: &Path) -> Result<Self, PskStoreError> {
-        let mut entries: HashMap<String, [u8; PSK_LEN]> = HashMap::new();
+        let mut entries: HashMap<String, Zeroizing<[u8; PSK_LEN]>> = HashMap::new();
         for (idx, raw) in text.lines().enumerate() {
             let line_no = idx + 1;
             let line = raw.trim_end_matches(['\r', '\n']);
@@ -121,16 +125,17 @@ impl PskStore {
 
     /// Look up a PSK by identity. Returns `None` if the identity is not enrolled.
     pub fn lookup(&self, identity: &str) -> Option<&[u8; PSK_LEN]> {
-        self.entries.get(identity)
+        self.entries.get(identity).map(|z| &**z)
     }
 
-    /// Insert or replace an identity's PSK. Returns the prior PSK if one was set,
-    /// so callers can decide whether to treat enrollment as create-or-update.
-    pub fn insert(&mut self, identity: String, psk: [u8; PSK_LEN]) -> Option<[u8; PSK_LEN]> {
-        self.entries.insert(identity, psk)
+    /// Insert or replace an identity's PSK. The prior value (if any)
+    /// is dropped through `Zeroizing`, wiping it from memory.
+    pub fn insert(&mut self, identity: String, psk: [u8; PSK_LEN]) {
+        self.entries.insert(identity, Zeroizing::new(psk));
     }
 
-    /// Remove an identity. Returns whether anything was removed.
+    /// Remove an identity. Returns whether anything was removed. The
+    /// removed PSK is wiped through `Zeroizing`.
     pub fn remove(&mut self, identity: &str) -> bool {
         self.entries.remove(identity).is_some()
     }
@@ -155,10 +160,7 @@ impl PskStore {
             let psk = self.entries.get(k).expect("key from same map");
             out.push_str(k);
             out.push(':');
-            for byte in psk {
-                use std::fmt::Write as _;
-                write!(&mut out, "{byte:02x}").expect("write to String never fails");
-            }
+            out.push_str(&hex::encode(psk.as_slice()));
             out.push('\n');
         }
         out
@@ -186,39 +188,34 @@ fn validate_identity(id: &str, path: &Path, line: usize) -> Result<(), PskStoreE
     Ok(())
 }
 
-fn decode_psk_hex(hex: &str, path: &Path, line: usize) -> Result<[u8; PSK_LEN], PskStoreError> {
-    if hex.len() != PSK_LEN * 2 {
+fn decode_psk_hex(
+    hex_str: &str,
+    path: &Path,
+    line: usize,
+) -> Result<Zeroizing<[u8; PSK_LEN]>, PskStoreError> {
+    if hex_str.len() != PSK_LEN * 2 {
         return Err(PskStoreError::BadPskHexLen {
             path: path.to_path_buf(),
             line,
-            got: hex.len(),
+            got: hex_str.len(),
         });
     }
-    let mut out = [0u8; PSK_LEN];
-    let bytes = hex.as_bytes();
-    for i in 0..PSK_LEN {
-        let hi = hex_nibble(bytes[2 * i]).ok_or(PskStoreError::BadPskHex {
+    let mut out = Zeroizing::new([0u8; PSK_LEN]);
+    hex::decode_to_slice(hex_str, out.as_mut_slice()).map_err(|e| match e {
+        hex::FromHexError::InvalidHexCharacter { c, .. } => PskStoreError::BadPskHex {
             path: path.to_path_buf(),
             line,
-            byte: bytes[2 * i],
-        })?;
-        let lo = hex_nibble(bytes[2 * i + 1]).ok_or(PskStoreError::BadPskHex {
+            byte: c as u8,
+        },
+        // Length already validated above; OddLength / InvalidStringLength
+        // are unreachable here. Surface as BadPskHexLen if reached.
+        _ => PskStoreError::BadPskHexLen {
             path: path.to_path_buf(),
             line,
-            byte: bytes[2 * i + 1],
-        })?;
-        out[i] = (hi << 4) | lo;
-    }
+            got: hex_str.len(),
+        },
+    })?;
     Ok(out)
-}
-
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(10 + b - b'a'),
-        b'A'..=b'F' => Some(10 + b - b'A'),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -359,7 +356,7 @@ mod tests {
     #[test]
     fn insert_then_remove_then_lookup() {
         let mut s = PskStore::empty();
-        assert_eq!(s.insert("x".to_string(), psk_a()), None);
+        s.insert("x".to_string(), psk_a());
         assert_eq!(s.lookup("x"), Some(&psk_a()));
         assert!(s.remove("x"));
         assert_eq!(s.lookup("x"), None);
@@ -367,10 +364,10 @@ mod tests {
     }
 
     #[test]
-    fn insert_replaces_returns_prior() {
+    fn insert_replaces() {
         let mut s = PskStore::empty();
         s.insert("x".to_string(), psk_a());
-        assert_eq!(s.insert("x".to_string(), psk_b()), Some(psk_a()));
+        s.insert("x".to_string(), psk_b());
         assert_eq!(s.lookup("x"), Some(&psk_b()));
     }
 }

@@ -15,11 +15,9 @@
 //! State writes are atomic per PROTOCOLS.md § "Atomic writes":
 //! tempfile → fsync → rename → fsync parent. `clients.json` lands
 //! with mode `0o640`, the symbolon-owned `psks` file with `0o600`.
-//! The daemon owns the PSK store directly (no stunnel, no SIGHUP)
-//! — atomic write to disk and in-memory swap happen in the same
-//! enroll/revoke handler.
+//! The daemon owns the PSK store directly — atomic write to disk
+//! and in-memory swap happen in the same enroll/revoke handler.
 
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -32,7 +30,9 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::daemon::{ResolvedClient, SharedState};
+use crate::events::EventKind;
 use crate::providers::github::GithubError;
+use zeroize::Zeroizing;
 
 const CLIENTS_FILE_MODE: u32 = 0o640;
 const PSK_FILE_MODE: u32 = 0o600;
@@ -217,13 +217,13 @@ async fn handle_admin(mut stream: UnixStream, state: Rc<SharedState>) {
     let request: Request = match serde_json::from_slice(&raw) {
         Ok(r) => r,
         Err(e) => {
-            info!(evt = "admin_request", req_id = %req_id, ok = false, error = %e);
+            info!(evt = %EventKind::AdminRequest, req_id = %req_id, ok = false, error = %e);
             let resp = error_response("bad_request", &format!("request parse failed: {e}"));
             let _ = write_response(&mut stream, &resp).await;
             return;
         }
     };
-    info!(evt = "admin_request", req_id = %req_id, op = %request.op_name());
+    info!(evt = %EventKind::AdminRequest, req_id = %req_id, op = %request.op_name());
     let resp_value = match dispatch(&req_id, &request, &state).await {
         Ok(v) => v,
         Err(e) => e,
@@ -341,7 +341,7 @@ async fn handle_enroll(
     let key_bytes = generate_psk_key()
         .await
         .map_err(|e| error_response("internal", &format!("rng: {e}")))?;
-    let psk_hex = hex_encode(&key_bytes);
+    let psk_hex = hex::encode(key_bytes.as_slice());
 
     // Update the in-memory PSK store, then write the new on-disk file
     // (deterministic sorted render). Insert is idempotent — on a retry
@@ -349,7 +349,7 @@ async fn handle_enroll(
     state
         .psks
         .borrow_mut()
-        .insert(client.to_string(), key_bytes);
+        .insert(client.to_string(), *key_bytes);
     let psk_content = state.psks.borrow().render();
     if let Err(e) = atomic_write(
         &state.psk_file_path,
@@ -408,7 +408,7 @@ async fn handle_enroll(
         },
     );
 
-    info!(evt = "enroll", provider = provider, client = client);
+    info!(evt = %EventKind::Enroll, provider = provider, client = client);
     Ok(serde_json::json!({
         "ok": true,
         "identity": client,
@@ -467,7 +467,7 @@ async fn handle_revoke(
 
     state.clients.borrow_mut().remove(client);
 
-    info!(evt = "revoke", provider = provider, client = client);
+    info!(evt = %EventKind::Revoke, provider = provider, client = client);
     Ok(serde_json::json!({ "ok": true }))
 }
 
@@ -741,15 +741,7 @@ fn is_valid_client_name(s: &str) -> bool {
             .any(|c| c == ':' || c == '\n' || c == '\r' || c.is_whitespace())
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        write!(s, "{b:02x}").expect("write to String never fails");
-    }
-    s
-}
-
-async fn generate_psk_key() -> std::io::Result<[u8; 32]> {
+async fn generate_psk_key() -> std::io::Result<Zeroizing<[u8; 32]>> {
     use compio::io::AsyncReadAtExt;
     let file = compio::fs::File::open("/dev/urandom").await?;
     let buf = vec![0u8; 32];
@@ -758,7 +750,7 @@ async fn generate_psk_key() -> std::io::Result<[u8; 32]> {
     let arr: [u8; 32] = buf
         .try_into()
         .map_err(|_| std::io::Error::other("short read from /dev/urandom"))?;
-    Ok(arr)
+    Ok(Zeroizing::new(arr))
 }
 
 pub(crate) async fn atomic_write(path: &Path, content: Vec<u8>, mode: u32) -> std::io::Result<()> {
@@ -840,7 +832,7 @@ fn check_peer_uid(stream: &UnixStream, my_uid: u32) -> bool {
                 true
             } else {
                 tracing::warn!(
-                    evt = "admin_denied",
+                    evt = %EventKind::AdminDenied,
                     peer_uid = uid,
                     peer_pid = cred.pid.as_raw_nonzero().get(),
                 );
@@ -849,7 +841,7 @@ fn check_peer_uid(stream: &UnixStream, my_uid: u32) -> bool {
         }
         Err(e) => {
             tracing::warn!(
-                evt = "admin_peercred_failed",
+                evt = %EventKind::AdminPeercredFailed,
                 error = %e,
                 "admitting connection; peer credentials unavailable",
             );
@@ -909,12 +901,6 @@ async fn write_response(stream: &mut UnixStream, value: &serde_json::Value) -> s
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn hex_encode_known_vector() {
-        assert_eq!(hex_encode(&[0xDE, 0xAD, 0xBE, 0xEF]), "deadbeef");
-        assert_eq!(hex_encode(&[0x00, 0x0F, 0xF0]), "000ff0");
-    }
 
     #[test]
     fn request_round_trips() {

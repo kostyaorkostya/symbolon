@@ -48,7 +48,7 @@ pub struct RuntimeConfig {
 pub struct ListenConfig {
     /// TCP address the daemon binds for inbound client connections.
     /// Default deployment: `0.0.0.0:9418`. Symbolon terminates Noise NNpsk0
-    /// in-process; no stunnel layer.
+    /// in-process.
     pub bind: SocketAddr,
     /// Path to the symbolon-owned PSK store (`identity:hex_psk` per line).
     /// Read at startup and re-read on SIGHUP. Atomically rewritten by
@@ -207,9 +207,9 @@ fn default_user_agent() -> String {
 #[serde(deny_unknown_fields)]
 pub struct ClientsFile {
     /// Schema version. Only `2` is supported today. v1 carried an
-    /// `ip` field per client (used when stunnel fronted the daemon
-    /// and identity came from the source IP); v2 drops it — identity
-    /// now derives from the Noise handshake's PSK selection.
+    /// `ip` field per client (identity used to come from the source
+    /// IP); v2 drops it — identity now derives from the Noise
+    /// handshake's PSK selection.
     pub version: u32,
     pub clients: Vec<ClientEntry>,
 }

@@ -38,6 +38,7 @@ const REPO_PATH_SAFE: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'.').re
 
 use crate::config::ProviderGithub;
 use crate::cpu_worker::CpuWorker;
+use crate::events::EventKind;
 use crate::git_credential;
 
 const GITHUB_API_VERSION: &str = "2022-11-28";
@@ -272,7 +273,7 @@ impl GitHubProvider {
     {
         let out_req_id = ulid::Ulid::new().to_string();
         info!(
-            evt = "provider_call",
+            evt = %EventKind::ProviderCall,
             req_id = %req_id,
             out_req_id = %out_req_id,
             endpoint = endpoint,
@@ -291,7 +292,7 @@ impl GitHubProvider {
         match raced {
             Ok(pc) => {
                 info!(
-                    evt = "provider_call_done",
+                    evt = %EventKind::ProviderCallDone,
                     req_id = %req_id,
                     out_req_id = %out_req_id,
                     status = pc.status,
@@ -305,7 +306,7 @@ impl GitHubProvider {
             }
             Err(e) => {
                 info!(
-                    evt = "provider_call_done",
+                    evt = %EventKind::ProviderCallDone,
                     req_id = %req_id,
                     out_req_id = %out_req_id,
                     status = 0,

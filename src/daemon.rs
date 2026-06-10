@@ -48,6 +48,7 @@ use tracing::{info, warn};
 use crate::config::{ClientsFile, Config};
 use crate::connection_tracker::ConnectionTracker;
 use crate::cpu_worker::CpuWorker;
+use crate::events::EventKind;
 use crate::git_credential;
 use crate::providers::github::{GitHubProvider, GithubError};
 use crate::psk_store::{PskStore, PskStoreError};
@@ -222,7 +223,7 @@ impl Service {
         };
 
         // Pre-sandbox: bind the inbound TCP listener directly. The
-        // daemon terminates Noise NNpsk0 in-process; no stunnel layer.
+        // daemon terminates Noise NNpsk0 in-process.
         let listen_addr = cfg.listen.bind;
         let listener =
             TcpListener::bind(&listen_addr)
@@ -278,7 +279,7 @@ impl Service {
         });
 
         info!(
-            evt = "prepare",
+            evt = %EventKind::Prepare,
             version = env!("CARGO_PKG_VERSION"),
             config_path = %config_path.display(),
             listen_addr = %listen_addr,
@@ -316,7 +317,7 @@ impl Service {
             match provider.selfcheck(&req_id).await {
                 Ok(outcome) => {
                     info!(
-                        evt = "selfcheck",
+                        evt = %EventKind::Selfcheck,
                         req_id = %req_id,
                         out_req_id = %outcome.out_req_id,
                         gh_req_id = outcome.gh_req_id.as_deref().unwrap_or(""),
@@ -327,7 +328,7 @@ impl Service {
                 }
                 Err(e) => {
                     warn!(
-                        evt = "selfcheck",
+                        evt = %EventKind::Selfcheck,
                         req_id = %req_id,
                         provider = %host,
                         ok = false,
@@ -346,7 +347,7 @@ impl Service {
         let _listen_addr = self.listen_addr;
         let admin_listener = self.admin_listener;
         let provider_names: Vec<&str> = state.providers.keys().map(String::as_str).collect();
-        info!(evt = "startup", providers = ?provider_names, "daemon started");
+        info!(evt = %EventKind::Startup, providers = ?provider_names, "daemon started");
 
         // Admin loop: held as a JoinHandle and awaited after the
         // accept loop exits. The admin loop itself selects on
@@ -406,7 +407,7 @@ impl Service {
         let drain_ms = shutdown_start.elapsed().as_millis() as u64;
         if !drain_complete {
             tracing::warn!(
-                evt = "drain_incomplete",
+                evt = %EventKind::DrainIncomplete,
                 inflight_drained,
                 drain_ms,
                 "drain deadline expired with handlers still in flight",
@@ -453,14 +454,14 @@ async fn reload_clients_inner(state: &SharedState, path: &Path) {
     let file = match crate::loader::load_clients_file(path).await {
         Ok(f) => f,
         Err(e) => {
-            warn!(evt = "config_reload", triggered_by = "sighup", ok = false, error = %e);
+            warn!(evt = %EventKind::ConfigReload, triggered_by = "sighup", ok = false, error = %e);
             return;
         }
     };
     let new_table = match build_clients_table(file) {
         Ok(t) => t,
         Err(e) => {
-            warn!(evt = "config_reload", triggered_by = "sighup", ok = false, error = %e);
+            warn!(evt = %EventKind::ConfigReload, triggered_by = "sighup", ok = false, error = %e);
             return;
         }
     };
@@ -470,7 +471,7 @@ async fn reload_clients_inner(state: &SharedState, path: &Path) {
     let new_psks = match load_psk_store(&state.psk_file_path).await {
         Ok(store) => store,
         Err(e) => {
-            warn!(evt = "config_reload", triggered_by = "sighup", ok = false, error = %e);
+            warn!(evt = %EventKind::ConfigReload, triggered_by = "sighup", ok = false, error = %e);
             return;
         }
     };
@@ -479,7 +480,7 @@ async fn reload_clients_inner(state: &SharedState, path: &Path) {
     *state.clients.borrow_mut() = new_table;
     *state.psks.borrow_mut() = new_psks;
     info!(
-        evt = "config_reload",
+        evt = %EventKind::ConfigReload,
         triggered_by = "sighup",
         client_count = client_count,
         psk_count = psk_count,
@@ -577,11 +578,6 @@ fn apply_sandbox(cfg: &Config) -> Result<(), DaemonError> {
             }
             v
         },
-        // TCP listen socket is bound BEFORE the sandbox closes, so
-        // post-sandbox `bind` is not required. Outbound connect to
-        // port 443 is permitted by the unconditional `ConnectTcp`
-        // rule inside `sandbox::apply`.
-        bind_tcp_ports: vec![],
     };
     let outcome = sandbox::apply(level, &paths)?;
     let degraded = !matches!(outcome.status, "fully_enforced" | "off");
@@ -589,7 +585,7 @@ fn apply_sandbox(cfg: &Config) -> Result<(), DaemonError> {
     // factor the level branch out further than this.
     if degraded {
         warn!(
-            evt = "sandbox_applied",
+            evt = %EventKind::SandboxApplied,
             policy = ?cfg.security.sandbox,
             abi = outcome.requested_abi,
             status = outcome.status,
@@ -599,7 +595,7 @@ fn apply_sandbox(cfg: &Config) -> Result<(), DaemonError> {
         );
     } else {
         info!(
-            evt = "sandbox_applied",
+            evt = %EventKind::SandboxApplied,
             policy = ?cfg.security.sandbox,
             abi = outcome.requested_abi,
             status = outcome.status,
@@ -647,7 +643,7 @@ async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<Shar
         Err(reason) => {
             warn!(
                 req_id = %req_id,
-                evt = "prelude_invalid",
+                evt = %EventKind::PreludeInvalid,
                 peer = ?peer,
                 reason = reason,
             );
@@ -657,11 +653,11 @@ async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<Shar
 
     // ------ Phase 2: PSK lookup + client metadata lookup ------
     let psk = match state.psks.borrow().lookup(&identity_owned) {
-        Some(p) => *p,
+        Some(p) => zeroize::Zeroizing::new(*p),
         None => {
             warn!(
                 req_id = %req_id,
-                evt = "mint_denied",
+                evt = %EventKind::MintDenied,
                 reason = "client_unknown",
                 psk_identity = %identity_owned,
                 peer = ?peer,
@@ -674,7 +670,7 @@ async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<Shar
         // two files; refuse to mint rather than guess metadata.
         warn!(
             req_id = %req_id,
-            evt = "mint_denied",
+            evt = %EventKind::MintDenied,
             reason = "client_metadata_missing",
             psk_identity = %identity_owned,
         );
@@ -682,7 +678,7 @@ async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<Shar
     };
     info!(
         req_id = %req_id,
-        evt = "accept",
+        evt = %EventKind::Accept,
         psk_identity = %client.name,
         peer = ?peer,
     );
@@ -693,7 +689,7 @@ async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<Shar
         Err(reason) => {
             warn!(
                 req_id = %req_id,
-                evt = "handshake_failed",
+                evt = %EventKind::HandshakeFailed,
                 client = %client.name,
                 reason = reason,
             );
@@ -707,7 +703,7 @@ async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<Shar
         Err(reason) => {
             warn!(
                 req_id = %req_id,
-                evt = "mint_denied",
+                evt = %EventKind::MintDenied,
                 reason = "transport_read",
                 client = %client.name,
                 detail = reason,
@@ -718,7 +714,7 @@ async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<Shar
     if request_bytes.len() > WIRE_READ_BUDGET {
         warn!(
             req_id = %req_id,
-            evt = "mint_denied",
+            evt = %EventKind::MintDenied,
             reason = "malformed_request",
             client = %client.name,
             detail = "request_exceeds_cap",
@@ -730,7 +726,7 @@ async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<Shar
         Err(e) => {
             warn!(
                 req_id = %req_id,
-                evt = "mint_denied",
+                evt = %EventKind::MintDenied,
                 reason = "malformed_request",
                 client = %client.name,
                 error = %e,
@@ -744,7 +740,7 @@ async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<Shar
     let Some(provider) = state.providers.get(&request.host) else {
         warn!(
             req_id = %req_id,
-            evt = "mint_denied",
+            evt = %EventKind::MintDenied,
             reason = "unknown_host",
             host = %request.host,
             client = %client.name,
@@ -771,7 +767,7 @@ async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<Shar
             if matches!(e, GithubError::RepoNotFound { .. }) {
                 info!(
                     req_id = %req_id,
-                    evt = "cache_invalidated",
+                    evt = %EventKind::CacheInvalidated,
                     provider = %request.host,
                     repo = %request.path,
                     cause = "404",
@@ -794,7 +790,7 @@ async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<Shar
     if let Err(e) = git_credential::write_response(&response, &mut out) {
         warn!(
             req_id = %req_id,
-            evt = "provider_error",
+            evt = %EventKind::ProviderError,
             reason = "response_encode",
             provider = %request.host,
             error = %e,
@@ -804,7 +800,7 @@ async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<Shar
     if let Err(reason) = write_framed_encrypt(&mut stream, &mut transport_state, &out).await {
         warn!(
             req_id = %req_id,
-            evt = "provider_error",
+            evt = %EventKind::ProviderError,
             reason = "response_write",
             provider = %request.host,
             detail = reason,
@@ -828,7 +824,7 @@ async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<Shar
         req_id = %req_id,
         out_req_id = %out_req_id,
         gh_req_id = gh_req_id.as_deref().unwrap_or(""),
-        evt = "mint",
+        evt = %EventKind::Mint,
         provider = %request.host,
         client = %client.name,
         repo = %request.path,
@@ -851,7 +847,7 @@ fn log_mint_error(
         GithubError::RepoNotFound { .. } => {
             warn!(
                 req_id = %req_id,
-                evt = "mint_denied",
+                evt = %EventKind::MintDenied,
                 reason = "repo_not_accessible",
                 provider_status = 404,
                 provider = %host,
@@ -863,7 +859,7 @@ fn log_mint_error(
         GithubError::Unauthorized => {
             warn!(
                 req_id = %req_id,
-                evt = "mint_denied",
+                evt = %EventKind::MintDenied,
                 reason = "provider_4xx",
                 provider_status = 401,
                 provider = %host,
@@ -875,7 +871,7 @@ fn log_mint_error(
         GithubError::Forbidden => {
             warn!(
                 req_id = %req_id,
-                evt = "mint_denied",
+                evt = %EventKind::MintDenied,
                 reason = "provider_4xx",
                 provider_status = 403,
                 provider = %host,
@@ -887,7 +883,7 @@ fn log_mint_error(
         GithubError::RateLimited => {
             warn!(
                 req_id = %req_id,
-                evt = "mint_denied",
+                evt = %EventKind::MintDenied,
                 reason = "provider_4xx",
                 provider_status = 429,
                 provider = %host,
@@ -899,7 +895,7 @@ fn log_mint_error(
         GithubError::MalformedPath(_) => {
             warn!(
                 req_id = %req_id,
-                evt = "mint_denied",
+                evt = %EventKind::MintDenied,
                 reason = "malformed_request",
                 provider = %host,
                 client = %client_name,
@@ -910,7 +906,7 @@ fn log_mint_error(
         GithubError::ServerError(status) => {
             warn!(
                 req_id = %req_id,
-                evt = "provider_error",
+                evt = %EventKind::ProviderError,
                 status = *status,
                 provider = %host,
                 repo = %path,
@@ -920,7 +916,7 @@ fn log_mint_error(
         GithubError::UnexpectedStatus(status) => {
             warn!(
                 req_id = %req_id,
-                evt = "provider_error",
+                evt = %EventKind::ProviderError,
                 status = *status,
                 provider = %host,
                 repo = %path,
@@ -930,7 +926,7 @@ fn log_mint_error(
         _ => {
             warn!(
                 req_id = %req_id,
-                evt = "provider_error",
+                evt = %EventKind::ProviderError,
                 provider = %host,
                 repo = %path,
                 provider_ms = provider_ms,

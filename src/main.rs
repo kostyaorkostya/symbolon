@@ -8,6 +8,7 @@ use std::process::ExitCode;
 use argh::FromArgs;
 
 use symbolon::CliCommand;
+use symbolon::EventKind;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/symbolon/config.toml";
 
@@ -58,7 +59,7 @@ async fn run_daemon(config_path: PathBuf) -> ExitCode {
     // is operator-disabled swap on the broker host — see
     // docs/INSTALL.md. Required-mode failure is fatal.
     if let Err(e) = symbolon::mlock_apply(cfg.security.mlock) {
-        tracing::error!(evt = "mlock_required_failed", error = %e);
+        tracing::error!(evt = %EventKind::MlockRequiredFailed, error = %e);
         return ExitCode::from(1);
     }
 
@@ -66,7 +67,7 @@ async fn run_daemon(config_path: PathBuf) -> ExitCode {
     let shutdown_watcher = match symbolon::spawn_shutdown_watcher(shutdown.clone()) {
         Ok(h) => h,
         Err(e) => {
-            tracing::error!(evt = "signal_registration_failed", signal = "SIGTERM/SIGINT", error = %e);
+            tracing::error!(evt = %EventKind::SignalRegistrationFailed, signal = "SIGTERM/SIGINT", error = %e);
             return ExitCode::from(1);
         }
     };
@@ -89,7 +90,7 @@ async fn run_daemon(config_path: PathBuf) -> ExitCode {
     ) {
         Ok(h) => h,
         Err(e) => {
-            tracing::error!(evt = "signal_registration_failed", signal = "SIGHUP", error = %e);
+            tracing::error!(evt = %EventKind::SignalRegistrationFailed, signal = "SIGHUP", error = %e);
             return ExitCode::from(1);
         }
     };
@@ -106,7 +107,7 @@ async fn run_daemon(config_path: PathBuf) -> ExitCode {
     // between this notification and the first `accept()` syscall
     // (microseconds) are processed normally.
     symbolon::ready_notify(cfg.runtime.pidfile.as_deref()).await;
-    tracing::info!(evt = "ready", pid = std::process::id());
+    tracing::info!(evt = %EventKind::Ready, pid = std::process::id());
 
     let run_result = service.run().await;
     let signal_name = shutdown_watcher.await.unwrap_or("SIGTERM");
@@ -115,7 +116,7 @@ async fn run_daemon(config_path: PathBuf) -> ExitCode {
     match run_result {
         Ok(stats) => {
             tracing::info!(
-                evt = "shutdown",
+                evt = %EventKind::Shutdown,
                 signal = signal_name,
                 inflight_drained = stats.inflight_drained,
                 drain_ms = stats.drain_ms,
@@ -124,7 +125,7 @@ async fn run_daemon(config_path: PathBuf) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            tracing::error!(evt = "run_failed", signal = signal_name, error = %e);
+            tracing::error!(evt = %EventKind::RunFailed, signal = signal_name, error = %e);
             ExitCode::from(1)
         }
     }

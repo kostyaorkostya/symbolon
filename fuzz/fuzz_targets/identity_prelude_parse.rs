@@ -1,6 +1,6 @@
 //! Fuzz the identity-prelude parser. The prelude carries the
 //! client identity that drives PSK selection on the daemon side
-//! (AGENTS.md invariant #7 in the post-stunnel architecture).
+//! (AGENTS.md invariant #7).
 //! When parsing succeeds, this harness asserts post-conditions:
 //!
 //! - `consumed >= 6 && consumed <= input.len()` (parser never reads

@@ -78,7 +78,7 @@ A client compromise does NOT buy the attacker:
   are rejected by the provider).
 - Secret reads, issue management, PR management, or anything outside
   the configured minimum permissions.
-- Other clients' traffic (per-client PSKs over TLS).
+- Other clients' traffic (per-client PSKs over Noise NNpsk0).
 - Persistent access (no long-lived tokens; the provider's private key
   never leaves the broker host).
 

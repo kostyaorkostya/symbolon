@@ -209,11 +209,10 @@ read/write allowlist, outbound TCP-connect restricted to port 443,
 abstract-Unix-socket scope, and `Scope::Signal` (Linux 6.12+)
 denying signals to processes outside the broker's Landlock domain.
 Intra-process signal use (Rust panic handlers, libc `abort()`,
-thread-local plumbing) is allowed — those legitimate runtime
-paths used to be incidentally blocked by an earlier seccomp filter
-which became unnecessary collateral after the Noise migration
-removed the only legitimate cross-process signal path (`SIGHUP` to
-stunnel).
+thread-local plumbing) is allowed — Symbolon does not legitimately
+send any cross-process signal, so the scope layer costs nothing
+and the daemon does not maintain a separate seccomp filter to
+enforce it.
 
 **What this prevents** if a dependency CVE ever lets code execute
 inside the daemon:

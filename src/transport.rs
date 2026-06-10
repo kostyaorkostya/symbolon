@@ -28,10 +28,9 @@
 //!        2              len
 //! ```
 //!
-//! The identity prelude is cleartext — matches stunnel's prior TLS-PSK identity
-//! hint, which is also cleartext during the TLS handshake. An attacker on the
-//! wire learns which client identity is being used; without the PSK they can't
-//! impersonate or decrypt anything.
+//! The identity prelude is cleartext — an attacker on the wire learns which
+//! client identity is being used, but without the PSK they can't impersonate
+//! or decrypt anything.
 
 use snow::{Builder, HandshakeState, TransportState, params::NoiseParams};
 

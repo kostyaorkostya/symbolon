@@ -31,7 +31,6 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -155,7 +154,6 @@ pub struct RunStats {
 pub struct Service {
     state: Rc<SharedState>,
     listener: TcpListener,
-    listen_addr: SocketAddr,
     admin_listener: UnixListener,
 }
 
@@ -289,7 +287,6 @@ impl Service {
         Ok(Self {
             state,
             listener,
-            listen_addr,
             admin_listener,
         })
     }
@@ -342,10 +339,11 @@ impl Service {
     /// Run the accept loops until `shutdown` is cancelled, drain
     /// per-connection handlers, unlink the admin socket. Returns RunStats.
     pub async fn run(self) -> Result<RunStats, DaemonError> {
-        let state = self.state;
-        let listener = self.listener;
-        let _listen_addr = self.listen_addr;
-        let admin_listener = self.admin_listener;
+        let Service {
+            state,
+            listener,
+            admin_listener,
+        } = self;
         let provider_names: Vec<&str> = state.providers.keys().map(String::as_str).collect();
         info!(evt = %EventKind::Startup, providers = ?provider_names, "daemon started");
 

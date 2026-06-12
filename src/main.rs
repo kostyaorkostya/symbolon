@@ -75,7 +75,7 @@ async fn run_daemon(config_path: PathBuf) -> ExitCode {
     let service = match symbolon::Service::prepare(&cfg, &config_path, shutdown.clone()).await {
         Ok(v) => v,
         Err(e) => {
-            tracing::error!(error = %e, "prepare failed");
+            tracing::error!(error = %symbolon::ErrorChain(&e), "prepare failed");
             return ExitCode::from(1);
         }
     };

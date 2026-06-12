@@ -19,6 +19,32 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::config::LogLevel;
 
+/// Display wrapper that walks `Error::source()` and joins each
+/// level with `: `. Use at log sites that surface a thiserror
+/// chain — without this, `error = %e` only renders the top
+/// variant's Display, dropping the transport-level cause.
+///
+/// Safety: every error variant the daemon can produce has been
+/// audited for secret-leak via Display. In particular,
+/// `GithubError::JsonParse` (which would carry a response-body
+/// fragment that might include an access token) deliberately
+/// omits its `#[source]`, so the chain stops at the safe
+/// `context` string. See the rationale comment on that variant
+/// in `src/providers/github.rs`.
+pub struct ErrorChain<'a, E: std::error::Error>(pub &'a E);
+
+impl<E: std::error::Error> std::fmt::Display for ErrorChain<'_, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)?;
+        let mut source = self.0.source();
+        while let Some(s) = source {
+            write!(f, ": {s}")?;
+            source = s.source();
+        }
+        Ok(())
+    }
+}
+
 pub fn setup_tracing(level: LogLevel) {
     let level_filter: LevelFilter = match level {
         LogLevel::Trace => LevelFilter::TRACE,

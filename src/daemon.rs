@@ -329,7 +329,7 @@ impl Service {
                         req_id = %req_id,
                         provider = %host,
                         ok = false,
-                        error = %e,
+                        error = %crate::logging::ErrorChain(&e),
                     );
                 }
             }
@@ -353,7 +353,7 @@ impl Service {
         let admin_state = state.clone();
         let admin_handle = compio::runtime::spawn(async move {
             if let Err(e) = crate::admin::run_admin_loop(admin_listener, admin_state).await {
-                tracing::error!(error = %e, "admin loop exited");
+                tracing::error!(error = %crate::logging::ErrorChain(&e), "admin loop exited");
             }
         });
 
@@ -452,14 +452,14 @@ async fn reload_clients_inner(state: &SharedState, path: &Path) {
     let file = match crate::loader::load_clients_file(path).await {
         Ok(f) => f,
         Err(e) => {
-            warn!(evt = %EventKind::ConfigReload, triggered_by = "sighup", ok = false, error = %e);
+            warn!(evt = %EventKind::ConfigReload, triggered_by = "sighup", ok = false, error = %crate::logging::ErrorChain(&e));
             return;
         }
     };
     let new_table = match build_clients_table(file) {
         Ok(t) => t,
         Err(e) => {
-            warn!(evt = %EventKind::ConfigReload, triggered_by = "sighup", ok = false, error = %e);
+            warn!(evt = %EventKind::ConfigReload, triggered_by = "sighup", ok = false, error = %crate::logging::ErrorChain(&e));
             return;
         }
     };
@@ -469,7 +469,7 @@ async fn reload_clients_inner(state: &SharedState, path: &Path) {
     let new_psks = match load_psk_store(&state.psk_file_path).await {
         Ok(store) => store,
         Err(e) => {
-            warn!(evt = %EventKind::ConfigReload, triggered_by = "sighup", ok = false, error = %e);
+            warn!(evt = %EventKind::ConfigReload, triggered_by = "sighup", ok = false, error = %crate::logging::ErrorChain(&e));
             return;
         }
     };
@@ -928,7 +928,7 @@ fn log_mint_error(
                 provider = %host,
                 repo = %path,
                 provider_ms = provider_ms,
-                error = %err,
+                error = %crate::logging::ErrorChain(&err),
             );
         }
     }

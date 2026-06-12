@@ -63,7 +63,7 @@ pub use crate::events::EventKind;
 #[doc(hidden)]
 pub use crate::loader::load_config;
 #[doc(hidden)]
-pub use crate::logging::setup_tracing;
+pub use crate::logging::{ErrorChain, setup_tracing};
 #[doc(hidden)]
 pub use crate::mlock::{MlockRequiredFailed, apply as mlock_apply};
 #[doc(hidden)]

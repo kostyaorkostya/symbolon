@@ -8,12 +8,16 @@
 //! (`swapoff -a` + fstab edit, per docs/INSTALL.md); this
 //! syscall is belt-and-suspenders on top.
 //!
-//! `MCL_ONFAULT` (Linux 4.4+) defers each page's lock to first
-//! fault, which sidesteps the well-documented bug where
-//! mmap'd files get force-loaded into RAM at lock time
-//! ([openbao#354](https://github.com/openbao/openbao/issues/354)).
-//! We don't mmap any file today; the flag is free insurance
-//! for if a future dep adds one.
+//! No `MCL_ONFAULT`: pages are pre-faulted at the time mlockall
+//! is invoked (for current pages) and at allocation time (for
+//! future pages). Deferring locks to first-fault produces a
+//! footgun where `best_effort` + finite `RLIMIT_MEMLOCK` logs
+//! `status=applied` and then the process aborts at the first
+//! allocation that exceeds the limit. Without `ONFAULT`, the
+//! kernel reports the rlimit shortfall synchronously, either at
+//! the mlockall call (current pages don't fit) or at the
+//! offending allocation (future pages don't fit) — never at an
+//! unpredictable later page fault.
 
 use tracing::{error, info, warn};
 
@@ -21,7 +25,7 @@ use crate::config::MlockMode;
 use crate::events::EventKind;
 
 #[derive(Debug, thiserror::Error)]
-#[error("mlockall(MCL_CURRENT|MCL_FUTURE|MCL_ONFAULT) failed (security.mlock = \"required\")")]
+#[error("mlockall(MCL_CURRENT|MCL_FUTURE) failed (security.mlock = \"required\")")]
 pub struct MlockRequiredFailed(#[source] pub std::io::Error);
 
 pub fn apply(mode: MlockMode) -> Result<(), MlockRequiredFailed> {
@@ -29,7 +33,7 @@ pub fn apply(mode: MlockMode) -> Result<(), MlockRequiredFailed> {
         info!(evt = %EventKind::Mlock, status = "off", policy = "off");
         return Ok(());
     }
-    let flags = libc::MCL_CURRENT | libc::MCL_FUTURE | libc::MCL_ONFAULT;
+    let flags = libc::MCL_CURRENT | libc::MCL_FUTURE;
     // SAFETY: mlockall takes integer flags only; no memory is
     // dereferenced. Effect is process-wide page-lock state,
     // which is exactly what we want.
@@ -39,7 +43,7 @@ pub fn apply(mode: MlockMode) -> Result<(), MlockRequiredFailed> {
             evt = %EventKind::Mlock,
             status = "applied",
             policy = ?mode,
-            flags = "current|future|onfault",
+            flags = "current|future",
         );
         return Ok(());
     }

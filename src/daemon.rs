@@ -563,6 +563,15 @@ fn apply_sandbox(cfg: &Config) -> Result<(), DaemonError> {
                     .parent()
                     .ok_or(DaemonError::NoParentDir("listen.psk_file"))?
                     .to_path_buf(),
+                // Shutdown unlinks the admin Unix socket; without
+                // its parent in the allowlist, the remove_file would
+                // silently fail post-sandbox and leave a stale socket
+                // for the next start.
+                cfg.admin
+                    .socket_path
+                    .parent()
+                    .ok_or(DaemonError::NoParentDir("admin.socket_path"))?
+                    .to_path_buf(),
             ];
             // ready::notify writes the pidfile post-sandbox; its
             // parent dir must be in the write-allowlist.

@@ -41,7 +41,7 @@ sandbox = "best_effort"
 # default ruleset already includes /etc/ssl/certs; RHEL/Fedora hosts
 # typically also need /etc/pki/tls/certs for OpenSSL CA roots.
 extra_read_dirs = []
-# mlockall(MCL_CURRENT|MCL_FUTURE|MCL_ONFAULT) policy at startup.
+# mlockall(MCL_CURRENT|MCL_FUTURE) policy at startup.
 # Belt-and-suspenders against secret exfiltration via swap; the
 # primary defence is disabling swap on the broker host (see
 # docs/INSTALL.md).
@@ -369,8 +369,9 @@ join the broker's log to GitHub's side when filing a ticket.
 
 1. Parse `config.toml`. Fail fast on schema errors.
 2. Load App private key(s) into memory. Fail fast on parse error.
-3. Unlink any stale `listen.socket` and `admin.socket_path`.
-4. Bind both Unix sockets; set mode `0660`, owner `symbolon:symbolon`.
+3. Unlink any stale `admin.socket_path`.
+4. Bind the TCP listen socket and the admin Unix socket; set
+   admin socket mode `0600`, owner `symbolon:symbolon`.
 5. Load `clients.json`. Fail fast on schema errors.
 6. Apply sandbox (Landlock at ABI 6). Per `[security] sandbox`:
    `required` aborts on missing kernel features; `best_effort`
@@ -389,7 +390,8 @@ join the broker's log to GitHub's side when filing a ticket.
 On `SIGTERM` or `SIGINT`:
 1. Stop accepting new connections on the listen socket.
 2. Drain in-flight handlers with a **5-second deadline**.
-3. Close the admin socket and the listen socket (unlinking them).
+3. Unlink and close the admin Unix socket; close the TCP
+   listen socket (no unlink — it's not a filesystem node).
 4. Exit 0.
 
 Log `evt=shutdown signal=<sig> inflight_drained=<n> drain_ms=<ms>`.

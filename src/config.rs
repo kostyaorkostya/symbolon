@@ -126,8 +126,8 @@ pub enum SandboxMode {
 }
 
 /// `mlockall` policy at daemon startup. We call
-/// `mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)` so the App
-/// private key and in-flight tokens never reach swap. Needs
+/// `mlockall(MCL_CURRENT | MCL_FUTURE)` so the App private key
+/// and in-flight tokens never reach swap. Needs
 /// `LimitMEMLOCK=infinity` in the systemd unit (or
 /// CAP_IPC_LOCK) — see docs/INSTALL.md.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]

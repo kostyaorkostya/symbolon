@@ -297,8 +297,12 @@ unset in `config.toml` under systemd** — `Type=notify` covers
 readiness; modern systemd man pages discourage pidfiles when notify
 is available.
 
-OpenRC operators, by contrast, **must** set `[runtime] pidfile` to
-match the init script's `pidfile=` (see §3.9).
+**OpenRC: also leave `[runtime] pidfile` unset.**
+`command_background=yes` + `pidfile=...` in the init script tells
+OpenRC's `start-stop-daemon` to create and manage the pidfile via
+`--make-pidfile` from the supervisor side. A daemon-side pidfile
+would be redundant and would force the pidfile's parent directory
+into the Landlock write-allowlist for no benefit.
 
 ### 3.10 Verify
 

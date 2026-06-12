@@ -124,13 +124,19 @@ accessible to the App.
 13. **Logging: structured JSON to stdout** (warn/error to stderr).
     The operator routes from there.
 14. **Secrets stay off disk.** In-process defence:
-    `mlockall(MCL_CURRENT|MCL_FUTURE|MCL_ONFAULT)` at startup
+    `mlockall(MCL_CURRENT|MCL_FUTURE)` at startup
     (`src/mlock.rs`) prevents pages reaching swap; controlled
     by `[security] mlock = required | best_effort (default) |
-    off`. Operator-side complements (per docs/INSTALL.md):
-    disable swap on the broker host, and set `LimitCORE=0` in
-    the systemd unit so coredumps can't leak page contents
-    via dump files.
+    off`. `MCL_ONFAULT` is deliberately NOT used — deferred
+    locks under finite `RLIMIT_MEMLOCK` create a footgun where
+    `status=applied` is logged and the process then aborts at
+    the first allocation that exceeds the limit. Pre-faulting
+    surfaces rlimit failures at the mlockall call (current
+    pages) or at the offending allocation (future pages),
+    never at an unpredictable later page fault. Operator-side
+    complements (per docs/INSTALL.md): disable swap on the
+    broker host, and set `LimitCORE=0` in the systemd unit so
+    coredumps can't leak page contents via dump files.
 
 ## Hard NOTs
 
@@ -215,9 +221,9 @@ Pinned in `Cargo.toml`:
   thread-local plumbing) remain permitted — which is correct,
   the threat surface worth blocking is *cross-process* signal
   attacks from a compromised broker.)
-- `libc` (the `mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)`
-  call in `src/mlock.rs`. Transitively required by landlock
-  anyway, so the explicit dep adds no surface.)
+- `libc` (the `mlockall(MCL_CURRENT | MCL_FUTURE)` call in
+  `src/mlock.rs`. Transitively required by landlock anyway,
+  so the explicit dep adds no surface.)
 - `sd-notify` (pure-Rust `sd_notify(READY=1)` so `Type=notify`
   systemd units mark the service active when `src/ready.rs::notify`
   fires. No-op outside systemd. Daemon code never imports this —

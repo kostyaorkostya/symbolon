@@ -218,8 +218,9 @@ Pinned in `Cargo.toml`:
   `src/bin/git_credential_symbolon.rs`. Pure-Rust, zero runtime
   deps, dual MIT/Apache. Replaces three hand-rolled hex codecs.)
 - `landlock` (Linux LSM sandboxing at ABI 6: FS allowlist +
-  TCP-connect/bind + abstract-UDS scope + `Scope::Signal`
-  (Linux 6.12+) denying cross-domain signal-sending. Applied in
+  outbound TCP-connect to port 443 + abstract-UDS scope +
+  `Scope::Signal` (Linux 6.12+) denying cross-domain
+  signal-sending. Applied in
   `src/sandbox.rs` after the TCP listen socket + admin Unix
   socket are bound and before the accept loops; gated by
   `[security] sandbox` in `config.toml` with default

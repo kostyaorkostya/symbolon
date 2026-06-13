@@ -20,10 +20,10 @@ package versions, and provider UIs change. The stable design lives in
   - Enough headroom for a ~3 MiB daemon. No TLS proxy needed —
     symbolon terminates Noise NNpsk0 in-process.
   - **Linux kernel 6.12+** recommended. The broker self-sandboxes
-    with Landlock at ABI 6: FS allowlist, per-port TCP-connect/bind,
-    abstract-UDS scope, and `Scope::Signal` (Linux 6.12+) denying
-    cross-process signal-sending. Kernels 6.10–6.11 work but
-    degrade the signal scope; the daemon emits
+    with Landlock at ABI 6: FS allowlist, outbound TCP-connect to
+    port 443, abstract-UDS scope, and `Scope::Signal` (Linux 6.12+)
+    denying cross-process signal-sending. Kernels 6.10–6.11 work
+    but degrade the signal scope; the daemon emits
     `evt=sandbox_applied lvl=warn status=partially_enforced` so
     the operator notices. Check with `uname -r`; check Landlock LSM
     is enabled with `grep landlock /sys/kernel/security/lsm`. In
@@ -182,12 +182,20 @@ Both files are mutated atomically by the daemon (tempfile + fsync +
 rename) — never hand-edit while the daemon is running unless
 recovering from corruption.
 
-### 3.7 Lock down with nftables
+### 3.7 Optional: IP-level filtering
 
-The daemon listens directly on TCP `:9418`; restrict accepts to your
-trusted LAN with nftables.
+Symbolon's access control is the per-client PSK and the Noise
+NNpsk0 handshake — a connection that doesn't present a known
+identity and the matching PSK never completes the handshake,
+regardless of where it originated. **IP-based filtering is
+optional defense-in-depth, not required.** The daemon binds
+`0.0.0.0:9418` deliberately so it works behind any LAN topology
+(DHCP clients, NAT, container bridges).
 
-Replace `<lan-cidr>` with your trusted LAN (e.g. `192.168.122.0/24`):
+Three deployment patterns when you do want a network-level layer:
+
+**Bare metal — host-level nftables on the broker.** Replace
+`<lan-cidr>` with your trusted LAN (e.g. `192.168.122.0/24`):
 
 ```sh
 nft -f - <<'EOF'
@@ -203,6 +211,20 @@ EOF
 ```
 
 Persist via your distro's nftables service.
+
+**libvirt VM — apply [`clean-traffic`](https://libvirt.org/firewall.html)
+at the host bridge.** The filter runs in the host's network
+namespace, so the guest doesn't need any in-VM nft rules and
+can't disable the policy from inside.
+
+**LXC / Docker / Incus containers — apply filtering at the bridge
+layer on the host, NOT inside the container.** Unprivileged
+containers typically can't load nftables rules under their user
+namespace — `nft -f` will either silently no-op or fail with a
+permission error. For Incus: `security.ipv4_filtering=true` /
+`security.ipv6_filtering=true` on the instance. For Docker: the
+default bridge anti-spoof behaviour. For raw LXC: whatever your
+bridge driver supports.
 
 ### 3.8 Install and start the daemon (OpenRC)
 

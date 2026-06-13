@@ -28,8 +28,8 @@ level = "info"   # trace | debug | info | warn | error
 
 [security]
 # Sandbox enforcement policy. Controls Landlock at ABI 6 (FS allowlist
-# + TCP-connect/bind + abstract-UDS scope + Scope::Signal denying
-# cross-domain signal-sending — Linux 6.12+).
+# + outbound TCP-connect to port 443 + abstract-UDS scope +
+# Scope::Signal denying cross-domain signal-sending — Linux 6.12+).
 #
 #   required    – refuse to start if the kernel can't enforce ABI 6.
 #   best_effort – default. Apply what the kernel supports; degrade and
@@ -273,16 +273,16 @@ Op fields (request → response):
 | op | request fields | response fields |
 |---|---|---|
 | `status` | — | `uptime_sec`, `providers`, `client_count` |
-| `list` | — | `clients` (array of `{name, ip, providers, enrolled_at, note}`) |
-| `enroll` | `provider`, `client`, `ip`, `note` (nullable) | `identity`, `psk_hex` (64 hex chars), `client_name` |
+| `list` | — | `clients` (array of `{name, providers, enrolled_at, note}`) |
+| `enroll` | `provider`, `client`, `note` (nullable) | `identity`, `psk_hex` (64 hex chars), `client_name` |
 | `revoke` | `provider`, `client` | — |
 | `mint` | `provider`, `client`, `path` | `username`, `password`, `expires_at_unix`, `repo_id` |
 | `selfcheck` | `provider` | `client_id`, `installation_id`, `api_base`, `clock_skew_sec` |
 
 Error codes:
 `bad_request | unknown_provider | unknown_client |
-client_already_enrolled | client_ip_collision | malformed_request |
-internal | repo_not_accessible | provider_4xx`.
+client_already_enrolled | internal | repo_not_accessible |
+provider_4xx`.
 
 The daemon serialises admin requests, so file writes to
 `clients.json` / `psks` do not race the listen-side accept loop
@@ -354,12 +354,24 @@ join the broker's log to GitHub's side when filing a ticket.
 
 **Repository-ID resolution and cache:**
 
-- `GET {api_base}/repos/{owner}/{repo}` with the App JWT returns
-  `{id, ...}`.
+- The App JWT only authenticates App-level endpoints (`/app`,
+  `/app/installations/...`); it cannot authenticate
+  `GET /repos/{owner}/{repo}`. So resolution is a two-step
+  flow per cache miss:
+  1. `POST /app/installations/{installation_id}/access_tokens`
+     with body `{"permissions":{"metadata":"read"}}` (no
+     `repository_ids`) using the App JWT — yields a
+     metadata-only installation token. Logged as
+     `provider_call endpoint=mint_metadata_token`.
+  2. `GET {api_base}/repos/{owner}/{repo}` with that
+     installation token as bearer — returns `{id, ...}`.
+     Logged as `provider_call endpoint=resolve_repo_id`.
 - In-memory cache keyed by `(provider_name, owner/repo)`
-  (case-insensitive for `owner/repo`).
-- **TTL: 600 seconds per entry.** On any 404 referring to a cached
-  entry, invalidate it; the next mint re-resolves. This handles the
+  (case-insensitive for `owner/repo`). Cache hits skip both
+  steps above and go straight to `mint_token`.
+- **TTL: 600 seconds per entry.** On any 404 from a subsequent
+  `mint_token` call referring to a cached entry, invalidate it;
+  the next mint re-resolves. This handles the
   delete-then-recreate-with-same-name case where the numeric ID
   changes.
 
@@ -463,7 +475,7 @@ extending the enum and adding a row below.
 | `mlock` | `status` (`applied` \| `skipped` \| `failed` \| `off`), `policy` (`required` \| `best_effort` \| `off`), `flags` (when applied) or `error` (when skipped/failed) — emitted once at startup by `main::run_daemon` after `setup_tracing`. `required` failure surfaces as the separate `mlock_required_failed` error event before exit |
 | `mlock_required_failed` | `error` — emitted at `error` lvl by `main` when `[security] mlock = "required"` and `mlockall` failed. Fatal (exit 1); operator should add `LimitMEMLOCK=infinity` to the systemd unit |
 | `admin_request` | `req_id`, `op` — emitted by the admin loop at entry of each request. The `req_id` (ULID) ties downstream `provider_call` / `mint` / `selfcheck` events back to this admin invocation |
-| `provider_call` | `req_id`, `out_req_id`, `endpoint` (`resolve_repo_id` \| `mint_token` \| `selfcheck`), `provider`, `timeout_ms` — emitted before each outbound HTTPS call |
+| `provider_call` | `req_id`, `out_req_id`, `endpoint` (`mint_metadata_token` \| `resolve_repo_id` \| `mint_token` \| `selfcheck`), `provider`, `timeout_ms` — emitted before each outbound HTTPS call |
 | `provider_call_done` | `req_id`, `out_req_id`, `status` (HTTP status code, 0 if no response), `gh_req_id` (X-GitHub-Request-Id, empty if absent), `elapsed_ms`, optional `error` — emitted after each outbound HTTPS call |
 
 `reason` values for `mint_denied`:

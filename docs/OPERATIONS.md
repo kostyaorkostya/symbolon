@@ -86,9 +86,9 @@ Landlock.
  "status":"fully_enforced","fs":true,"tcp":true,"scope":true}
 ```
 
-- `status: "fully_enforced"` → all of FS, TCP-connect/bind, and
-  the scope layer (abstract-UDS + cross-process signal-send) are
-  active. Logged at `info`.
+- `status: "fully_enforced"` → all of FS, outbound TCP-connect to
+  port 443, and the scope layer (abstract-UDS + cross-process
+  signal-send) are active. Logged at `info`.
 - `status: "partially_enforced"` → some features were downgraded
   because the kernel doesn't support them. The per-subsystem
   booleans show which. Logged at `warn`. Common cause: kernel
@@ -196,11 +196,13 @@ points at the fix.
   Retry the git operation; the daemon does not retry.
 - **`sandbox_applied status=not_enforced` or `partially_enforced`**:
   the kernel doesn't support the requested landlock features. Check
-  `uname -r` (need 6.10+ for full ABI 6) and
-  `grep landlock /sys/kernel/security/lsm`. If the host kernel is
-  fine but you're in an LXC container, confirm the container hasn't
-  masked `/sys/kernel/security/`. Set `[security] sandbox = "required"`
-  to make the daemon refuse to start on hosts that can't enforce.
+  `uname -r` — need 6.12+ for full ABI 6 (`Scope::Signal` landed in
+  6.12); 6.10–6.11 enforce everything else but report `scope: false`.
+  Also `grep landlock /sys/kernel/security/lsm`. If the host kernel
+  is fine but you're in an LXC container, confirm the container
+  hasn't masked `/sys/kernel/security/`. Set
+  `[security] sandbox = "required"` to make the daemon refuse to
+  start on hosts that can't enforce.
 
 ## Sandbox: scope of protection and limitations
 

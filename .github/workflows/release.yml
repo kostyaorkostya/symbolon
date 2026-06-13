@@ -108,34 +108,40 @@ jobs:
       # tracing/JSON logs and `--call-graph=fp` profiling).
       #
       # `llvm-strip` rather than GNU `strip`: Ubuntu's stock
-      # binutils package is built single-target (host x86_64
-      # only), so the host `strip` cannot recognise aarch64 ELF
-      # inputs and bails with "File format not recognized" —
-      # BFD's per-arch backend isn't compiled in. LLVM's object
-      # library is multi-target by design, so one binary handles
-      # both matrix legs without a per-target apt install or
-      # branching on `matrix.target`. Pre-installed on the
-      # GitHub-hosted ubuntu-24.04 runner; flag-compatible with
-      # GNU strip for `--strip-debug` and `--remove-section=`.
+      # binutils is single-target (host x86_64 only), so the host
+      # `strip` can't recognise aarch64 ELF and bails with "File
+      # format not recognized" — BFD's per-arch backend isn't
+      # compiled in. LLVM's object library is multi-target. The
+      # ubuntu-24.04 image installs `llvm-strip-N` via the
+      # clang-N packages (currently N=18) but NOT the unversioned
+      # `/usr/bin/llvm-strip` symlink (that comes from the `llvm`
+      # metapackage, which isn't pulled in by default). Resolve
+      # at runtime so the workflow survives image bumps without
+      # editing. Flag-compatible with GNU strip for
+      # `--strip-debug` and `--remove-section=`.
       - name: Strip unwind tables
         run: |
           set -euo pipefail
+          LLVM_STRIP=$(command -v llvm-strip llvm-strip-18 llvm-strip-19 llvm-strip-17 2>/dev/null | head -n1)
+          LLVM_READELF=$(command -v llvm-readelf llvm-readelf-18 llvm-readelf-19 llvm-readelf-17 2>/dev/null | head -n1)
+          [ -n "${LLVM_STRIP}" ]   || { echo "no llvm-strip found on PATH"   >&2; exit 1; }
+          [ -n "${LLVM_READELF}" ] || { echo "no llvm-readelf found on PATH" >&2; exit 1; }
+          echo "using ${LLVM_STRIP} and ${LLVM_READELF}"
           for name in symbolon git-credential-symbolon; do
             BIN=target/${{ matrix.target }}/release/${name}
             BEFORE=$(stat -c%s "${BIN}")
-            llvm-strip --strip-debug \
-                       --remove-section=.eh_frame \
-                       --remove-section=.eh_frame_hdr \
-                       --remove-section=.gcc_except_table \
-                       "${BIN}"
+            "${LLVM_STRIP}" --strip-debug \
+                            --remove-section=.eh_frame \
+                            --remove-section=.eh_frame_hdr \
+                            --remove-section=.gcc_except_table \
+                            "${BIN}"
             AFTER=$(stat -c%s "${BIN}")
             echo "Stripped ${BIN}: ${BEFORE} -> ${AFTER} bytes ($((BEFORE - AFTER)) saved)"
             # Belt-and-braces: confirm the sections we just asked
             # to remove are actually gone. Catches a silent no-op
             # (wrong flag name on a future llvm-strip version,
-            # llvm-readelf-only-shows tool drift, etc.) before
-            # the binary ships.
-            if llvm-readelf -S "${BIN}" | grep -qE '\.eh_frame|\.gcc_except_table'; then
+            # etc.) before the binary ships.
+            if "${LLVM_READELF}" -S "${BIN}" | grep -qE '\.eh_frame|\.gcc_except_table'; then
               echo "unwind sections still present in ${BIN} after strip" >&2
               exit 1
             fi

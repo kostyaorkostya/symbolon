@@ -22,7 +22,7 @@ use symbolon::{
     LoggingConfig, MlockMode, ProviderGithub, Providers, RuntimeConfig, SandboxMode,
     SecurityConfig,
 };
-use wiremock::matchers::{method, path as wm_path};
+use wiremock::matchers::{body_bytes, method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 pub const CLIENT_ID: &str = "Iv1.test12345";
@@ -89,6 +89,38 @@ pub fn canonical_mint_body() -> Vec<u8> {
         r#"{{"repository_ids":[{REPO_ID}],"permissions":{{"contents":"write","metadata":"read"}}}}"#
     )
     .into_bytes()
+}
+
+/// Request body for the metadata-only installation token POST that
+/// precedes the `GET /repos/{owner}/{repo}` lookup. Must match
+/// `build_metadata_token_body()` in `src/providers/github.rs` byte
+/// for byte.
+pub fn canonical_metadata_token_body() -> Vec<u8> {
+    br#"{"permissions":{"metadata":"read"}}"#.to_vec()
+}
+
+/// Placeholder token returned by `mount_metadata_token_ok`. The
+/// resolve step uses it as a bearer for `GET /repos/...`; tests only
+/// observe the narrow-mint token (`TOKEN`), so the value here is
+/// arbitrary but visibly distinct.
+pub const METADATA_TOKEN: &str = "ghs_metadata_only_xxxxxxxx";
+
+/// Mount the metadata-only installation token POST that the resolve
+/// step requires (`POST /app/installations/{id}/access_tokens` with
+/// `{"permissions":{"metadata":"read"}}` body). Pair with
+/// `mount_repo_ok` so the subsequent `GET /repos/{owner}/{repo}`
+/// authenticates correctly.
+pub async fn mount_metadata_token_ok(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(wm_path(mint_path()))
+        .and(body_bytes(canonical_metadata_token_body()))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(
+                serde_json::json!({"token": METADATA_TOKEN, "expires_at": EXPIRES_AT}),
+            ),
+        )
+        .mount(server)
+        .await;
 }
 
 pub async fn build_provider(api_base: String) -> GitHubProvider {

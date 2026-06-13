@@ -863,7 +863,7 @@ fn log_mint_error(
                 provider_ms = provider_ms,
             );
         }
-        GithubError::Unauthorized => {
+        GithubError::Unauthorized { body } => {
             warn!(
                 req_id = %req_id,
                 evt = %EventKind::MintDenied,
@@ -873,9 +873,10 @@ fn log_mint_error(
                 client = %client_name,
                 repo = %path,
                 provider_ms = provider_ms,
+                error = %body,
             );
         }
-        GithubError::Forbidden => {
+        GithubError::Forbidden { body } => {
             warn!(
                 req_id = %req_id,
                 evt = %EventKind::MintDenied,
@@ -885,6 +886,7 @@ fn log_mint_error(
                 client = %client_name,
                 repo = %path,
                 provider_ms = provider_ms,
+                error = %body,
             );
         }
         GithubError::RateLimited => {

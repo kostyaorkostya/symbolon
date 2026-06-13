@@ -120,10 +120,15 @@ pub enum GithubError {
     BadExpiresAt(String),
     #[error("malformed owner/repo path: {0}")]
     MalformedPath(String),
-    #[error("unauthorized (401) — App key may be invalid or revoked")]
-    Unauthorized,
-    #[error("forbidden (403) — likely missing User-Agent or App lacks permission")]
-    Forbidden,
+    // Body excerpt is GitHub's error envelope `message` (e.g.
+    // "A JSON web token could not be decoded", "Bad credentials")
+    // or, if the body wasn't parseable, a short raw prefix. Safe to
+    // log — 4xx envelopes never carry token bytes (those only appear
+    // in 2xx mint responses, which take a different code path).
+    #[error("unauthorized (401): {body}")]
+    Unauthorized { body: String },
+    #[error("forbidden (403): {body}")]
+    Forbidden { body: String },
     #[error("repository '{path}' not found or App lacks access")]
     RepoNotFound { path: String },
     #[error("rate limited (429)")]
@@ -380,41 +385,11 @@ impl GitHubProvider {
         };
         let status = resp.status().as_u16();
         let gh_req_id = read_gh_req_id(&resp);
-        match status {
-            200 => {}
-            401 => {
-                return ProviderCall {
-                    status,
-                    gh_req_id,
-                    result: Err(GithubError::Unauthorized),
-                };
-            }
-            403 => {
-                return ProviderCall {
-                    status,
-                    gh_req_id,
-                    result: Err(GithubError::Forbidden),
-                };
-            }
-            500..=599 => {
-                return ProviderCall {
-                    status,
-                    gh_req_id,
-                    result: Err(GithubError::ServerError(status)),
-                };
-            }
-            other => {
-                return ProviderCall {
-                    status,
-                    gh_req_id,
-                    result: Err(GithubError::UnexpectedStatus(other)),
-                };
-            }
-        }
         // HTTP `Date` header (IMF-fixdate per RFC 7231 § 7.1.1.1) is
         // accepted by `time`'s Rfc2822 parser (`GMT` → zero offset).
         // Silently 0 if the header is missing or unparseable; clock
-        // skew is informational, not a hard failure.
+        // skew is informational, not a hard failure. Read BEFORE
+        // `resp.bytes()` since that consumes the response.
         let clock_skew_sec = resp
             .headers()
             .get("date")
@@ -434,6 +409,24 @@ impl GitHubProvider {
                 };
             }
         };
+        let err: Option<GithubError> = match status {
+            200 => None,
+            401 => Some(GithubError::Unauthorized {
+                body: parse_github_error_body(&body),
+            }),
+            403 => Some(GithubError::Forbidden {
+                body: parse_github_error_body(&body),
+            }),
+            500..=599 => Some(GithubError::ServerError(status)),
+            other => Some(GithubError::UnexpectedStatus(other)),
+        };
+        if let Some(e) = err {
+            return ProviderCall {
+                status,
+                gh_req_id,
+                result: Err(e),
+            };
+        }
         let parsed: Result<SelfcheckOutcome, GithubError> = (|| {
             let v: serde_json::Value =
                 serde_json::from_slice(&body).map_err(|_| GithubError::JsonParse {
@@ -547,30 +540,38 @@ impl GitHubProvider {
         owner: &str,
         repo: &str,
     ) -> Result<u64, GithubError> {
+        // Repo-scoped reads on `GET /repos/{owner}/{repo}` require an
+        // **installation access token**; the raw App JWT only
+        // authenticates App-level endpoints (`/app`,
+        // `/app/installations/...`). Mint a metadata-only
+        // installation token first, then use it as the bearer for
+        // the actual repo lookup. Logged as two distinct
+        // `provider_call` breadcrumbs.
+        let install_token = self.mint_metadata_token(req_id).await?;
         let (id, _out, _gh) = self
             .with_breadcrumbs(req_id, "resolve_repo_id", self.request_timeout, |out| {
-                self.resolve_repo_id_inner(out, owner, repo)
+                self.resolve_repo_id_inner(out, &install_token, owner, repo)
             })
             .await?;
         Ok(id)
     }
 
+    async fn mint_metadata_token(&self, req_id: &str) -> Result<String, GithubError> {
+        let ((token, _expires), _out, _gh) = self
+            .with_breadcrumbs(req_id, "mint_metadata_token", self.request_timeout, |out| {
+                self.mint_metadata_token_inner(out)
+            })
+            .await?;
+        Ok(token)
+    }
+
     async fn resolve_repo_id_inner(
         &self,
         out_req_id: String,
+        install_token: &str,
         owner: &str,
         repo: &str,
     ) -> ProviderCall<u64> {
-        let jwt = match self.sign_jwt_now().await {
-            Ok(j) => j,
-            Err(e) => {
-                return ProviderCall {
-                    status: 0,
-                    gh_req_id: None,
-                    result: Err(e),
-                };
-            }
-        };
         let url = format!(
             "{}/repos/{}/{}",
             self.api_base,
@@ -580,7 +581,7 @@ impl GitHubProvider {
         let req = match self
             .client
             .get(&url)
-            .and_then(|r| r.bearer_auth(&jwt))
+            .and_then(|r| r.bearer_auth(install_token))
             .and_then(|r| r.header("Accept", ACCEPT_HEADER))
             .and_then(|r| r.header("X-GitHub-Api-Version", GITHUB_API_VERSION))
             .and_then(|r| r.header("User-Agent", &self.user_agent))
@@ -612,10 +613,24 @@ impl GitHubProvider {
         };
         let status = resp.status().as_u16();
         let gh_req_id = read_gh_req_id(&resp);
+        let body = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                return ProviderCall {
+                    status,
+                    gh_req_id,
+                    result: Err(GithubError::from(e)),
+                };
+            }
+        };
         let err: Option<GithubError> = match status {
             200 => None,
-            401 => Some(GithubError::Unauthorized),
-            403 => Some(GithubError::Forbidden),
+            401 => Some(GithubError::Unauthorized {
+                body: parse_github_error_body(&body),
+            }),
+            403 => Some(GithubError::Forbidden {
+                body: parse_github_error_body(&body),
+            }),
             404 => Some(GithubError::RepoNotFound {
                 path: format!("{owner}/{repo}"),
             }),
@@ -630,7 +645,74 @@ impl GitHubProvider {
                 result: Err(e),
             };
         }
-        let body = match resp.bytes().await {
+        ProviderCall {
+            status,
+            gh_req_id,
+            result: parse_repo_response(&body),
+        }
+    }
+
+    /// Mint a metadata-only installation token (no
+    /// `repository_ids`, `permissions: {metadata: read}`). Used to
+    /// authenticate the `/repos/{owner}/{repo}` lookup that
+    /// precedes the actual narrow-scope mint. Same response shape
+    /// as a regular mint; only the request body differs.
+    async fn mint_metadata_token_inner(
+        &self,
+        out_req_id: String,
+    ) -> ProviderCall<(String, SystemTime)> {
+        let jwt = match self.sign_jwt_now().await {
+            Ok(j) => j,
+            Err(e) => {
+                return ProviderCall {
+                    status: 0,
+                    gh_req_id: None,
+                    result: Err(e),
+                };
+            }
+        };
+        let url = format!(
+            "{}/app/installations/{}/access_tokens",
+            self.api_base, self.installation_id
+        );
+        let body = build_metadata_token_body();
+        let req = match self
+            .client
+            .post(&url)
+            .and_then(|r| r.bearer_auth(&jwt))
+            .and_then(|r| r.header("Accept", ACCEPT_HEADER))
+            .and_then(|r| r.header("X-GitHub-Api-Version", GITHUB_API_VERSION))
+            .and_then(|r| r.header("User-Agent", &self.user_agent))
+            .and_then(|r| r.header("Content-Type", "application/json"))
+            .and_then(|r| r.header(X_REQUEST_ID_HEADER, &out_req_id))
+            .and_then(|r| {
+                r.header(
+                    REQUEST_TIMEOUT_HEADER,
+                    &self.request_timeout.as_secs().to_string(),
+                )
+            }) {
+            Ok(r) => r.body(body),
+            Err(e) => {
+                return ProviderCall {
+                    status: 0,
+                    gh_req_id: None,
+                    result: Err(GithubError::from(e)),
+                };
+            }
+        };
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                return ProviderCall {
+                    status: 0,
+                    gh_req_id: None,
+                    result: Err(GithubError::from(e)),
+                };
+            }
+        };
+        let status = resp.status().as_u16();
+        let gh_req_id = read_gh_req_id(&resp);
+        let bytes = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
                 return ProviderCall {
@@ -640,10 +722,32 @@ impl GitHubProvider {
                 };
             }
         };
+        let err: Option<GithubError> = match status {
+            201 => None,
+            401 => Some(GithubError::Unauthorized {
+                body: parse_github_error_body(&bytes),
+            }),
+            403 => Some(GithubError::Forbidden {
+                body: parse_github_error_body(&bytes),
+            }),
+            429 => Some(GithubError::RateLimited),
+            500..=599 => Some(GithubError::ServerError(status)),
+            // 404 here means "installation not found" — surface as
+            // UnexpectedStatus rather than RepoNotFound, since this
+            // mint isn't repo-scoped.
+            _ => Some(GithubError::UnexpectedStatus(status)),
+        };
+        if let Some(e) = err {
+            return ProviderCall {
+                status,
+                gh_req_id,
+                result: Err(e),
+            };
+        }
         ProviderCall {
             status,
             gh_req_id,
-            result: parse_repo_response(&body),
+            result: parse_mint_response(&bytes),
         }
     }
 
@@ -718,10 +822,24 @@ impl GitHubProvider {
         };
         let status = resp.status().as_u16();
         let gh_req_id = read_gh_req_id(&resp);
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                return ProviderCall {
+                    status,
+                    gh_req_id,
+                    result: Err(GithubError::from(e)),
+                };
+            }
+        };
         let err: Option<GithubError> = match status {
             201 => None,
-            401 => Some(GithubError::Unauthorized),
-            403 => Some(GithubError::Forbidden),
+            401 => Some(GithubError::Unauthorized {
+                body: parse_github_error_body(&bytes),
+            }),
+            403 => Some(GithubError::Forbidden {
+                body: parse_github_error_body(&bytes),
+            }),
             404 => Some(GithubError::RepoNotFound {
                 path: path.to_string(),
             }),
@@ -736,16 +854,6 @@ impl GitHubProvider {
                 result: Err(e),
             };
         }
-        let bytes = match resp.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                return ProviderCall {
-                    status,
-                    gh_req_id,
-                    result: Err(GithubError::from(e)),
-                };
-            }
-        };
         ProviderCall {
             status,
             gh_req_id,
@@ -874,6 +982,16 @@ struct MintPermissions {
     metadata: &'static str,
 }
 
+#[derive(Serialize)]
+struct MetadataTokenBody {
+    permissions: MetadataTokenPermissions,
+}
+
+#[derive(Serialize)]
+struct MetadataTokenPermissions {
+    metadata: &'static str,
+}
+
 fn build_claims(now: SystemTime, client_id: &str) -> JwtClaims {
     let unix = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     JwtClaims {
@@ -926,6 +1044,44 @@ fn build_mint_body(repo_id: u64) -> Vec<u8> {
         },
     };
     serde_json::to_vec(&body).expect("MintRequestBody fields are all serializable")
+}
+
+/// Body for `POST /app/installations/{id}/access_tokens` that
+/// asks for an installation token with read-only metadata scope
+/// (no `repository_ids` / `repositories` — implicitly broad over
+/// the installation's accessible repos). Used to authenticate
+/// `GET /repos/{owner}/{repo}` during repo-ID resolution; that
+/// endpoint accepts installation tokens but not the App JWT.
+fn build_metadata_token_body() -> Vec<u8> {
+    let body = MetadataTokenBody {
+        permissions: MetadataTokenPermissions { metadata: "read" },
+    };
+    serde_json::to_vec(&body).expect("MetadataTokenBody fields are all serializable")
+}
+
+/// Pull a short, log-safe excerpt from a GitHub 4xx response body.
+/// GitHub's error responses are typically
+/// `{"message":"…","documentation_url":"…"}`; return the `message`
+/// when present, otherwise a truncated raw prefix. **Only safe for
+/// 4xx responses**: mint 2xx bodies carry the access token and must
+/// never reach this function.
+fn parse_github_error_body(body: &[u8]) -> String {
+    #[derive(serde::Deserialize)]
+    struct Envelope<'a> {
+        message: Option<&'a str>,
+    }
+    if let Ok(env) = serde_json::from_slice::<Envelope>(body)
+        && let Some(m) = env.message
+    {
+        return m.to_string();
+    }
+    const MAX: usize = 200;
+    let text = std::str::from_utf8(body).unwrap_or("(non-utf8 body)");
+    if text.len() > MAX {
+        format!("{}…", &text[..MAX])
+    } else {
+        text.to_string()
+    }
 }
 
 fn parse_mint_response(bytes: &[u8]) -> Result<(String, SystemTime), GithubError> {

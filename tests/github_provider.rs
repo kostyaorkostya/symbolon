@@ -14,8 +14,9 @@ use wiremock::matchers::{body_bytes, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{
-    EXPIRES_AT, OWNER, REPO, REPO_ID, TOKEN, build_provider, canonical_mint_body, mint_path,
-    mount_mint_ok, mount_repo_ok, repo_path,
+    EXPIRES_AT, OWNER, REPO, REPO_ID, TOKEN, build_provider, canonical_metadata_token_body,
+    canonical_mint_body, mint_path, mount_metadata_token_ok, mount_mint_ok, mount_repo_ok,
+    repo_path,
 };
 
 #[compio::test]
@@ -45,15 +46,30 @@ async fn mint_happy_path() {
 
 #[compio::test]
 async fn mint_uses_cached_repo_id() {
+    use wiremock::matchers::body_bytes;
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path(repo_path()))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": REPO_ID})))
-        .expect(1) // GET must be called exactly once across both mints
+        .expect(1) // GET fires once: cache miss on the first mint, hit on the second.
         .mount(&server)
         .await;
+    // Metadata-only token POST is part of the resolve flow only, so
+    // it fires once (only on the cache-miss mint).
     Mock::given(method("POST"))
         .and(path(mint_path()))
+        .and(body_bytes(canonical_metadata_token_body()))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(json!({"token": "meta", "expires_at": EXPIRES_AT})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Narrow mint POST fires once per `mint()` call.
+    Mock::given(method("POST"))
+        .and(path(mint_path()))
+        .and(body_bytes(canonical_mint_body()))
         .respond_with(
             ResponseTemplate::new(201)
                 .set_body_json(json!({"token": TOKEN, "expires_at": EXPIRES_AT})),
@@ -78,6 +94,7 @@ async fn mint_uses_cached_repo_id() {
 async fn mint_request_headers_and_body_exact() {
     use wiremock::matchers::header_exists;
     let server = MockServer::start().await;
+    mount_metadata_token_ok(&server).await;
     mount_repo_ok(&server).await;
     Mock::given(method("POST"))
         .and(path(mint_path()))
@@ -136,6 +153,9 @@ async fn mint_surfaces_github_request_id() {
 #[compio::test]
 async fn resolve_returns_404() {
     let server = MockServer::start().await;
+    // Metadata-only token mint must succeed so the resolve flow
+    // reaches the `GET /repos/...` call we want to test.
+    mount_metadata_token_ok(&server).await;
     Mock::given(method("GET"))
         .and(path(repo_path()))
         .respond_with(ResponseTemplate::new(404))
@@ -168,7 +188,7 @@ async fn mint_returns_401() {
             .mint("test-req", &format!("{OWNER}/{REPO}"))
             .await
             .unwrap_err(),
-        GithubError::Unauthorized
+        GithubError::Unauthorized { .. }
     ));
 }
 
@@ -188,7 +208,7 @@ async fn mint_returns_403() {
             .mint("test-req", &format!("{OWNER}/{REPO}"))
             .await
             .unwrap_err(),
-        GithubError::Forbidden
+        GithubError::Forbidden { .. }
     ));
 }
 
@@ -234,11 +254,12 @@ async fn mint_returns_500() {
 
 #[compio::test]
 async fn mint_invalidates_on_404() {
+    use wiremock::matchers::body_bytes;
     let server = MockServer::start().await;
 
-    // The GET resolver is always available — we expect it to be hit
-    // exactly twice (once for the first successful mint, once again
-    // after the 404-driven cache invalidation forces a re-resolve).
+    // GET fires twice across phases 1 and 3 (cache miss → fill,
+    // narrow-mint 404 invalidates → re-resolve). Phase 2 hits the
+    // cache and skips the GET.
     Mock::given(method("GET"))
         .and(path(repo_path()))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": REPO_ID})))
@@ -246,9 +267,23 @@ async fn mint_invalidates_on_404() {
         .mount(&server)
         .await;
 
-    // First POST: success. Use a scoped mock so we can remove it.
-    let first_post = Mock::given(method("POST"))
+    // Metadata-only token POST fires whenever a GET fires (same
+    // pre-condition: the resolve path runs). So 2 calls.
+    Mock::given(method("POST"))
         .and(path(mint_path()))
+        .and(body_bytes(canonical_metadata_token_body()))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(json!({"token": "meta", "expires_at": EXPIRES_AT})),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    // Phase 1: narrow mint succeeds.
+    let first_narrow = Mock::given(method("POST"))
+        .and(path(mint_path()))
+        .and(body_bytes(canonical_mint_body()))
         .respond_with(
             ResponseTemplate::new(201)
                 .set_body_json(json!({"token": TOKEN, "expires_at": EXPIRES_AT})),
@@ -263,11 +298,13 @@ async fn mint_invalidates_on_404() {
         .await
         .unwrap();
 
-    drop(first_post);
+    drop(first_narrow);
 
-    // Second POST: 404 (repo deleted/recreated).
-    let second_post = Mock::given(method("POST"))
+    // Phase 2: narrow mint 404s (repo deleted/recreated). Cache is
+    // hit, so no GET / no metadata POST this round.
+    let second_narrow = Mock::given(method("POST"))
         .and(path(mint_path()))
+        .and(body_bytes(canonical_mint_body()))
         .respond_with(ResponseTemplate::new(404))
         .expect(1)
         .mount_as_scoped(&server)
@@ -279,12 +316,14 @@ async fn mint_invalidates_on_404() {
         .unwrap_err();
     assert!(matches!(err, GithubError::RepoNotFound { .. }));
 
-    drop(second_post);
+    drop(second_narrow);
 
-    // Third POST: succeeds again; GET must fire again because the
-    // 404 invalidated the cached repo-id.
+    // Phase 3: narrow mint succeeds. The phase-2 404 invalidated the
+    // cache, so this triggers a fresh resolve (metadata POST + GET +
+    // narrow POST).
     Mock::given(method("POST"))
         .and(path(mint_path()))
+        .and(body_bytes(canonical_mint_body()))
         .respond_with(
             ResponseTemplate::new(201)
                 .set_body_json(json!({"token": TOKEN, "expires_at": EXPIRES_AT})),

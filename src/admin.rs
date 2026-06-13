@@ -544,8 +544,10 @@ fn error_response_from_github(err: &GithubError) -> serde_json::Value {
             "repo_not_accessible",
             format!("repository '{path}' not found or App lacks access"),
         ),
-        GithubError::Unauthorized => ("provider_4xx", "App key invalid (401)".to_string()),
-        GithubError::Forbidden => ("provider_4xx", "App lacks permission (403)".to_string()),
+        GithubError::Unauthorized { body } => {
+            ("provider_4xx", format!("unauthorized (401): {body}"))
+        }
+        GithubError::Forbidden { body } => ("provider_4xx", format!("forbidden (403): {body}")),
         GithubError::RateLimited => ("provider_4xx", "rate limited (429)".to_string()),
         GithubError::MalformedPath(p) => ("bad_request", format!("malformed owner/repo path: {p}")),
         GithubError::ServerError(s) => ("internal", format!("provider 5xx: {s}")),

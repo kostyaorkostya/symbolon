@@ -107,22 +107,38 @@ jobs:
       # working — neither is in our diagnostic loop (we use
       # tracing/JSON logs and `--call-graph=fp` profiling).
       #
-      # ELF section names are architecture-agnostic, so the host
-      # `strip` from binutils works for both x86_64 and aarch64
-      # ELF targets even when cross-building.
+      # `llvm-strip` rather than GNU `strip`: Ubuntu's stock
+      # binutils package is built single-target (host x86_64
+      # only), so the host `strip` cannot recognise aarch64 ELF
+      # inputs and bails with "File format not recognized" —
+      # BFD's per-arch backend isn't compiled in. LLVM's object
+      # library is multi-target by design, so one binary handles
+      # both matrix legs without a per-target apt install or
+      # branching on `matrix.target`. Pre-installed on the
+      # GitHub-hosted ubuntu-24.04 runner; flag-compatible with
+      # GNU strip for `--strip-debug` and `--remove-section=`.
       - name: Strip unwind tables
         run: |
           set -euo pipefail
           for name in symbolon git-credential-symbolon; do
             BIN=target/${{ matrix.target }}/release/${name}
             BEFORE=$(stat -c%s "${BIN}")
-            strip --strip-debug \
-                  --remove-section=.eh_frame \
-                  --remove-section=.eh_frame_hdr \
-                  --remove-section=.gcc_except_table \
-                  "${BIN}"
+            llvm-strip --strip-debug \
+                       --remove-section=.eh_frame \
+                       --remove-section=.eh_frame_hdr \
+                       --remove-section=.gcc_except_table \
+                       "${BIN}"
             AFTER=$(stat -c%s "${BIN}")
             echo "Stripped ${BIN}: ${BEFORE} -> ${AFTER} bytes ($((BEFORE - AFTER)) saved)"
+            # Belt-and-braces: confirm the sections we just asked
+            # to remove are actually gone. Catches a silent no-op
+            # (wrong flag name on a future llvm-strip version,
+            # llvm-readelf-only-shows tool drift, etc.) before
+            # the binary ships.
+            if llvm-readelf -S "${BIN}" | grep -qE '\.eh_frame|\.gcc_except_table'; then
+              echo "unwind sections still present in ${BIN} after strip" >&2
+              exit 1
+            fi
           done
       - name: Package
         run: |

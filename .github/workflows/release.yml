@@ -2,8 +2,30 @@ name: release
 on:
   push:
     tags: ['v*']
+# Two-stage shape: matrix builds upload workflow artifacts; a single
+# downstream release job downloads everything and makes ONE
+# action-gh-release call. The previous shape had each matrix runner
+# invoke softprops/action-gh-release independently, and on Immutable
+# Releases repos that races: the first runner creates and (in
+# v2.6+) publishes the release, which locks it; the second runner
+# then hits "Cannot upload assets to an immutable release" when its
+# action call tries to attach binaries.
+#
+# Reference: softprops/action-gh-release README on Immutable
+# Releases (the action uploads-before-publish for standard
+# releases, which only helps when there's a single publisher).
+concurrency:
+  # Serialize per-tag so a second push of the same tag (or a tag
+  # re-push) can't race the in-flight publish. Cancel-in-progress
+  # is OFF: a half-finished publish should run to completion, not
+  # be killed mid-asset-upload.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+# Default to read-only at the workflow level; only the `release`
+# job opts in to `contents: write`. Build jobs don't touch the
+# release surface, so they don't need write access.
 permissions:
-  contents: write # required by softprops/action-gh-release to upload assets
+  contents: read
 jobs:
   build:
     name: build-${{ matrix.target }}
@@ -111,16 +133,52 @@ jobs:
             cp "${BIN}" "${OUT}"
             sha256sum "${OUT}" > "${OUT}.sha256"
           done
-      # softprops/action-gh-release is widely used and well-maintained,
-      # but pin to a commit SHA so an upstream tag move can't quietly
-      # change behavior.  Bump deliberately.
-      - name: Upload release asset
-        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
+      # Hand the four files (two binaries + their sha256s) off to
+      # the downstream `release` job via a workflow artifact. NO
+      # release-API interaction in this job — that's what avoided
+      # the matrix-race-vs-Immutable-Releases bug. Each matrix leg
+      # uploads under a unique artifact name; the release job
+      # collects them all via `pattern: release-*`.
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
         with:
-          files: |
+          name: release-${{ matrix.target }}
+          path: |
             symbolon-${{ matrix.target }}
             symbolon-${{ matrix.target }}.sha256
             git-credential-symbolon-${{ matrix.target }}
             git-credential-symbolon-${{ matrix.target }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+  release:
+    name: release
+    needs: build
+    runs-on: ubuntu-latest
+    # Single publisher; only this job needs write on the release.
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          # Flatten all per-target artifacts into one directory so
+          # the `files: dist/*` glob below picks up every file in
+          # a single action-gh-release call.
+          merge-multiple: true
+      # softprops/action-gh-release is widely used and well-
+      # maintained, but pin to a commit SHA so an upstream tag
+      # move can't quietly change behavior. Bump deliberately.
+      #
+      # v2.6.x is the first line that uploads assets BEFORE
+      # publishing the release (the bug-class fix for Immutable
+      # Releases). Combined with the single-publisher pattern
+      # above, the asset-upload happens before the "publish event"
+      # locks the release.
+      - name: Publish release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          files: dist/*
           fail_on_unmatched_files: true
           generate_release_notes: true

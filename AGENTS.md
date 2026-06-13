@@ -50,6 +50,13 @@ publishes binaries with sha256 attestations. The workflow:
 3. Post-strips `.eh_frame` / `.eh_frame_hdr` /
    `.gcc_except_table` (safe with `panic = "abort"`; saves
    ~390 KB).
+4. Hands each target's binaries+sha256s to a single downstream
+   `release` job via `actions/upload-artifact`. The release job
+   downloads everything and makes ONE `softprops/action-gh-release`
+   call. The matrix legs never touch the release surface — that's
+   what avoids the "Cannot upload assets to an immutable release"
+   race when two parallel runners both try to create + publish the
+   same tag on an Immutable Releases-enabled repo.
 
 To reproduce a shipping-shaped local artefact (with the same
 path-trim and post-strip applied), use the in-tree helper:

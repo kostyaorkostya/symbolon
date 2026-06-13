@@ -21,9 +21,8 @@ use std::io;
 use std::path::PathBuf;
 
 use landlock::{
-    ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath,
-    PathFd, PathFdError, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetError, RulesetStatus,
-    Scope,
+    Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath, PathFd,
+    PathFdError, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetError, RulesetStatus, Scope, ABI,
 };
 
 use crate::config::SandboxMode;
@@ -128,7 +127,16 @@ fn apply_landlock(
 
     let mut created = ruleset.create().map_err(SandboxError::Ruleset)?;
 
+    // `ReadDir` is needed for the parent-dir fsync step at the
+    // end of `src/admin.rs::atomic_write` (the tempfile→fsync→
+    // rename→fsync-parent pattern): opening the dir as a
+    // read-only file to fsync it goes through Landlock's
+    // open-directory check. Without it, the rename succeeds and
+    // the data lands but `File::open(&dir)` returns EACCES,
+    // surfacing as a confusing "write X: Permission denied"
+    // partial failure.
     let write_bits: BitFlags<AccessFs> = AccessFs::ReadFile
+        | AccessFs::ReadDir
         | AccessFs::WriteFile
         | AccessFs::MakeReg
         | AccessFs::RemoveFile
@@ -308,5 +316,48 @@ mod tests {
         let paths = make_paths(vec![], vec![]);
         let out = apply(SandboxMode::Off, &paths).unwrap();
         assert_eq!(out.status, "off");
+    }
+
+    #[test]
+    fn write_parent_dirs_allow_parent_fsync() {
+        // Regression: `src/admin.rs::atomic_write` ends with
+        // `File::open(&parent_dir).sync_all()` to fsync the parent
+        // directory. Opening a directory for read requires
+        // `AccessFs::ReadDir`; if the `write_bits` bundle omits it,
+        // the rename succeeds (data lands on disk) but the parent
+        // fsync returns EACCES, surfacing as a confusing partial
+        // failure ("write psks: Permission denied") from
+        // `symbolon github enroll`.
+        let outcome = run_isolated(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "symbolon-sandbox-write-parent-fsync-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir(&dir).unwrap();
+
+            let paths = SandboxPaths {
+                read_files: vec![],
+                read_dirs: vec![],
+                resolv_files: vec![],
+                write_parent_dirs: vec![dir.clone()],
+            };
+            let out = apply(SandboxMode::BestEffort, &paths).unwrap();
+
+            // Mirror the syscall sequence atomic_write's final
+            // step performs: open(dir, O_RDONLY) + fsync(fd).
+            let parent_fsync = fs::File::open(&dir).and_then(|f| f.sync_all());
+            (out, parent_fsync, dir)
+        });
+        let (out, parent_fsync, dir) = outcome;
+        let _ = fs::remove_dir_all(&dir);
+        if out.fs {
+            parent_fsync
+                .expect("parent-dir fsync must succeed when write_parent_dirs covers the dir");
+        } else {
+            // Kernel lacks Landlock support — sandbox degraded;
+            // test cannot verify enforcement.
+            let _ = parent_fsync;
+        }
     }
 }

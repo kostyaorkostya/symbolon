@@ -66,18 +66,15 @@ mlock = "best_effort"
 # write-allowlist automatically.
 pidfile = "/run/symbolon/symbolon.pid"
 
+# Per-provider section — field reference in per-provider docs
+# under docs/providers/. Example for GitHub:
 [provider.github]
-# For github.com, keep defaults below.
-# For GitHub Enterprise Server, set:
-#   host     = "github.example.com"
-#   api_base = "https://github.example.com/api/v3"
 host = "github.com"
 api_base = "https://api.github.com"
 client_id = "Iv23liABCDEFGHIJklmn"
 installation_id = 789012
 private_key_path = "/etc/symbolon/github-app.pem"
 selfcheck_timeout = "5s"
-# request_timeout = "10s"   # optional; default 10s
 ```
 
 Unknown top-level keys are rejected by `serde` deserialization
@@ -85,19 +82,19 @@ Unknown top-level keys are rejected by `serde` deserialization
 section is optional and defaults to `sandbox = "best_effort"` with
 no extra read dirs.
 
-The PEM key path (`provider.github.private_key_path`) is read once
-at startup, **before** the sandbox is applied. The default sandbox
-ruleset deliberately omits `/etc/symbolon/` so a post-compromise
-process inside the daemon cannot re-open the key. Keep the PEM
-under `/etc/symbolon/` (or any other dir outside
-`/var/lib/symbolon/`); do not place it in the directory granted
-write access for atomic state-file writes.
+The provider private-key path is read once at startup, **before**
+the sandbox is applied. The default sandbox ruleset deliberately
+omits `/etc/symbolon/` so a post-compromise process inside the
+daemon cannot re-open the key. Keep the key file under
+`/etc/symbolon/` (or any other dir outside `/var/lib/symbolon/`);
+do not place it in the directory granted write access for atomic
+state-file writes.
 
-### `/var/lib/symbolon/clients.json` — machine-authored (schema v2)
+### `/var/lib/symbolon/clients.json` — machine-authored
 
 ```json
 {
-  "version": 2,
+  "version": 1,
   "clients": [
     {
       "name": "dev-vm-1",
@@ -109,11 +106,11 @@ write access for atomic state-file writes.
 }
 ```
 
-The `providers` array allows multi-provider enrolment; for the
-GitHub-only build it's always `["github"]`. Schema v1 (which carried
-a per-client `ip` field) is rejected at startup — operators
-upgrading from v1 must re-enroll all clients (the PSK changes
-shape too, see below).
+`version` is a literal integer the daemon checks at parse time
+(currently must be `1`); it exists so a future on-disk format
+change can be detected and migrated rather than silently
+mis-parsed. The `providers` array allows multi-provider
+enrolment per client.
 
 ### `/var/lib/symbolon/psks` — machine-authored
 
@@ -217,10 +214,11 @@ path=octocat/Spoon-Knife
 
 (`key=value` lines terminated by an empty line.)
 
-**Response:**
+**Response** (value of `username` is provider-determined; see
+per-provider doc):
 
 ```
-username=x-access-token
+username=<provider-specified-username>
 password=<token>
 password_expiry_utc=<epoch>
 
@@ -291,96 +289,22 @@ The daemon serialises admin requests, so file writes to
 CR or embedded LF inside any string field is rejected (same
 Clone2Leak-class defence applied to the admin path).
 
-### GitHub provider outbound
+### Provider outbound
 
-References: [REST API for App installations][gh-installs],
-[Installation access tokens][gh-iat], [App permissions][gh-perms],
-[JWT (RFC 7519)](https://www.rfc-editor.org/rfc/rfc7519).
+Per-provider outbound HTTPS contracts (endpoints, auth, headers,
+body shape, retry / cache behaviour) live in
+[providers/](providers/) — one file per supported provider.
+Currently:
 
-[gh-installs]: https://docs.github.com/en/rest/apps/installations
-[gh-iat]: https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-an-installation-access-token-for-a-github-app
-[gh-perms]: https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/choosing-permissions-for-a-github-app
-
-**App JWT signing (RS256):**
-
-- `iss`: App client ID (e.g. `Iv23liABCDEFGHIJklmn`). GitHub
-  accepts either the numeric App ID or the client ID here; we use
-  the client ID because it is stable across App ownership transfers.
-- `iat`: now − 60 s (clock-skew tolerance).
-- `exp`: now + 540 s (9 minutes; GitHub max is 10).
-- Signing key: PEM at `provider.github.private_key_path`, loaded once
-  at daemon startup, held in memory. To rotate, restart the daemon.
-- Implementation: in-tree RS256 signer at
-  `src/providers/jwt_rs256.rs` (RSASSA-PKCS1-v1_5 with SHA-256),
-  built directly on the `rsa` and `sha2` crates. Replaces a prior
-  dependency on `jsonwebtoken`; the byte-exact JWT output is pinned
-  by `tests::known_vector_matches_jsonwebtoken_baseline`.
-
-**Token mint:**
-
-- `POST {api_base}/app/installations/{installation_id}/access_tokens`
-- Headers:
-  - `Authorization: Bearer <jwt>`
-  - `Accept: application/vnd.github+json`
-  - `X-GitHub-Api-Version: <current>`
-  - `User-Agent: <provider.github.user_agent>` — defaults to `symbolon` if
-    unset; configurable by the operator. Required by GitHub (missing
-    UA → 403). Intentionally carries no version number so an
-    attacker can't narrow the applicable CVE list.
-  - `X-Request-ID: <out_req_id>` — fresh ULID per outbound call.
-    The same value flows into the `provider_call` /
-    `provider_call_done` breadcrumbs and into `MintOutcome` /
-    `SelfcheckOutcome` for operator-side correlation.
-  - `Request-Timeout: <seconds>` — best-effort hint per the expired
-    IETF draft (`draft-thomson-hybi-http-timeout`). Integer seconds
-    derived from the per-call timeout (`request_timeout` for
-    resolve / mint; `selfcheck_timeout` for selfcheck). GitHub does
-    not document honouring it; any intermediate proxy that follows
-    the draft (e.g. envoy) might. Cost is one header.
-
-Response (read on every call): `X-GitHub-Request-Id` is captured
-into `gh_req_id` on the outcome / breadcrumb so an operator can
-join the broker's log to GitHub's side when filing a ticket.
-- Body:
-  ```json
-  {
-    "repository_ids": [<numeric_repo_id>],
-    "permissions": { "contents": "write", "metadata": "read" }
-  }
-  ```
-- Response: `201 Created` with `{token, expires_at}`. Surface 4xx as
-  `evt=mint_denied provider_status=<code>`; surface 5xx as
-  `evt=provider_error`.
-
-**Repository-ID resolution and cache:**
-
-- The App JWT only authenticates App-level endpoints (`/app`,
-  `/app/installations/...`); it cannot authenticate
-  `GET /repos/{owner}/{repo}`. So resolution is a two-step
-  flow per cache miss:
-  1. `POST /app/installations/{installation_id}/access_tokens`
-     with body `{"permissions":{"metadata":"read"}}` (no
-     `repository_ids`) using the App JWT — yields a
-     metadata-only installation token. Logged as
-     `provider_call endpoint=mint_metadata_token`.
-  2. `GET {api_base}/repos/{owner}/{repo}` with that
-     installation token as bearer — returns `{id, ...}`.
-     Logged as `provider_call endpoint=resolve_repo_id`.
-- In-memory cache keyed by `(provider_name, owner/repo)`
-  (case-insensitive for `owner/repo`). Cache hits skip both
-  steps above and go straight to `mint_token`.
-- **TTL: 600 seconds per entry.** On any 404 from a subsequent
-  `mint_token` call referring to a cached entry, invalidate it;
-  the next mint re-resolves. This handles the
-  delete-then-recreate-with-same-name case where the numeric ID
-  changes.
+- **GitHub** → [providers/github.md § Outbound API contract](providers/github.md#outbound-api-contract).
 
 ## Daemon lifecycle
 
 ### Startup
 
 1. Parse `config.toml`. Fail fast on schema errors.
-2. Load App private key(s) into memory. Fail fast on parse error.
+2. Load each configured provider's private key file into memory.
+   Fail fast on parse error.
 3. Unlink any stale `admin.socket_path`.
 4. Bind the TCP listen socket and the admin Unix socket; set
    admin socket mode `0600`, owner `symbolon:symbolon`.
@@ -388,13 +312,13 @@ join the broker's log to GitHub's side when filing a ticket.
 6. Apply sandbox (Landlock at ABI 6). Per `[security] sandbox`:
    `required` aborts on missing kernel features; `best_effort`
    degrades and emits `evt=sandbox_applied` at `warn` lvl; `off`
-   skips. After this step the PEM key dir is unreachable, only the
-   small allowlist (state dirs, `/dev/urandom`, `/etc/ssl/certs`,
-   nameservice files, TCP-connect to port 443, intra-domain
-   signals) remains
-   permitted.
-7. Run selfcheck (verify App ID matches JWT, verify each provider's
-   `api_base` reachable, log clock skew).
+   skips. After this step the provider key dir is unreachable;
+   only the small allowlist (state dirs, `/dev/urandom`,
+   `/etc/ssl/certs`, nameservice files, TCP-connect to port 443,
+   intra-process signals) remains permitted.
+7. Run per-provider selfcheck (provider-specific: verifies the
+   provider identity claim and reachability; see
+   [providers/](providers/)).
 8. Enter the accept loop.
 
 ### Shutdown
@@ -415,9 +339,9 @@ On any other signal except SIGHUP: terminate fast; do not drain.
 | File | Reload mechanism |
 |---|---|
 | `clients.json` | SIGHUP re-reads from disk. |
-| `psks` | Read AND written by daemon: `symbolon github enroll`/`revoke` route through the admin socket; the daemon parses, mutates the in-memory `PskStore`, and atomically rewrites the file. No external process to notify — symbolon owns the responder side of Noise NNpsk0 directly. |
+| `psks` | Read AND written by daemon: per-provider `enroll`/`revoke` commands route through the admin socket; the daemon parses, mutates the in-memory `PskStore`, and atomically rewrites the file. No external process to notify — symbolon owns the responder side of Noise NNpsk0 directly. |
 | `config.toml` | Restart required. |
-| App private key | Restart required. |
+| Provider private key | Restart required. |
 
 ## Logging schema
 

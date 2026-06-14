@@ -260,9 +260,7 @@ pub enum ConfigError {
         source: serde_json::Error,
     },
     /// `clients.json` has a schema version we don't know how to read.
-    #[error(
-        "clients file version unsupported: got {0}, expected 2 (re-enroll all clients to upgrade from v1)"
-    )]
+    #[error("clients file version unsupported: got {0}, expected 1")]
     UnsupportedClientsVersion(u32),
 }
 
@@ -280,7 +278,7 @@ pub fn parse_clients_file(text: &str, path: &Path) -> Result<ClientsFile, Config
         path: path.to_path_buf(),
         source,
     })?;
-    if parsed.version != 2 {
+    if parsed.version != 1 {
         return Err(ConfigError::UnsupportedClientsVersion(parsed.version));
     }
     Ok(parsed)
@@ -440,15 +438,15 @@ selfcheck_timeout = "5s"
 
     #[test]
     fn clients_empty_array_parses() {
-        let parsed: ClientsFile = serde_json::from_str(r#"{"version":2,"clients":[]}"#).unwrap();
-        assert_eq!(parsed.version, 2);
+        let parsed: ClientsFile = serde_json::from_str(r#"{"version":1,"clients":[]}"#).unwrap();
+        assert_eq!(parsed.version, 1);
         assert!(parsed.clients.is_empty());
     }
 
     #[test]
     fn clients_one_entry_parses() {
         let json = r#"{
-  "version": 2,
+  "version": 1,
   "clients": [
     {
       "name": "dev-vm-1",
@@ -470,7 +468,7 @@ selfcheck_timeout = "5s"
     #[test]
     fn clients_unknown_field_on_entry_rejected() {
         let json = r#"{
-  "version": 2,
+  "version": 1,
   "clients": [
     {
       "name": "x",
@@ -485,27 +483,23 @@ selfcheck_timeout = "5s"
     }
 
     #[test]
-    fn clients_v1_rejected_with_migration_hint() {
-        // v1 carried per-client `ip`; operators must re-enroll all clients
-        // when upgrading.
-        let json = r#"{"version":1,"clients":[]}"#;
+    fn clients_unknown_version_rejected() {
+        // Any version other than the current (1) must be rejected so a
+        // future on-disk format change can't be silently mis-parsed.
+        let json = r#"{"version":2,"clients":[]}"#;
         let err = parse_clients_file(json, Path::new("/test/clients.json")).unwrap_err();
         assert!(
-            matches!(err, ConfigError::UnsupportedClientsVersion(1)),
+            matches!(err, ConfigError::UnsupportedClientsVersion(2)),
             "unexpected error: {err}"
-        );
-        assert!(
-            err.to_string().contains("re-enroll"),
-            "error should hint at the migration path: {err}"
         );
     }
 
     #[test]
-    fn clients_v1_ip_field_now_rejected_as_unknown() {
-        // Belt-and-suspenders: even if someone forces version=2, the legacy
-        // `ip` field is rejected by deny_unknown_fields.
+    fn clients_ip_field_rejected_as_unknown() {
+        // The schema does not carry a per-client `ip` field;
+        // deny_unknown_fields rejects it.
         let json = r#"{
-  "version": 2,
+  "version": 1,
   "clients": [
     {
       "name": "x",

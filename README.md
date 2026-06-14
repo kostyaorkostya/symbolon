@@ -1,14 +1,16 @@
 # Symbolon — git credentials broker
 
-*Symbolon* (σύμβολον) keeps long-lived **GitHub** credentials off
-your dev VMs. It holds the platform's privileged identity (e.g. a
-GitHub App's private key) on a trusted broker host and mints
-short-lived, single-repository tokens to clients on demand.
+*Symbolon* (σύμβολον) keeps long-lived git credentials off your dev
+VMs. It holds the platform's privileged identity on a trusted
+broker host and mints short-lived, single-repository tokens to
+clients on demand.
 
-Currently supports **GitHub** (including GitHub Enterprise Server).
-Other providers are designed to plug in without changing the
-daemon, transport, or existing clients. **Optimized for
-trusted-network homelab deployment.**
+Currently supports **GitHub** — see
+[docs/providers/github.md](docs/providers/github.md) for the
+per-provider setup, guarantees, and bounds. Other providers are
+designed to plug in without changing the daemon, transport, or
+existing clients. **Optimized for trusted-network homelab
+deployment.**
 
 ## Why this exists
 
@@ -22,9 +24,10 @@ access for as long as the credential lives.
 
 Symbolon holds the platform's privileged identity on a trusted
 broker host and mints short-lived, repository-scoped tokens on
-demand. A client compromise bounds the attacker to the broker's
-narrow per-mint scope for ≤1 hour (the TTL of the provider's
-installation token).
+demand. A client compromise is bounded by the per-provider token
+lifetime and per-mint scope — the concrete numbers and what each
+provider does and doesn't guarantee are in
+[docs/providers/](docs/providers/).
 
 ## Architecture
 
@@ -40,7 +43,6 @@ installation token).
 └──────────────────────────┘                │       │ HTTPS             │
                                             │       ▼                   │
                                             │  provider API             │
-                                            │  (GitHub today)           │
                                             │  mints per-repo token     │
                                             └───────────────────────────┘
 ```
@@ -50,16 +52,17 @@ helper on the client. The helper opens an authenticated, encrypted
 session to the broker. Handshake completion proves the client's
 identity; the daemon dispatches the request to the configured
 provider, mints a single-repo token, and writes it back through the
-session. The token expires within an hour. Nothing is persisted on
-either side. Wire format: see
+session. The token's lifetime and exact scope are determined by
+the provider — see [docs/providers/](docs/providers/). Nothing is
+persisted on either side. Wire format:
 [docs/PROTOCOLS.md](docs/PROTOCOLS.md).
 
 ## Threat model (summary)
 
 A client compromise buys the attacker:
 
-- Up to ~1 hour of token use against repositories accessible to the
-  configured provider identity.
+- Tokens for the per-mint scope, valid for the per-provider TTL,
+  for any repository the configured provider identity can reach.
 - The ability to request fresh tokens for those repos until the
   operator removes the client or removes the repo from the
   provider's access set.
@@ -67,58 +70,55 @@ A client compromise buys the attacker:
 A client compromise does NOT buy the attacker:
 
 - Access to repos the provider identity hasn't been granted.
-- Anything outside the per-mint permission set the broker requests
-  from the provider (minimum-permissions; for GitHub the
-  `Workflows` permission is intentionally not granted, so pushes
-  touching `.github/workflows/*.yml` are rejected). See
-  [AGENTS.md](./AGENTS.md) for the full per-provider permission
-  set.
+- Anything outside the per-mint permission set the broker
+  requests from the provider. The exact set is per-provider; see
+  [docs/providers/](docs/providers/) for the concrete bounds per
+  provider.
 - Other clients' traffic (per-client PSKs).
-- Persistent access (no long-lived tokens; the provider's private
-  key never leaves the broker host).
+- Persistent access — no long-lived tokens; the provider's
+  private key never leaves the broker host.
 
-Full threat model and architectural decisions: see [AGENTS.md](./AGENTS.md).
+Full threat model and architectural decisions: [AGENTS.md](./AGENTS.md).
 
 ## Non-goals
 
 - **Cross-untrusted-network deployment.** This design assumes
-  source-IP attestation is provided by the surrounding environment
-  (e.g. libvirt `clean-traffic` plus host-bridge anti-rogue-DHCP,
-  or equivalent). Running broker and clients across the public
-  internet would require a different transport and identity story.
+  source-IP attestation is provided by the surrounding
+  environment (e.g. libvirt `clean-traffic` plus host-bridge
+  anti-rogue-DHCP, or equivalent). Running broker and clients
+  across the public internet would require a different transport
+  and identity story.
 - **Multi-tenancy.** One trust boundary, one operator, one
   provider identity per provider kind. Not a SaaS.
 - **Hot-reload of provider private keys.** Restart the daemon to
   rotate keys.
 - **Real-time provider-side change detection.** Webhooks are not
-  consumed; per-provider selfcheck commands (e.g.
-  `symbolon github selfcheck`) are the on-demand check.
-- **Token persistence or caching.** Every token is freshly minted;
-  none are stored anywhere.
+  consumed; per-provider selfcheck commands are the on-demand
+  check.
+- **Token persistence or caching.** Every token is freshly
+  minted; none are stored anywhere.
 
 ## Quick start
 
-Full setup in [docs/INSTALL.md](docs/INSTALL.md). The short
-version for the currently supported provider (GitHub):
+Daemon install (provider-agnostic): [docs/INSTALL.md](docs/INSTALL.md).
 
-1. **Create a GitHub App** (Contents R/W + Metadata R only) and
-   install it on the repos you want exposed.
-2. **Deploy `symbolon` to a trusted-network host.** No TLS proxy
-   needed — the client session is terminated in-process.
-3. **Enroll each client:** `symbolon github enroll <name>`. The
-   command prints a paste-ready snippet for the client.
+Per-provider setup (App creation, config block, commands):
+[docs/providers/github.md](docs/providers/github.md) for GitHub.
 
 ## Documentation
 
 - **[AGENTS.md](./AGENTS.md)** — design rationale, architectural
   invariants, conventions, agent guidance.
-- **[docs/INSTALL.md](./docs/INSTALL.md)** — deploying the broker
-  and enrolling clients.
+- **[docs/INSTALL.md](./docs/INSTALL.md)** — daemon install,
+  cross-provider.
 - **[docs/OPERATIONS.md](./docs/OPERATIONS.md)** — operator
-  commands, logging, troubleshooting.
+  commands, logging, troubleshooting (cross-provider).
 - **[docs/PROTOCOLS.md](./docs/PROTOCOLS.md)** — wire formats,
   file schemas, daemon lifecycle, logging schema.
-- **[docs/REFERENCES.md](./docs/REFERENCES.md)** — authoritative URLs.
+- **[docs/providers/](./docs/providers/)** — one file per
+  supported provider.
+- **[docs/REFERENCES.md](./docs/REFERENCES.md)** — authoritative
+  URLs.
 
 ## License
 

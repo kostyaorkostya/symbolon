@@ -228,7 +228,7 @@ pub fn write_clients_json(path: &Path, entries: &[&str]) {
             )
         })
         .collect();
-    let body = format!(r#"{{"version":2,"clients":[{}]}}"#, entries_json.join(","));
+    let body = format!(r#"{{"version":1,"clients":[{}]}}"#, entries_json.join(","));
     std::fs::write(path, body).unwrap();
 }
 

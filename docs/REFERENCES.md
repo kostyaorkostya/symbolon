@@ -1,23 +1,20 @@
 # References
 
-Authoritative URLs cited from elsewhere in the project. If a link rots,
-the URL changes here, not in 5 different files.
-
-## Provider APIs
-
-- [GitHub REST API for App installations](https://docs.github.com/en/rest/apps/installations)
-- [Generating an installation access token](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-an-installation-access-token-for-a-github-app)
-- [Choosing permissions for a GitHub App](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/choosing-permissions-for-a-github-app)
+Authoritative URLs cited from elsewhere in the project. If a link
+rots, the URL changes here, not in five different files. Provider
+API links live with their provider doc under
+[`providers/`](providers/).
 
 ## Protocols
 
 - [Noise Protocol Framework, revision 34](https://noiseprotocol.org/noise_rev34.html)
   — the cryptographic protocol family `symbolon` uses for its
-  client-server transport (pattern `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s`).
-- [git-credential](https://git-scm.com/docs/git-credential) — the helper
-  invocation interface.
-- [gitcredentials(7)](https://git-scm.com/docs/gitcredentials) — config
-  surface and helper protocol.
+  client-server transport (pattern
+  `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s`).
+- [git-credential](https://git-scm.com/docs/git-credential) — the
+  helper invocation interface.
+- [gitcredentials(7)](https://git-scm.com/docs/gitcredentials) —
+  config surface and helper protocol.
 
 ## RFCs
 
@@ -27,10 +24,11 @@ the URL changes here, not in 5 different files.
 
 - [compio](https://docs.rs/compio/) — async runtime.
 - [cyper](https://docs.rs/cyper/) — HTTPS client on compio.
-- [snow](https://github.com/mcginty/snow) — pure-Rust Noise Protocol
-  implementation; drives the transport in `src/transport.rs`.
-- [rsa](https://docs.rs/rsa/) — RSASSA-PKCS1-v1_5 RS256 signing for
-  the GitHub App JWT.
+- [snow](https://github.com/mcginty/snow) — pure-Rust Noise
+  Protocol implementation; drives the transport in
+  `src/transport.rs`.
+- [rsa](https://docs.rs/rsa/) — RSASSA-PKCS1-v1_5 RS256 signing
+  used by the GitHub provider's JWT.
 
 ## Build & reproducibility
 
@@ -42,5 +40,5 @@ the URL changes here, not in 5 different files.
 ## Security background
 
 - [Clone2Leak — Git security vulnerabilities announced (Jan 2025)](https://github.blog/open-source/git/git-security-vulnerabilities-announced-5/)
-  — origin of the CR/LF rejection requirement in the git-credential
-  parser (PROTOCOLS.md).
+  — origin of the CR/LF rejection requirement in the
+  git-credential parser (PROTOCOLS.md).

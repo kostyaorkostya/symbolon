@@ -15,6 +15,8 @@ Detail lives in sibling documents:
 - Operator commands, logging recipes, troubleshooting:
   [`docs/OPERATIONS.md`](docs/OPERATIONS.md)
 - Deployment: [`docs/INSTALL.md`](docs/INSTALL.md)
+- Per-provider setup, guarantees, outbound API contracts,
+  hardening: [`docs/providers/`](docs/providers/)
 - Authoritative URLs: [`docs/REFERENCES.md`](docs/REFERENCES.md)
 
 ## Purpose
@@ -77,13 +79,15 @@ applied. Dev binaries aren't shipped, so this is fine.
 ## Threat model
 
 Primary threat: a client is compromised (malicious supply-chain
-dependency pulled at build time; agentic coding tool induced to read or
-execute; untrusted code on disk). The broker is the trust boundary; it
-holds provider private keys. Client compromise must not enable: pivot
-to other repos on the account, modification of CI workflow files,
-secret reads, or anything outside the App's configured permissions.
-Acceptable residual: up to 1 hour of token use against repos already
-accessible to the App.
+dependency pulled at build time; agentic coding tool induced to read
+or execute; untrusted code on disk). The broker is the trust
+boundary; it holds the provider private key. Client compromise must
+not enable: pivot to other repos on the account, modification of CI
+workflow files, secret reads, or anything outside the configured
+provider's permission set. Acceptable residual: up to the
+provider-specific token TTL of token use against repos already
+accessible to the configured provider identity. The concrete TTL
+and permission set per provider live in `docs/providers/<name>.md`.
 
 ## Architectural invariants (do not relitigate)
 
@@ -94,12 +98,16 @@ accessible to the App.
 3. **No broker-side allowlist.** The broker mints for any repo the
    configured provider identity can reach. Per-mint scoping (next
    item) keeps blast radius narrow.
-4. **Per-mint scoping is mandatory.** Every mint passes
-   `repository_ids: [single_repo_id]` and
-   `permissions: {contents: write, metadata: read}`. Never broader.
-5. **App permissions are immutable.** Contents R/W + Metadata R only.
-   `Workflows` MUST NOT be granted; its absence prevents a compromised
-   client from pushing CI changes.
+4. **Per-mint scoping is mandatory.** Every mint requests exactly
+   one repository plus the minimum permission set the provider
+   accepts for `git push` / `git clone`. Never broader. The exact
+   on-the-wire encoding is provider-specific and lives in
+   `docs/providers/<name>.md`.
+5. **Provider permissions are immutable per provider.** The
+   broker requests one fixed permission set per provider, hard-
+   coded in `src/providers/<name>.rs`. Operators do not configure
+   it. The required-vs-forbidden-vs-rejected set per provider
+   lives in `docs/providers/<name>.md`.
 6. **Transport: Noise NNpsk0 over TCP, terminated in-process** via
    the [`snow`](https://github.com/mcginty/snow) crate. The daemon
    listens directly on TCP (default `:9418`) and runs the responder
@@ -396,7 +404,7 @@ src/
   bin/
     git_credential_symbolon.rs  # client-side git-credential helper
   lib.rs               # crate-level docs, pub re-exports
-  config.rs            # config.toml + clients.json (v2) parsing
+  config.rs            # config.toml + clients.json parsing
   connection_tracker.rs# spawn / drain abstraction for accept loops
   cpu_worker.rs        # Dedicated OS thread for CPU-bound work
   git_credential.rs    # protocol parse/emit; CR/LF rejection mandatory
@@ -504,13 +512,15 @@ Known omissions, not oversights:
   changes.
 - **Metrics endpoint** (Prometheus / OpenMetrics). Logs are the
   observability surface today. Add when there's a consumer.
-- **Webhook handling.** No live notification when the App's
-  permissions change provider-side; `symbolon github selfcheck` is the
-  on-demand check.
+- **Webhook handling.** No live notification when the provider's
+  permission grants change provider-side; per-provider selfcheck
+  commands (e.g. `symbolon github selfcheck`) are the on-demand
+  check.
 - **Emergency offline state mutation.** Operator commands talk to
   the admin socket of a running daemon. No CLI path that mutates
-  `clients.json` or `symbolon.psk` directly.
-- **App-key hot reload.** Restart the daemon to pick up a new key.
+  `clients.json` or `/var/lib/symbolon/psks` directly.
+- **Provider-key hot reload.** Restart the daemon to pick up a
+  new key.
 - **`provider_error` `endpoint` / `body_snippet` fields.**
   PROTOCOLS.md lists them in the logging schema; the daemon does
   not emit them yet. Adding `body_snippet` requires a redaction

@@ -1146,7 +1146,7 @@ mod tests {
             std::env::temp_dir().join(format!("symbolon-reload-test-{}.json", ulid::Ulid::new()));
         std::fs::write(
             &clients_path,
-            r#"{"version":2,"clients":[{"name":"new","providers":["github"],"enrolled_at":"y","note":null}]}"#,
+            r#"{"version":1,"clients":[{"name":"new","providers":["github"],"enrolled_at":"y","note":null}]}"#,
         )
         .unwrap();
         // psk_file_path points at a nonexistent file; load_psk_store

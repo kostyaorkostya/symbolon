@@ -1,10 +1,17 @@
 # Installing `symbolon`
 
-Fresh-deployment guide. Operational details (commands, paths,
-packaging) drift over time; the stable design lives in
-[../AGENTS.md](../AGENTS.md), wire formats in
-[PROTOCOLS.md](PROTOCOLS.md), per-provider setup in
-[providers/](providers/).
+How-to — fresh-deployment guide. Operational details (commands,
+paths, packaging) drift over time; the stable explanation is
+elsewhere.
+
+| Doc | Mode |
+|---|---|
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Explanation — how the system works |
+| [`PROTOCOLS.md`](PROTOCOLS.md) | Reference — wire / file / log schemas |
+| [`PROVIDER_CONTRACT.md`](PROVIDER_CONTRACT.md) | Reference — RFC-2119 provider contract |
+| [`OPERATIONS.md`](OPERATIONS.md) | How-to — day-to-day operations |
+| [`providers/`](providers/) | Per-provider setup (App creation, config block) |
+| [`../AGENTS.md`](../AGENTS.md) | Agent guidance — design + style |
 
 ## 1. Prerequisites
 

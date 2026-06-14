@@ -1,11 +1,18 @@
 # Operating `symbolon`
 
-Cross-provider operator reference. Per-provider specifics
-(commands, hardening, hard-cutoff procedures) live in
-[providers/](providers/); fresh deploy in
-[INSTALL.md](INSTALL.md); design rationale in
-[../AGENTS.md](../AGENTS.md); wire and file formats in
-[PROTOCOLS.md](PROTOCOLS.md).
+Cross-provider operator reference.
+
+| Doc | Mode |
+|---|---|
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Explanation — how the system works |
+| [`INSTALL.md`](INSTALL.md) | How-to — fresh deploy |
+| [`PROTOCOLS.md`](PROTOCOLS.md) | Reference — wire / file / log schemas |
+| [`providers/`](providers/) | Per-provider commands, hardening, hard-cutoff |
+| [`../AGENTS.md`](../AGENTS.md) | Agent-facing source-of-truth for design + style |
+
+Mode legend for this file: command listings and `evt=...` field
+guides are **reference**; troubleshooting, revocation, update,
+and backup are **how-to recipes**.
 
 CLI commands talk to the daemon over its admin Unix socket. The
 socket is SO_PEERCRED-gated to root or the daemon's UID, so the
@@ -86,21 +93,13 @@ Landlock.
 
 ## Sandbox
 
-Brief: the broker self-sandboxes at startup with Landlock at ABI 6
-— FS read/write allowlist, outbound TCP-connect restricted to port
-443, abstract-UDS scope, and `Scope::Signal` (Linux 6.12+) denying
-signals to processes outside the broker's domain. The exact
-allowlist (paths, scopes, edge cases) is in
-[`src/sandbox.rs`](../src/sandbox.rs) — read the source when
-something behaves unexpectedly.
-
-The atomic-write directory grant on `/var/lib/symbolon/` covers
-everything in that directory; the provider key lives outside this
-dir on purpose.
-
-For additional host-policy enforcement (per-process syscall scope
-etc.), layer AppArmor or SELinux from the surrounding LXC/systemd
-config. Out of scope for the broker itself.
+For the model + scope + invariants, see
+[`ARCHITECTURE.md` § Sandbox model](ARCHITECTURE.md#sandbox-model).
+The exact ruleset (paths, scopes, edge cases) is in
+[`src/sandbox.rs`](../src/sandbox.rs). For additional host-policy
+enforcement (per-process syscall scope etc.), layer AppArmor or
+SELinux from the surrounding LXC/systemd config — out of scope
+for the broker itself.
 
 ## Troubleshooting
 
@@ -208,15 +207,6 @@ Find the `req_id` of the failing request and trace it from
   hasn't masked `/sys/kernel/security/`. Set
   `[security] sandbox = "required"` to make the daemon refuse to
   start on hosts that can't enforce.
-
-## Identity attribution
-
-Identity is the PSK identity surfaced by the Noise handshake. A
-connection only completes the handshake if the client presented an
-enrolled identity AND held the matching PSK; the `evt=accept` log
-field `psk_identity` reflects that authenticated value, not the
-client-claimed string. The TCP source address is logged as `peer`
-for audit only — never used for identity decisions (DHCP-friendly).
 
 ## Revocation
 

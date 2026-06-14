@@ -1,15 +1,22 @@
 # GitHub provider
 
-Everything specific to the GitHub provider. The cross-provider core
-is in [`../INSTALL.md`](../INSTALL.md),
-[`../OPERATIONS.md`](../OPERATIONS.md),
-[`../PROTOCOLS.md`](../PROTOCOLS.md), and
+Everything specific to the GitHub provider. The cross-provider
+core is in [`../ARCHITECTURE.md`](../ARCHITECTURE.md) (explanation),
+[`../PROTOCOLS.md`](../PROTOCOLS.md) (reference),
+[`../PROVIDER_CONTRACT.md`](../PROVIDER_CONTRACT.md) (RFC-2119
+contract — and § "How GitHub satisfies the contract" maps each
+point to this provider's binding),
+[`../INSTALL.md`](../INSTALL.md) (how-to deploy),
+[`../OPERATIONS.md`](../OPERATIONS.md) (how-to operate), and
 [`../../AGENTS.md`](../../AGENTS.md).
 
 Tested against `github.com`. GitHub Enterprise Server is supported
 in principle (the API surface is the same) but not exercised in CI.
 
-## Per-mint guarantees
+Section mode tags below: `(reference)` = consult while working,
+`(how-to)` = follow steps to a goal.
+
+## Per-mint guarantees (reference)
 
 These are the bounds a compromised client can hit when this provider
 is in use. They follow from how the broker uses GitHub's APIs, not
@@ -32,7 +39,7 @@ compromised client cannot push changes to
 `.github/workflows/*.yml`: GitHub rejects those pushes server-side
 when the token lacks `Workflows: write`.
 
-## Create the GitHub App
+## Create the GitHub App (how-to)
 
 On github.com:
 
@@ -61,7 +68,7 @@ For GitHub Enterprise Server: the same steps apply on your GHES
 instance. The Client ID and installation ID will differ from any
 public github.com Apps.
 
-## Config block
+## Config block (reference)
 
 In `/etc/symbolon/config.toml`:
 
@@ -85,7 +92,7 @@ selfcheck_timeout = "5s"             # required; tune to your p99 to api.github.
 credential helper sends — no suffix matching, no case-folding, no
 default. See [`../PROTOCOLS.md`](../PROTOCOLS.md) § "Host dispatch".
 
-## Commands
+## Commands (reference)
 
 ```
 symbolon github enroll <client> [--note <text>]
@@ -111,7 +118,7 @@ symbolon github selfcheck
     clock skew is bounded. Exits non-zero on any failed check.
 ```
 
-## Outbound API contract
+## Outbound API contract (reference)
 
 References: [REST API for App installations][gh-installs],
 [Installation access tokens][gh-iat], [App permissions][gh-perms],
@@ -197,7 +204,7 @@ captured into `gh_req_id` on the outcome / breadcrumb so an
 operator can join the broker's log to GitHub's side when filing
 a ticket.
 
-## Hardening recommendations
+## Hardening recommendations (how-to, sysadmin)
 
 The per-mint scoping above is the narrowest GitHub will issue for
 a push-capable token. Within that scope, a compromised token can
@@ -251,7 +258,7 @@ On Free accounts, rulesets created on **private** repositories
 save successfully and appear in the UI, but are not enforced;
 GitHub shows a banner indicating this.
 
-## Hard cutoff (incident response)
+## Hard cutoff (how-to, incident response)
 
 `symbolon github revoke <client>` removes the client's PSK so the
 client can't request more tokens, but it does not revoke the
@@ -267,7 +274,7 @@ client can't request more tokens, but it does not revoke the
   daemon** — the App key is loaded at startup and is not
   hot-reloadable.
 
-## References
+## References (reference)
 
 - [REST API for App installations](https://docs.github.com/en/rest/apps/installations)
 - [Generating an installation access token](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-an-installation-access-token-for-a-github-app)

@@ -1,9 +1,18 @@
 # Protocols & file formats
 
-Wire formats and on-disk schemas for `symbolon`. Design rationale and
-conventions are in [`../AGENTS.md`](../AGENTS.md); operator material is
-in [`OPERATIONS.md`](OPERATIONS.md) and [`INSTALL.md`](INSTALL.md);
-authoritative URLs are in [`REFERENCES.md`](REFERENCES.md).
+Reference doc — wire formats and on-disk schemas for `symbolon`.
+Look here while working; for "how does this thing work" read
+[`ARCHITECTURE.md`](ARCHITECTURE.md) first.
+
+| Doc | Mode |
+|---|---|
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Explanation — how the system works |
+| [`PROVIDER_CONTRACT.md`](PROVIDER_CONTRACT.md) | Reference — RFC-2119 contract for providers |
+| [`INSTALL.md`](INSTALL.md) | How-to — deploy |
+| [`OPERATIONS.md`](OPERATIONS.md) | How-to — operate |
+| [`providers/`](providers/) | Per-provider setup, guarantees, outbound API |
+| [`REFERENCES.md`](REFERENCES.md) | Reference — external URLs |
+| [`../AGENTS.md`](../AGENTS.md) | Agent guidance — design + style |
 
 ## File formats
 

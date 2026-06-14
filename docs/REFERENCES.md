@@ -1,9 +1,17 @@
 # References
 
-Authoritative URLs cited from elsewhere in the project. If a link
-rots, the URL changes here, not in five different files. Provider
-API links live with their provider doc under
-[`providers/`](providers/).
+Reference doc — authoritative URLs cited from elsewhere in the
+project. If a link rots, the URL changes here, not in five
+different files. Provider API links live with their provider doc
+under [`providers/`](providers/).
+
+| Doc | Mode |
+|---|---|
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Explanation — how the system works |
+| [`PROTOCOLS.md`](PROTOCOLS.md) | Reference — wire / file / log schemas |
+| [`PROVIDER_CONTRACT.md`](PROVIDER_CONTRACT.md) | Reference — RFC-2119 provider contract |
+| [`INSTALL.md`](INSTALL.md), [`OPERATIONS.md`](OPERATIONS.md) | How-to |
+| [`providers/`](providers/) | Per-provider docs |
 
 ## Protocols
 

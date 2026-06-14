@@ -9,15 +9,31 @@ Single source of truth for design decisions and conventions. Read it top
 to bottom before writing or modifying code. If anything here conflicts
 with an ad-hoc instruction in chat, ask before deviating.
 
-Detail lives in sibling documents:
-- Wire formats, file schemas, logging schema, daemon lifecycle:
-  [`docs/PROTOCOLS.md`](docs/PROTOCOLS.md)
-- Operator commands, logging recipes, troubleshooting:
+Detail lives in sibling documents (we follow
+[Diátaxis](https://diataxis.fr/) — each doc is one mode):
+- How the system works (explanation):
+  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- Wire formats, file schemas, logging schema, daemon lifecycle
+  (reference): [`docs/PROTOCOLS.md`](docs/PROTOCOLS.md)
+- RFC-2119 contract for providers (reference):
+  [`docs/PROVIDER_CONTRACT.md`](docs/PROVIDER_CONTRACT.md)
+- Operator commands, logging recipes, troubleshooting (how-to):
   [`docs/OPERATIONS.md`](docs/OPERATIONS.md)
-- Deployment: [`docs/INSTALL.md`](docs/INSTALL.md)
+- Deployment (how-to): [`docs/INSTALL.md`](docs/INSTALL.md)
 - Per-provider setup, guarantees, outbound API contracts,
   hardening: [`docs/providers/`](docs/providers/)
-- Authoritative URLs: [`docs/REFERENCES.md`](docs/REFERENCES.md)
+- Authoritative URLs (reference):
+  [`docs/REFERENCES.md`](docs/REFERENCES.md)
+
+### Where does a statement go?
+
+Single decision rule for all doc edits: **if a statement would
+still be true when a second provider lands (GitLab, Gitea,
+Forgejo), it belongs in the generic docs (README, ARCHITECTURE,
+PROTOCOLS, PROVIDER_CONTRACT, OPERATIONS, INSTALL). If swapping
+providers would falsify it, it belongs in
+`docs/providers/<name>.md`.** Apply this rule to every paragraph
+you add or move.
 
 ## Purpose
 
@@ -102,12 +118,14 @@ and permission set per provider live in `docs/providers/<name>.md`.
    one repository plus the minimum permission set the provider
    accepts for `git push` / `git clone`. Never broader. The exact
    on-the-wire encoding is provider-specific and lives in
-   `docs/providers/<name>.md`.
+   `docs/providers/<name>.md`. Normative form:
+   [`docs/PROVIDER_CONTRACT.md` § M1, M2](docs/PROVIDER_CONTRACT.md#must).
 5. **Provider permissions are immutable per provider.** The
    broker requests one fixed permission set per provider, hard-
    coded in `src/providers/<name>.rs`. Operators do not configure
    it. The required-vs-forbidden-vs-rejected set per provider
-   lives in `docs/providers/<name>.md`.
+   lives in `docs/providers/<name>.md`. Normative form:
+   [`docs/PROVIDER_CONTRACT.md` § M2, F4](docs/PROVIDER_CONTRACT.md).
 6. **Transport: Noise NNpsk0 over TCP, terminated in-process** via
    the [`snow`](https://github.com/mcginty/snow) crate. The daemon
    listens directly on TCP (default `:9418`) and runs the responder

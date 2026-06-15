@@ -148,7 +148,7 @@ async fn run_cli(config_path: PathBuf, command: CliCommand) -> ExitCode {
     }
 }
 
-/// symbolon — git credentials broker. With no subcommand, runs as a daemon.
+/// symbolon — git credentials broker.
 #[derive(FromArgs)]
 struct Args {
     /// path to config.toml (default /etc/symbolon/config.toml)
@@ -168,7 +168,7 @@ enum Subcommand {
     Github(GithubArgs),
 }
 
-/// run as the broker daemon (default when no subcommand is given)
+/// run as the broker daemon
 #[derive(FromArgs)]
 #[argh(subcommand, name = "daemon")]
 struct DaemonArgs {}

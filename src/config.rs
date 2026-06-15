@@ -206,10 +206,7 @@ fn default_user_agent() -> String {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientsFile {
-    /// Schema version. Only `2` is supported today. v1 carried an
-    /// `ip` field per client (identity used to come from the source
-    /// IP); v2 drops it — identity now derives from the Noise
-    /// handshake's PSK selection.
+    /// Schema version. Only `1` is supported today.
     pub version: u32,
     pub clients: Vec<ClientEntry>,
 }

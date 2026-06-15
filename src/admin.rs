@@ -855,8 +855,7 @@ fn check_peer_uid(stream: &UnixStream, my_uid: u32) -> bool {
 // Per-iteration `Vec` allocation. For the admin protocol's tiny
 // JSON requests this is invisible; iggy's `BytesMut::with_capacity`
 // + `.clear()` (or compio's `BufferPool` + `AsyncReadManaged`) is
-// the reuse pattern if it ever matters. See daemon.rs::read_more
-// for the symmetric comment.
+// the reuse pattern if it ever matters.
 async fn read_line(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
     let mut accumulated = Vec::new();
     // Single 1 KiB chunk buffer reused across reads via clear-and-

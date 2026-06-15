@@ -190,8 +190,8 @@ Pinned in `Cargo.toml`:
 
 - `argh` (derive-based argv parser used by `src/main.rs`. Picked over
   `clap` for code-size and over hand-rolled parsing for maintainability.
-  Daemon mode is preserved on bare `symbolon` by synthesising a hidden
-  `daemon` subcommand in `main`; everything else is regular argh.)
+  All subcommands (`daemon`, `status`, `list`, `github …`) are regular
+  argh subcommands; bare `symbolon` prints help and exits non-zero.)
 - `compio` with features `runtime,macros,net,fs,time,io-uring,ring`
   (async runtime; `macros` for `#[compio::main]`; `net`+`fs`+`time`
   for the daemon surface; `io-uring` listed explicitly so a future
@@ -576,7 +576,7 @@ Known omissions, not oversights:
   lookup. At our traffic (<<1 mint/s) the natural failure/retry
   cycle covers IP rotation. No proactive resolver work needed.
   High-mint-rate deployments would want a connection-lifetime cap.
-- **Per-read buffer reuse.** Both `src/daemon.rs::read_more` and
+- **Per-read buffer reuse.** Both `src/daemon.rs::read_exact_n` and
   `src/admin.rs::read_line` allocate a fresh `Vec` per read
   iteration. Apache iggy reuses a `BytesMut::with_capacity` via
   `.clear()` across iterations (see

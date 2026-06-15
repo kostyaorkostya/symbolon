@@ -173,25 +173,10 @@ off disk").
 
 ## Concurrency model
 
-The broker runs on a single-threaded
-[compio](https://docs.rs/compio) runtime (thread-per-core with
-one core today). Implications:
+Single-threaded [compio](https://docs.rs/compio) runtime.
+CPU-bound work (today: JWT signing) runs on a dedicated OS
+thread via `crate::cpu_worker::CpuWorker`.
 
-- Tasks cooperatively yield at `.await` only. A long CPU-bound
-  section without an `.await` blocks every other task, including
-  the accept loop. CPU work goes through
-  `crate::cpu_worker::CpuWorker`, a dedicated OS thread (used
-  today for JWT signing).
-- Shared mutable state uses `Rc<RefCell<T>>` (no Send/Sync
-  needed). RefCell borrows MUST drop before any `.await` or the
-  daemon panics at runtime. The check is manual; see
-  AGENTS.md "Diagnostic discipline" and the Axis 1a notes in
-  prior code reviews.
-- The admin-socket loop and the per-connection accept loop are
-  separate compio tasks. Per-connection handlers are bounded by
-  a 5-second timeout (slow-loris defence) and drained on
-  shutdown with a 5-second deadline.
-
-Developer-facing detail and rationale (when to use `CpuWorker`
-vs `spawn_blocking`, why no Tokio) lives in
+Rationale and developer-facing detail (`CpuWorker` vs
+`spawn_blocking`, why no Tokio) lives in
 [`../AGENTS.md` § Concurrency notes](../AGENTS.md).

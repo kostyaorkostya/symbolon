@@ -23,8 +23,8 @@ your local convention.
 ### Cross-provider
 
 ```
-symbolon [--config /etc/symbolon/config.toml]
-    Run the daemon. Default when invoked with no subcommand.
+symbolon daemon [--config /etc/symbolon/config.toml]
+    Run the broker daemon.
 
 symbolon status
     Print daemon health: uptime, last successful mint, last error,

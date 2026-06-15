@@ -41,7 +41,6 @@ use compio::BufResult;
 use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use compio::net::{TcpListener, TcpStream, UnixListener};
 use compio::runtime::CancelToken;
-use snow::{HandshakeState, TransportState};
 use tracing::{info, warn};
 
 use crate::config::{ClientsFile, Config};
@@ -52,7 +51,7 @@ use crate::git_credential;
 use crate::providers::github::{GitHubProvider, GithubError};
 use crate::psk_store::{PskStore, PskStoreError};
 use crate::sandbox::{self, SandboxError, SandboxPaths};
-use crate::transport::{self, PreludeError, TransportError};
+use crate::transport::{Phase, Responder, SessionError, Step};
 
 /// Per-connection read budget enforced at the daemon's read loop.
 /// Tighter than `git_credential::PARSER_HARD_MAX` (which is the
@@ -642,204 +641,380 @@ fn build_clients_table(file: ClientsFile) -> Result<HashMap<String, ResolvedClie
     Ok(table)
 }
 
+/// Cross-step state the driver needs to stash so the final `evt=mint`
+/// log event (emitted only after the encrypted response is on the wire)
+/// can see everything from the earlier `Step::Request` arm.
+struct MintRecord {
+    host: String,
+    path: String,
+    response: git_credential::Response,
+    repo_id: u64,
+    out_req_id: String,
+    gh_req_id: Option<String>,
+    provider_ms: u64,
+}
+
 async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<SharedState>) {
     let peer = stream.peer_addr().ok();
-    // ------ Phase 1: identity prelude ------
-    let identity_owned = match read_prelude(&mut stream).await {
-        Ok(s) => s,
-        Err(reason) => {
-            warn!(
-                req_id = %req_id,
-                evt = %EventKind::PreludeInvalid,
-                peer = ?peer,
-                reason = reason,
-            );
-            return;
-        }
-    };
+    let mut sess = Responder::new();
+    let mut client_name: Option<String> = None;
+    let mut mint_record: Option<MintRecord> = None;
 
-    // ------ Phase 2: PSK lookup + client metadata lookup ------
-    let psk = match state.psks.borrow().lookup(&identity_owned) {
-        Some(p) => zeroize::Zeroizing::new(*p),
-        None => {
-            warn!(
-                req_id = %req_id,
-                evt = %EventKind::MintDenied,
-                reason = "client_unknown",
-                psk_identity = %identity_owned,
-                peer = ?peer,
-            );
-            return;
-        }
-    };
-    let Some(client) = state.clients.borrow().get(&identity_owned).cloned() else {
-        // PSK exists but no clients.json entry — operator desynced the
-        // two files; refuse to mint rather than guess metadata.
-        warn!(
-            req_id = %req_id,
-            evt = %EventKind::MintDenied,
-            reason = "client_metadata_missing",
-            psk_identity = %identity_owned,
-        );
-        return;
-    };
-    info!(
-        req_id = %req_id,
-        evt = %EventKind::Accept,
-        psk_identity = %client.name,
-        peer = ?peer,
-    );
+    loop {
+        let phase_at_entry = sess.phase();
+        let step = match sess.step() {
+            Ok(s) => s,
+            Err(e) => {
+                log_session_failure(&req_id, peer, phase_at_entry, client_name.as_deref(), &e);
+                return;
+            }
+        };
 
-    // ------ Phase 2b: Noise NNpsk0 responder handshake ------
-    let mut transport_state = match run_responder_handshake(&mut stream, &psk).await {
-        Ok(ts) => ts,
-        Err(reason) => {
-            warn!(
-                req_id = %req_id,
-                evt = %EventKind::HandshakeFailed,
-                client = %client.name,
-                reason = reason,
-            );
-            return;
-        }
-    };
+        match step {
+            Step::ReadExact { n } => {
+                let phase = sess.phase();
+                let Some(bytes) = read_exact_n(&mut stream, n).await else {
+                    log_phase_eof(&req_id, peer, phase, client_name.as_deref());
+                    return;
+                };
+                if let Err(e) = sess.recv(&bytes) {
+                    log_session_failure(&req_id, peer, phase, client_name.as_deref(), &e);
+                    return;
+                }
+            }
 
-    // ------ Phase 3: encrypted git-credential request ------
-    let request_bytes = match read_framed_decrypt(&mut stream, &mut transport_state).await {
-        Ok(b) => b,
-        Err(reason) => {
-            warn!(
-                req_id = %req_id,
-                evt = %EventKind::MintDenied,
-                reason = "transport_read",
-                client = %client.name,
-                detail = reason,
-            );
-            return;
-        }
-    };
-    if request_bytes.len() > WIRE_READ_BUDGET {
-        warn!(
-            req_id = %req_id,
-            evt = %EventKind::MintDenied,
-            reason = "malformed_request",
-            client = %client.name,
-            detail = "request_exceeds_cap",
-        );
-        return;
-    }
-    let request = match git_credential::parse(&request_bytes) {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(
-                req_id = %req_id,
-                evt = %EventKind::MintDenied,
-                reason = "malformed_request",
-                client = %client.name,
-                error = %e,
-            );
-            return;
-        }
-    };
-    drop(request_bytes);
-
-    // ------ Phase 4: host dispatch ------
-    let Some(provider) = state.providers.get(&request.host) else {
-        warn!(
-            req_id = %req_id,
-            evt = %EventKind::MintDenied,
-            reason = "unknown_host",
-            host = %request.host,
-            client = %client.name,
-        );
-        return;
-    };
-
-    // ------ Phase 5: mint ------
-    let started = Instant::now();
-    let mint_result = provider.mint(&req_id, &request.path).await;
-    let provider_ms = started.elapsed().as_millis() as u64;
-
-    let (response, repo_id, out_req_id, gh_req_id) = match mint_result {
-        Ok(outcome) => (
-            outcome.response,
-            outcome.repo_id,
-            outcome.out_req_id,
-            outcome.gh_req_id,
-        ),
-        Err(e) => {
-            // RepoNotFound at mint-time = the provider just invalidated
-            // a (possibly cached) repo-id; surface that to the operator
-            // as a distinct event per PROTOCOLS.md.
-            if matches!(e, GithubError::RepoNotFound { .. }) {
+            Step::NeedPsk { identity } => {
+                let psk = match state.psks.borrow().lookup(&identity) {
+                    Some(p) => zeroize::Zeroizing::new(*p),
+                    None => {
+                        warn!(
+                            req_id = %req_id,
+                            evt = %EventKind::MintDenied,
+                            reason = "client_unknown",
+                            psk_identity = %identity,
+                            peer = ?peer,
+                        );
+                        return;
+                    }
+                };
+                let Some(client) = state.clients.borrow().get(&identity).cloned() else {
+                    // PSK exists but no clients.json entry — operator
+                    // desynced the two files; refuse to mint rather than
+                    // guess metadata.
+                    warn!(
+                        req_id = %req_id,
+                        evt = %EventKind::MintDenied,
+                        reason = "client_metadata_missing",
+                        psk_identity = %identity,
+                    );
+                    return;
+                };
                 info!(
                     req_id = %req_id,
-                    evt = %EventKind::CacheInvalidated,
-                    provider = %request.host,
-                    repo = %request.path,
-                    cause = "404",
+                    evt = %EventKind::Accept,
+                    psk_identity = %client.name,
+                    peer = ?peer,
                 );
+                client_name = Some(client.name);
+                if let Err(e) = sess.set_psk(*psk) {
+                    log_session_failure(&req_id, peer, sess.phase(), client_name.as_deref(), &e);
+                    return;
+                }
             }
-            log_mint_error(
-                &req_id,
-                &client.name,
-                &request.host,
-                &request.path,
-                provider_ms,
-                e,
-            );
-            return;
-        }
-    };
 
-    // ------ Phase 6: emit encrypted response ------
-    let mut out = Vec::with_capacity(256);
-    if let Err(e) = git_credential::write_response(&response, &mut out) {
-        warn!(
-            req_id = %req_id,
-            evt = %EventKind::ProviderError,
-            reason = "response_encode",
-            provider = %request.host,
-            error = %e,
-        );
-        return;
+            Step::Write(bytes) => {
+                if let Err(e) = write_all_bytes(&mut stream, bytes).await {
+                    warn!(
+                        req_id = %req_id,
+                        evt = %EventKind::HandshakeFailed,
+                        client = client_name.as_deref().unwrap_or(""),
+                        reason = "handshake_write_io",
+                        error = %e,
+                    );
+                    return;
+                }
+                if let Err(e) = sess.wrote() {
+                    log_session_failure(&req_id, peer, sess.phase(), client_name.as_deref(), &e);
+                    return;
+                }
+            }
+
+            Step::Request(request_bytes) => {
+                let client_str = client_name.as_deref().unwrap_or("");
+                if request_bytes.len() > WIRE_READ_BUDGET {
+                    warn!(
+                        req_id = %req_id,
+                        evt = %EventKind::MintDenied,
+                        reason = "malformed_request",
+                        client = client_str,
+                        detail = "request_exceeds_cap",
+                    );
+                    return;
+                }
+                let request = match git_credential::parse(&request_bytes) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(
+                            req_id = %req_id,
+                            evt = %EventKind::MintDenied,
+                            reason = "malformed_request",
+                            client = client_str,
+                            error = %e,
+                        );
+                        return;
+                    }
+                };
+                drop(request_bytes);
+
+                let Some(provider) = state.providers.get(&request.host) else {
+                    warn!(
+                        req_id = %req_id,
+                        evt = %EventKind::MintDenied,
+                        reason = "unknown_host",
+                        host = %request.host,
+                        client = client_str,
+                    );
+                    return;
+                };
+
+                let started = Instant::now();
+                let mint_result = provider.mint(&req_id, &request.path).await;
+                let provider_ms = started.elapsed().as_millis() as u64;
+
+                let outcome = match mint_result {
+                    Ok(o) => o,
+                    Err(e) => {
+                        // RepoNotFound at mint-time = the provider just
+                        // invalidated a (possibly cached) repo-id; surface
+                        // that as a distinct event per PROTOCOLS.md.
+                        if matches!(e, GithubError::RepoNotFound { .. }) {
+                            info!(
+                                req_id = %req_id,
+                                evt = %EventKind::CacheInvalidated,
+                                provider = %request.host,
+                                repo = %request.path,
+                                cause = "404",
+                            );
+                        }
+                        log_mint_error(
+                            &req_id,
+                            client_str,
+                            &request.host,
+                            &request.path,
+                            provider_ms,
+                            e,
+                        );
+                        return;
+                    }
+                };
+
+                let mut response_bytes = Vec::with_capacity(256);
+                if let Err(e) =
+                    git_credential::write_response(&outcome.response, &mut response_bytes)
+                {
+                    warn!(
+                        req_id = %req_id,
+                        evt = %EventKind::ProviderError,
+                        reason = "response_encode",
+                        provider = %request.host,
+                        error = %e,
+                    );
+                    return;
+                }
+
+                if let Err(e) = sess.set_response(&response_bytes) {
+                    log_session_failure(&req_id, peer, sess.phase(), client_name.as_deref(), &e);
+                    return;
+                }
+
+                mint_record = Some(MintRecord {
+                    host: request.host,
+                    path: request.path,
+                    response: outcome.response,
+                    repo_id: outcome.repo_id,
+                    out_req_id: outcome.out_req_id,
+                    gh_req_id: outcome.gh_req_id,
+                    provider_ms,
+                });
+            }
+
+            Step::Done => {
+                let _ = stream.flush().await;
+                if let (Some(client_str), Some(rec)) =
+                    (client_name.as_deref(), mint_record.as_ref())
+                {
+                    let expires_at_secs = rec
+                        .response
+                        .password_expiry_utc
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let now_secs = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(expires_at_secs);
+                    let ttl_sec = expires_at_secs.saturating_sub(now_secs);
+                    info!(
+                        req_id = %req_id,
+                        out_req_id = %rec.out_req_id,
+                        gh_req_id = rec.gh_req_id.as_deref().unwrap_or(""),
+                        evt = %EventKind::Mint,
+                        provider = %rec.host,
+                        client = %client_str,
+                        repo = %rec.path,
+                        repo_id = rec.repo_id,
+                        ttl_sec = ttl_sec,
+                        expires_at_unix = expires_at_secs,
+                        provider_ms = rec.provider_ms,
+                    );
+                }
+                return;
+            }
+        }
     }
-    if let Err(reason) = write_framed_encrypt(&mut stream, &mut transport_state, &out).await {
-        warn!(
+}
+
+/// Map a `SessionError` raised inside the responder state machine to
+/// the event the daemon would have logged with the old imperative code.
+/// Phase is the state we were in BEFORE the failing call — used for
+/// `FrameTooBig` whose meaning depends on whether we were doing the
+/// handshake or the transport read.
+fn log_session_failure(
+    req_id: &str,
+    peer: Option<std::net::SocketAddr>,
+    phase: Phase,
+    client_name: Option<&str>,
+    err: &SessionError,
+) {
+    let client_str = client_name.unwrap_or("");
+    match err {
+        SessionError::PreludeBadMagic { .. } => warn!(
+            req_id = %req_id,
+            evt = %EventKind::PreludeInvalid,
+            peer = ?peer,
+            reason = "bad_magic",
+        ),
+        SessionError::PreludeBadVersion { .. } => warn!(
+            req_id = %req_id,
+            evt = %EventKind::PreludeInvalid,
+            peer = ?peer,
+            reason = "bad_version",
+        ),
+        SessionError::PreludeBadIdentityLen { .. } => warn!(
+            req_id = %req_id,
+            evt = %EventKind::PreludeInvalid,
+            peer = ?peer,
+            reason = "bad_identity_len",
+        ),
+        SessionError::PreludeInvalidCharset { .. } => warn!(
+            req_id = %req_id,
+            evt = %EventKind::PreludeInvalid,
+            peer = ?peer,
+            reason = "invalid_charset",
+        ),
+        SessionError::HandshakeRead(_) => warn!(
+            req_id = %req_id,
+            evt = %EventKind::HandshakeFailed,
+            client = client_str,
+            reason = "handshake_read_failed",
+        ),
+        SessionError::HandshakeWrite(_) => warn!(
+            req_id = %req_id,
+            evt = %EventKind::HandshakeFailed,
+            client = client_str,
+            reason = "handshake_write_failed",
+        ),
+        SessionError::IntoTransport(_) => warn!(
+            req_id = %req_id,
+            evt = %EventKind::HandshakeFailed,
+            client = client_str,
+            reason = "handshake_into_transport_failed",
+        ),
+        SessionError::TransportRead(_) => warn!(
+            req_id = %req_id,
+            evt = %EventKind::MintDenied,
+            client = client_str,
+            reason = "transport_read",
+            detail = "decrypt_failed",
+        ),
+        SessionError::TransportWrite(_) => warn!(
             req_id = %req_id,
             evt = %EventKind::ProviderError,
             reason = "response_write",
-            provider = %request.host,
-            detail = reason,
-        );
-        return;
+            client = client_str,
+        ),
+        SessionError::FrameTooBig { got } => match phase {
+            Phase::Transport => warn!(
+                req_id = %req_id,
+                evt = %EventKind::MintDenied,
+                client = client_str,
+                reason = "transport_read",
+                detail = "frame_too_big",
+                got = got,
+            ),
+            _ => warn!(
+                req_id = %req_id,
+                evt = %EventKind::HandshakeFailed,
+                client = client_str,
+                reason = "frame_too_big",
+                got = got,
+            ),
+        },
+        SessionError::BadIdentity { .. }
+        | SessionError::BadPskLen { .. }
+        | SessionError::RecvLen { .. }
+        | SessionError::WrongState { .. } => warn!(
+            req_id = %req_id,
+            evt = %EventKind::HandshakeFailed,
+            client = client_str,
+            reason = "internal",
+            error = %err,
+        ),
     }
-    let _ = stream.flush().await;
+}
 
-    let expires_at_secs = response
-        .password_expiry_utc
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(expires_at_secs);
-    let ttl_sec = expires_at_secs.saturating_sub(now_secs);
-
-    info!(
-        req_id = %req_id,
-        out_req_id = %out_req_id,
-        gh_req_id = gh_req_id.as_deref().unwrap_or(""),
-        evt = %EventKind::Mint,
-        provider = %request.host,
-        client = %client.name,
-        repo = %request.path,
-        repo_id = repo_id,
-        ttl_sec = ttl_sec,
-        expires_at_unix = expires_at_secs,
-        provider_ms = provider_ms,
-    );
+/// Log a clean EOF (read returned 0 bytes) attributed to the current
+/// protocol phase.
+fn log_phase_eof(
+    req_id: &str,
+    peer: Option<std::net::SocketAddr>,
+    phase: Phase,
+    client_name: Option<&str>,
+) {
+    let client_str = client_name.unwrap_or("");
+    match phase {
+        Phase::PreludeHead => warn!(
+            req_id = %req_id,
+            evt = %EventKind::PreludeInvalid,
+            peer = ?peer,
+            reason = "eof_before_prelude_head",
+        ),
+        Phase::PreludeBody => warn!(
+            req_id = %req_id,
+            evt = %EventKind::PreludeInvalid,
+            peer = ?peer,
+            reason = "eof_before_identity",
+        ),
+        Phase::Handshake => warn!(
+            req_id = %req_id,
+            evt = %EventKind::HandshakeFailed,
+            client = client_str,
+            reason = "eof_during_handshake",
+        ),
+        Phase::Transport => warn!(
+            req_id = %req_id,
+            evt = %EventKind::MintDenied,
+            client = client_str,
+            reason = "transport_read",
+            detail = "eof",
+        ),
+        Phase::AwaitingPsk | Phase::Done => warn!(
+            req_id = %req_id,
+            evt = %EventKind::HandshakeFailed,
+            client = client_str,
+            reason = "eof_unexpected_phase",
+        ),
+    }
 }
 
 fn log_mint_error(
@@ -945,13 +1120,12 @@ fn log_mint_error(
     }
 }
 
-// ----- TCP/Noise I/O helpers ---------------------------------------------
+// ----- TCP I/O primitives ------------------------------------------------
 //
-// All errors are surfaced as static `&'static str` reason codes so that
-// `handle_connection` can pass them straight into structured log fields
-// without leaking error formatting choices upstream. The Noise transport
-// itself never returns recoverable errors mid-stream: any failure here
-// drops the connection.
+// The two functions the state machine driver in `handle_connection` calls
+// against the TCP socket. Everything else (prelude parsing, Noise
+// handshake driving, framing, encrypt/decrypt) lives inside
+// `transport::Responder`.
 
 /// Read EXACTLY `n` bytes from `stream` into a fresh `Vec`. Returns
 /// `None` on EOF or I/O error.
@@ -977,117 +1151,6 @@ async fn read_exact_n(stream: &mut TcpStream, n: usize) -> Option<Vec<u8>> {
 async fn write_all_bytes(stream: &mut TcpStream, payload: Vec<u8>) -> std::io::Result<()> {
     let BufResult(res, _) = stream.write_all(payload).await;
     res.map(|_| ())
-}
-
-/// Read the identity prelude: 6-byte header + identity bytes. Returns
-/// the owned identity string on success, or a static reason on failure.
-async fn read_prelude(stream: &mut TcpStream) -> Result<String, &'static str> {
-    let head = read_exact_n(stream, 6)
-        .await
-        .ok_or("eof_before_prelude_head")?;
-    // Validate magic + version + id_len without committing to a
-    // borrowing parse yet (we need a final &[u8] that contains the
-    // identity bytes too).
-    match transport::parse_prelude(&head) {
-        Err(PreludeError::Incomplete { .. }) => { /* expected — keep going */ }
-        Err(PreludeError::BadMagic { .. }) => return Err("bad_magic"),
-        Err(PreludeError::BadVersion { .. }) => return Err("bad_version"),
-        Err(PreludeError::BadIdentityLen { .. }) => return Err("bad_identity_len"),
-        // The 6-byte head can't have an invalid charset error.
-        Err(PreludeError::InvalidCharset { .. }) => return Err("invalid_charset"),
-        Ok(_) => unreachable!("6 bytes is never a complete prelude (min 7)"),
-    }
-    let id_len = head[5] as usize;
-    let tail = read_exact_n(stream, id_len)
-        .await
-        .ok_or("eof_before_identity")?;
-    let mut full = head;
-    full.extend_from_slice(&tail);
-    let (identity, _) = transport::parse_prelude(&full).map_err(|e| match e {
-        PreludeError::BadMagic { .. } => "bad_magic",
-        PreludeError::BadVersion { .. } => "bad_version",
-        PreludeError::BadIdentityLen { .. } => "bad_identity_len",
-        PreludeError::InvalidCharset { .. } => "invalid_charset",
-        PreludeError::Incomplete { .. } => "incomplete",
-    })?;
-    Ok(identity.as_str().to_string())
-}
-
-/// Run the responder side of `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s`.
-/// Consumes one inbound framed handshake message, writes one outbound,
-/// then transitions to transport mode.
-async fn run_responder_handshake(
-    stream: &mut TcpStream,
-    psk: &[u8; 32],
-) -> Result<TransportState, &'static str> {
-    let mut hs: HandshakeState = transport::responder(psk).map_err(|e| match e {
-        TransportError::BadPskLen { .. } => "bad_psk_len",
-        TransportError::Params(_) => "noise_params",
-        TransportError::Handshake(_) => "noise_build",
-        TransportError::Transition(_) | TransportError::Transport(_) => "noise_internal",
-        TransportError::OversizedFrame { .. } => "noise_oversize",
-    })?;
-    let mut scratch = vec![0u8; transport::MAX_MESSAGE_SIZE];
-
-    // -> psk, e (read one framed message)
-    let msg1 = read_framed_raw(stream).await?;
-    transport::handshake_read(&mut hs, &msg1, &mut scratch).map_err(|_| "handshake_read_failed")?;
-
-    // <- e, ee (write one framed message)
-    let n = transport::handshake_write(&mut hs, &[], &mut scratch)
-        .map_err(|_| "handshake_write_failed")?;
-    write_framed_raw(stream, &scratch[..n])
-        .await
-        .map_err(|_| "handshake_write_io")?;
-
-    transport::into_transport(hs).map_err(|_| "handshake_into_transport_failed")
-}
-
-/// Read a 16-bit BE length-prefixed framed payload from `stream`.
-async fn read_framed_raw(stream: &mut TcpStream) -> Result<Vec<u8>, &'static str> {
-    let len_buf_vec = read_exact_n(stream, 2)
-        .await
-        .ok_or("eof_before_frame_len")?;
-    let len_buf: [u8; 2] = len_buf_vec
-        .as_slice()
-        .try_into()
-        .map_err(|_| "frame_len_underflow")?;
-    let len = transport::read_frame_length(&len_buf).map_err(|_| "frame_too_big")?;
-    read_exact_n(stream, len)
-        .await
-        .ok_or("eof_before_frame_body")
-}
-
-/// Read one framed Noise transport message and decrypt it.
-async fn read_framed_decrypt(
-    stream: &mut TcpStream,
-    ts: &mut TransportState,
-) -> Result<Vec<u8>, &'static str> {
-    let ct = read_framed_raw(stream).await?;
-    let mut out = vec![0u8; transport::MAX_MESSAGE_SIZE];
-    let n = transport::transport_read(ts, &ct, &mut out).map_err(|_| "decrypt_failed")?;
-    out.truncate(n);
-    Ok(out)
-}
-
-/// Frame `payload` with a 16-bit BE length prefix and write to stream.
-async fn write_framed_raw(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
-    let framed = transport::frame(payload)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "frame too big"))?;
-    write_all_bytes(stream, framed).await
-}
-
-/// Encrypt `plaintext` through the transport, frame it, and send.
-async fn write_framed_encrypt(
-    stream: &mut TcpStream,
-    ts: &mut TransportState,
-    plaintext: &[u8],
-) -> Result<(), &'static str> {
-    let mut buf = vec![0u8; transport::MAX_MESSAGE_SIZE];
-    let n = transport::transport_write(ts, plaintext, &mut buf).map_err(|_| "encrypt_failed")?;
-    write_framed_raw(stream, &buf[..n])
-        .await
-        .map_err(|_| "write_io")
 }
 
 #[cfg(test)]

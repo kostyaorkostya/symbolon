@@ -28,10 +28,7 @@ use std::time::Duration;
 
 use argh::FromArgs;
 
-use symbolon::transport::{
-    self, MAX_MESSAGE_SIZE, TransportError, encode_prelude, frame, initiator, into_transport,
-    read_frame_length,
-};
+use symbolon::transport::{Initiator, SessionError, Step};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -79,6 +76,11 @@ fn run(args: &Args) -> Result<(), ClientError> {
         .read_to_end(&mut request)
         .map_err(ClientError::ReadStdin)?;
 
+    // Build the Initiator BEFORE opening the socket. Validates the
+    // identity charset and PSK length, so a misconfigured invocation
+    // fails fast without a wasted TCP roundtrip.
+    let sess = Initiator::new(&args.identity, psk, request).map_err(ClientError::Session)?;
+
     let mut stream = connect(&args.endpoint)?;
     stream
         .set_read_timeout(Some(READ_TIMEOUT))
@@ -87,14 +89,7 @@ fn run(args: &Args) -> Result<(), ClientError> {
         .set_write_timeout(Some(WRITE_TIMEOUT))
         .map_err(ClientError::SetTimeout)?;
 
-    let prelude = encode_prelude(&args.identity).ok_or_else(|| ClientError::BadIdentity {
-        identity: args.identity.clone(),
-    })?;
-    stream
-        .write_all(&prelude)
-        .map_err(ClientError::WriteHandshake)?;
-
-    let response = run_session(&mut stream, &psk, &request)?;
+    let response = drive(&mut stream, sess)?;
     std::io::stdout()
         .write_all(&response)
         .map_err(ClientError::WriteStdout)?;
@@ -123,54 +118,34 @@ fn connect(endpoint: &str) -> Result<TcpStream, ClientError> {
     })
 }
 
-fn run_session(
-    stream: &mut TcpStream,
-    psk: &[u8; 32],
-    request: &[u8],
-) -> Result<Vec<u8>, ClientError> {
-    let mut hs = initiator(psk).map_err(ClientError::Transport)?;
-    let mut scratch = vec![0u8; MAX_MESSAGE_SIZE];
-
-    // -> psk, e
-    let n =
-        transport::handshake_write(&mut hs, &[], &mut scratch).map_err(ClientError::Transport)?;
-    write_framed(stream, &scratch[..n])?;
-
-    // <- e, ee
-    let reply = read_framed(stream)?;
-    let _ =
-        transport::handshake_read(&mut hs, &reply, &mut scratch).map_err(ClientError::Transport)?;
-
-    let mut ts = into_transport(hs).map_err(ClientError::Transport)?;
-
-    let n = transport::transport_write(&mut ts, request, &mut scratch)
-        .map_err(ClientError::Transport)?;
-    write_framed(stream, &scratch[..n])?;
-
-    let ciphertext = read_framed(stream)?;
-    let n = transport::transport_read(&mut ts, &ciphertext, &mut scratch)
-        .map_err(ClientError::Transport)?;
-    Ok(scratch[..n].to_vec())
-}
-
-fn write_framed(stream: &mut TcpStream, payload: &[u8]) -> Result<(), ClientError> {
-    let framed = frame(payload).map_err(ClientError::Transport)?;
-    stream
-        .write_all(&framed)
-        .map_err(ClientError::WriteHandshake)
-}
-
-fn read_framed(stream: &mut TcpStream) -> Result<Vec<u8>, ClientError> {
-    let mut len_buf = [0u8; 2];
-    stream
-        .read_exact(&mut len_buf)
-        .map_err(ClientError::ReadHandshake)?;
-    let len = read_frame_length(&len_buf).map_err(ClientError::Transport)?;
-    let mut body = vec![0u8; len];
-    stream
-        .read_exact(&mut body)
-        .map_err(ClientError::ReadHandshake)?;
-    Ok(body)
+/// Drive the `Initiator` state machine against a blocking TCP socket
+/// until it reports `Step::Done`, then return the decrypted response.
+fn drive(stream: &mut TcpStream, mut sess: Initiator) -> Result<Vec<u8>, ClientError> {
+    loop {
+        match sess.step().map_err(ClientError::Session)? {
+            Step::ReadExact { n } => {
+                let mut buf = vec![0u8; n];
+                stream
+                    .read_exact(&mut buf)
+                    .map_err(ClientError::ReadHandshake)?;
+                sess.recv(&buf).map_err(ClientError::Session)?;
+            }
+            Step::Write(bytes) => {
+                stream
+                    .write_all(&bytes)
+                    .map_err(ClientError::WriteHandshake)?;
+                sess.wrote().map_err(ClientError::Session)?;
+            }
+            Step::Done => return sess.take_response().map_err(ClientError::Session),
+            Step::NeedPsk { .. } | Step::Request(_) => {
+                // Responder-only variants; the Initiator never emits these.
+                return Err(ClientError::Session(SessionError::WrongState {
+                    method: "drive",
+                    state: "unexpected_initiator_step",
+                }));
+            }
+        }
+    }
 }
 
 fn load_psk(path: &PathBuf) -> Result<[u8; 32], ClientError> {
@@ -211,8 +186,6 @@ enum ClientError {
     BadPskLen { path: PathBuf, got: usize },
     #[error("PSK file {} has non-hex byte 0x{byte:02x}", path.display())]
     BadPskHex { path: PathBuf, byte: u8 },
-    #[error("identity {identity:?} is empty, too long, or contains disallowed chars")]
-    BadIdentity { identity: String },
     #[error("resolving endpoint {endpoint:?} failed")]
     Resolve {
         endpoint: String,
@@ -235,6 +208,6 @@ enum ClientError {
     WriteHandshake(#[source] std::io::Error),
     #[error("reading from broker failed")]
     ReadHandshake(#[source] std::io::Error),
-    #[error("Noise transport error")]
-    Transport(#[source] TransportError),
+    #[error("Noise session error")]
+    Session(#[source] SessionError),
 }

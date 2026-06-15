@@ -171,6 +171,20 @@ anti-swap defence is operator-side: disable swap on the broker
 host. Both contribute to AGENTS.md invariant #14 ("Secrets stay
 off disk").
 
+## Transport layer
+
+The Noise NNpsk0 protocol lifecycle (identity prelude → handshake
+→ encrypted request/response) is a sans-IO state machine:
+`transport::Responder` for the daemon side, `transport::Initiator`
+for the client. Each emits `Step` values telling the I/O driver
+what to do next — read N bytes, write these bytes, look up a PSK
+for this identity, process this plaintext request. The driver
+does only I/O; the machine owns all state.
+
+Same machine drives the async compio daemon (`src/daemon.rs`) and
+the sync std::net client binary (`src/bin/git_credential_symbolon.rs`).
+Protocol changes happen in one place.
+
 ## Concurrency model
 
 Single-threaded [compio](https://docs.rs/compio) runtime.

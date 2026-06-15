@@ -249,9 +249,9 @@ Pinned in `Cargo.toml`:
   `[security] sandbox` in `config.toml` with default
   `best_effort`. Pure Rust + `libc` only; works on musl.
   Intra-process signals (panic handlers, libc `abort()`,
-  thread-local plumbing) remain permitted. Which is correct,
-  the threat surface worth blocking is *cross-process* signal
-  attacks from a compromised broker.)
+  thread-local plumbing) remain permitted; that is correct,
+  since the threat surface worth blocking is *cross-process*
+  signal attacks from a compromised broker.)
 - `libc` (the `mlockall(MCL_CURRENT | MCL_FUTURE)` call in
   `src/mlock.rs`. Transitively required by landlock anyway,
   so the explicit dep adds no surface.)
@@ -265,9 +265,9 @@ Pinned in `Cargo.toml`:
   "use-curve25519", "use-getrandom", "std"]` (pure-Rust Noise
   Protocol Framework implementation; tracks Noise spec rev 34,
   forbids `unsafe_code` internally. Drives `Noise_NNpsk0_25519_
-  ChaChaPoly_BLAKE2s` in `src/transport.rs`. The responder side
-  in the daemon, the initiator side in the `git-credential-
-  symbolon` client binary. Feature trim drops aes-gcm / sha2 /
+  ChaChaPoly_BLAKE2s` in `src/transport.rs` (responder side in
+  the daemon, initiator side in the `git-credential-symbolon`
+  client binary). Feature trim drops aes-gcm / sha2 /
   blake3 / p256 / pqcrypto since our pattern uses only
   ChaCha20-Poly1305 + BLAKE2s + X25519.)
 - `serde`, `serde_json`, `toml` (config + provider responses)
@@ -279,8 +279,8 @@ Pinned in `Cargo.toml`:
 - `tracing` with `default-features = false, features = ["std",
   "release_max_level_info"]`. `release_max_level_info` compiles
   out every `debug!` / `trace!` callsite in our code and our
-  deps from release builds. H2 and rustls in particular are
-  heavily instrumented at those levels; gating them saves
+  deps from release builds; in particular, h2 and rustls are
+  heavily instrumented at those levels and gating them saves
   measurable `.rodata` + `.text` weight at no functional cost
   since we never log below info in production. `attributes` is
   dropped because we don't use `#[instrument]` anywhere.
@@ -306,10 +306,10 @@ Pinned in `Cargo.toml`:
 - `thiserror` (errors)
 - `rustix` with features `net,process`. `process` for `geteuid` on
   the admin path (used by the SO_PEERCRED gate in `admin.rs`).
-  `net` for
-  `socket_peercred` on the admin UDS. The SO_PEERCRED check that
-  rejects connections from UIDs other than root or the daemon's
-  own (defense in depth against a loose `/run/symbolon/` ACL).
+  `net` for `socket_peercred` on the admin UDS, the SO_PEERCRED
+  check that rejects connections from UIDs other than root or
+  the daemon's own (defense in depth against a loose
+  `/run/symbolon/` ACL).
 - `signal-hook-registry` (long-lived OS-level signal handler
   installed once at startup. Replaces `compio::signal::unix::signal`
   which is one-shot and reverts the kernel disposition to `SigDfl`
@@ -318,9 +318,10 @@ Pinned in `Cargo.toml`:
   AtomicBool + call `AtomicWaker::wake` on a `SignalNotifier` struct;
   the compio task loop awaits a re-armable `Notified` future. Both
   the AtomicBool store and the AtomicWaker wake are lock-free,
-  alloc-free, reentrant. Async-signal-safe, matching compio-signal's
-  internal handler at `compio/compio-signal/src/unix/mod.rs:15-26`
-  but with a permanent rather than per-call registration.)
+  alloc-free, reentrant, and async-signal-safe; the handler matches
+  compio-signal's internal handler at
+  `compio/compio-signal/src/unix/mod.rs:15-26` but with a permanent
+  rather than per-call registration.)
 - `synchrony` with features `async_flag,event` (sync primitives for
   `compio`. `sync::event::Event` is the re-armable wakeup used by
   `ConnectionTracker`'s "drain empty" notification and by the
@@ -361,10 +362,10 @@ semver, and works in environments where outbound HTTPS is restricted
 to the registry path. WebFetch is neither necessary nor reliable for
 this and may fail in sandboxed environments.
 
-- `cargo add <crate>`. Adds the latest compatible version to
+- `cargo add <crate>`: adds the latest compatible version to
   `Cargo.toml` and updates `Cargo.lock`. Use `cargo add <crate>@<req>`
   to pin to a specific version.
-- `cargo search <crate>`. Inspect available versions if needed.
+- `cargo search <crate>`: inspect available versions if needed.
 
 Never hand-edit version strings in `Cargo.toml` from guessed values.
 Let `cargo add` write them, then commit `Cargo.lock`.
@@ -387,10 +388,10 @@ Addenda:
   `<Module>Error`). `anyhow` only at the binary's `main` boundary.
 - No `#[allow(...)]` without an explanatory comment.
 - Default visibility is `pub(crate)`. Only `lib.rs` re-exports `pub`.
-- Default to no comments. Add a doc comment only when the *why* or the
-  contract isn't obvious from the name and signature. Hidden
-  invariants, surprising edge cases, security-load-bearing rules (e.g.
-  the CR/LF rejection in `git_credential`). Don't restate what
+- Default to no comments. Add a doc comment only when the *why* or
+  the contract isn't obvious from the name and signature: hidden
+  invariants, surprising edge cases, security-load-bearing rules
+  (e.g. the CR/LF rejection in `git_credential`). Don't restate what
   well-named code already says.
 
 ## Diagnostic discipline (mandatory)
@@ -487,10 +488,10 @@ the submission/completion queue model), so the codebase's
 **Fuzzing** is set up for the two parsers that consume attacker-
 controlled bytes:
 
-- `symbolon::parse_identity_prelude`. The unencrypted prelude
+- `symbolon::parse_identity_prelude`: the unencrypted prelude
   bytes the client sends before the Noise handshake. Identity
   selection depends on it (AGENTS.md invariant #7).
-- `symbolon::git_credential::parse`. Git-credential request block
+- `symbolon::git_credential::parse`: git-credential request block
   (decrypted out of the Noise transport before parsing); carries
   the CR/LF Clone2Leak defence (AGENTS.md invariant #12).
 
@@ -507,7 +508,7 @@ cargo fuzz run identity_prelude_parse -- -max_total_time=600
 
 (The `+nightly` switch isn't needed because `fuzz/rust-toolchain.toml`
 pins it.) The 10-minute budget is a baseline; longer runs find
-more. LibFuzzer writes any crashing input to
+more. libFuzzer writes any crashing input to
 `fuzz/artifacts/<target>/` and exits non-zero. To reproduce:
 
 ```sh
@@ -545,7 +546,7 @@ Known omissions, not oversights:
   invalidation fires the event today. TTL expiry is silently
   re-resolved; the provider doesn't currently surface "I just
   dropped an expired entry" to the daemon.
-- **Multiple instances of the same provider** (e.g. Github.com +
+- **Multiple instances of the same provider** (e.g. github.com +
   github.example.com on one broker). Section name `[provider.X]` is
   also the dispatch key; introduce a `kind` field if/when needed.
 - **Async DNS via `hickory-resolver`.** Tokio-coupled
@@ -553,7 +554,7 @@ Known omissions, not oversights:
   + multiple users-forum threads confirm no compio/async-std
   backend exists). AGENTS.md hard-NOTs tokio. The sandbox allowlist
   therefore continues to include the nameservice files libc's
-  `getaddrinfo` actually reads. Selected at compile time via
+  `getaddrinfo` actually reads, selected at compile time via
   `cfg(target_env = "musl")` in `src/daemon.rs::nameservice_files`.
   musl reads `/etc/resolv.conf` and `/etc/hosts` only; glibc also
   reads `/etc/nsswitch.conf` and `/etc/gai.conf`. The musl release

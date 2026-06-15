@@ -1,37 +1,32 @@
 # GitHub provider
 
-Everything specific to the GitHub provider. The cross-provider
-core is in [`../ARCHITECTURE.md`](../ARCHITECTURE.md) (explanation),
-[`../PROTOCOLS.md`](../PROTOCOLS.md) (reference),
-[`../PROVIDER_CONTRACT.md`](../PROVIDER_CONTRACT.md) (RFC-2119
-contract — and § "How GitHub satisfies the contract" maps each
-point to this provider's binding),
-[`../INSTALL.md`](../INSTALL.md) (how-to deploy),
-[`../OPERATIONS.md`](../OPERATIONS.md) (how-to operate), and
-[`../../AGENTS.md`](../../AGENTS.md).
+Everything specific to the GitHub provider. Cross-provider
+core lives in [`../ARCHITECTURE.md`](../ARCHITECTURE.md),
+[`../PROTOCOLS.md`](../PROTOCOLS.md), and
+[`../PROVIDER_CONTRACT.md`](../PROVIDER_CONTRACT.md) (see its
+"How GitHub satisfies the contract" section for the per-clause
+mapping). Deploy: [`../INSTALL.md`](../INSTALL.md). Operate:
+[`../OPERATIONS.md`](../OPERATIONS.md).
 
-Tested against `github.com`. GitHub Enterprise Server is supported
-in principle (the API surface is the same) but not exercised in CI.
+Tested against `github.com`. GitHub Enterprise Server should work
+on the same code path (same API surface) but CI doesn't exercise it.
 
-Section mode tags below: `(reference)` = consult while working,
-`(how-to)` = follow steps to a goal.
-
-## Per-mint guarantees (reference)
+## Per-mint guarantees
 
 These are the bounds a compromised client can hit when this provider
 is in use. They follow from how the broker uses GitHub's APIs, not
 from operator policy.
 
-- **Token TTL ≤ 1 hour** — the lifetime of a GitHub installation
+- **Token TTL ≤ 1 hour.** The lifetime of a GitHub installation
   access token. Outstanding tokens are not revocable by the broker;
   `symbolon github revoke` only stops future mints.
-- **Single repository per token** — every mint passes
-  `repository_ids: [<one>]`. The token can act on exactly that
-  repo, not the others the App installation reaches.
-- **`contents: write` + `metadata: read`, nothing else** — fixed at
+- **Single repository per token.** Every mint passes
+  `repository_ids: [<one>]`. The token can act on that one repo,
+  not the others the App installation reaches.
+- **`contents: write` + `metadata: read`, nothing else.** Fixed at
   mint time. `Workflows`, `Issues`, `Pull requests`, `Actions`,
-  secrets — all unrequested and therefore unavailable to the
-  minted token even if the App was somehow granted them
+  secrets: all unrequested and therefore unavailable to the
+  minted token even if the App was granted them
   installation-side.
 
 The `Workflows`-not-granted property is the load-bearing reason a
@@ -39,7 +34,7 @@ compromised client cannot push changes to
 `.github/workflows/*.yml`: GitHub rejects those pushes server-side
 when the token lacks `Workflows: write`.
 
-## Create the GitHub App (how-to)
+## Create the GitHub App
 
 On github.com:
 
@@ -58,8 +53,8 @@ On github.com:
    string like `Iv23liABCDEFGHIJklmn`, listed alongside the App ID
    on the settings page) and the **installation ID** (visible in
    the URL after installation, e.g. `/installations/789012`). The
-   broker uses the Client ID as the JWT `iss` claim — GitHub's
-   currently-recommended form per
+   broker uses the Client ID as the JWT `iss` claim, which is
+   GitHub's currently-recommended form per
    [Generating a JWT for a GitHub App][gh-jwt].
 7. Choose **Only select repositories** and pick the ones you want
    the broker to mint for. This is the working set; keep it small.
@@ -68,7 +63,7 @@ For GitHub Enterprise Server: the same steps apply on your GHES
 instance. The Client ID and installation ID will differ from any
 public github.com Apps.
 
-## Config block (reference)
+## Config block
 
 In `/etc/symbolon/config.toml`:
 
@@ -89,10 +84,10 @@ selfcheck_timeout = "5s"             # required; tune to your p99 to api.github.
 ```
 
 `host` is matched **byte-exact** against the `host=` field a git
-credential helper sends — no suffix matching, no case-folding, no
+credential helper sends. No suffix matching, no case-folding, no
 default. See [`../PROTOCOLS.md`](../PROTOCOLS.md) § "Host dispatch".
 
-## Commands (reference)
+## Commands
 
 ```
 symbolon github enroll <client> [--note <text>]
@@ -106,7 +101,7 @@ symbolon github revoke <client>
     `clients.json` and `psks`.
 
     Outstanding tokens minted in the previous hour are NOT
-    revoked. They live their full TTL — see § "Hard cutoff" below.
+    revoked. They live their full TTL; see § "Hard cutoff" below.
 
 symbolon github mint <client> <owner/repo>
     Test path: run the full mint flow as if <client> requested a
@@ -118,7 +113,7 @@ symbolon github selfcheck
     clock skew is bounded. Exits non-zero on any failed check.
 ```
 
-## Outbound API contract (reference)
+## Outbound API contract
 
 References: [REST API for App installations][gh-installs],
 [Installation access tokens][gh-iat], [App permissions][gh-perms],
@@ -147,16 +142,16 @@ References: [REST API for App installations][gh-installs],
 
 The App JWT only authenticates App-level endpoints (`/app`,
 `/app/installations/...`); it cannot authenticate
-`GET /repos/{owner}/{repo}`. So resolution is a two-step flow per
+`GET /repos/{owner}/{repo}`. Resolution is a two-step flow per
 cache miss:
 
 1. `POST /app/installations/{installation_id}/access_tokens` with
    body `{"permissions":{"metadata":"read"}}` (no
-   `repository_ids`) using the App JWT — yields a metadata-only
+   `repository_ids`) using the App JWT. Yields a metadata-only
    installation token. Logged as
    `provider_call endpoint=mint_metadata_token`.
 2. `GET {api_base}/repos/{owner}/{repo}` with that installation
-   token as bearer — returns `{id, ...}`. Logged as
+   token as bearer. Returns `{id, ...}`. Logged as
    `provider_call endpoint=resolve_repo_id`.
 
 In-memory cache keyed by `(provider_name, owner/repo)`
@@ -175,15 +170,15 @@ with-same-name case where the numeric ID changes.
   - `Authorization: Bearer <jwt>`
   - `Accept: application/vnd.github+json`
   - `X-GitHub-Api-Version: <current>`
-  - `User-Agent: <provider.github.user_agent>` — defaults to
+  - `User-Agent: <provider.github.user_agent>`. Defaults to
     `symbolon` if unset; configurable. Required by GitHub
-    (missing UA → 403). Intentionally carries no version number
-    so an attacker can't narrow the applicable CVE list.
-  - `X-Request-ID: <out_req_id>` — fresh ULID per outbound call.
+    (missing UA returns 403). Carries no version number so an
+    attacker can't narrow the applicable CVE list.
+  - `X-Request-ID: <out_req_id>`. Fresh ULID per outbound call.
     Same value flows into the `provider_call` /
     `provider_call_done` breadcrumbs and into `MintOutcome` /
     `SelfcheckOutcome` for operator-side correlation.
-  - `Request-Timeout: <seconds>` — best-effort hint per the
+  - `Request-Timeout: <seconds>`. Best-effort hint per the
     expired IETF draft (`draft-thomson-hybi-http-timeout`).
     Integer seconds derived from the per-call timeout. GitHub
     does not document honouring it; any intermediate proxy that
@@ -204,11 +199,11 @@ captured into `gh_req_id` on the outcome / breadcrumb so an
 operator can join the broker's log to GitHub's side when filing
 a ticket.
 
-## Hardening recommendations (how-to, sysadmin)
+## Hardening recommendations
 
 The per-mint scoping above is the narrowest GitHub will issue for
 a push-capable token. Within that scope, a compromised token can
-still manage releases (create / edit / delete release records,
+still manage releases (create, edit, delete release records,
 replace release assets, move release tags). These can be mitigated
 on the GitHub side without changing the broker.
 
@@ -258,7 +253,7 @@ On Free accounts, rulesets created on **private** repositories
 save successfully and appear in the UI, but are not enforced;
 GitHub shows a banner indicating this.
 
-## Hard cutoff (how-to, incident response)
+## Hard cutoff
 
 `symbolon github revoke <client>` removes the client's PSK so the
 client can't request more tokens, but it does not revoke the
@@ -271,10 +266,10 @@ client can't request more tokens, but it does not revoke the
   App's ability to issue new tokens entirely; existing minted
   tokens still live their TTL. Then update
   `/etc/symbolon/github-app.pem` on the broker and **restart the
-  daemon** — the App key is loaded at startup and is not
+  daemon**. The App key is loaded at startup and is not
   hot-reloadable.
 
-## References (reference)
+## References
 
 - [REST API for App installations](https://docs.github.com/en/rest/apps/installations)
 - [Generating an installation access token](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-an-installation-access-token-for-a-github-app)

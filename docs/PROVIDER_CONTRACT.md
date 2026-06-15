@@ -1,13 +1,12 @@
 # Provider contract
 
 The contract any `symbolon` provider implementation satisfies.
-This is the reference doc for adding a new provider. Reference
-mode, RFC-2119 normative language.
+Read this before adding a provider. RFC-2119 normative language.
 
-See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the system-level
-explanation of how the broker uses providers, and the existing
-GitHub provider in [`providers/github.md`](providers/github.md)
-+ `src/providers/github.rs` for a worked example.
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for how the broker uses
+providers, and the existing GitHub provider in
+[`providers/github.md`](providers/github.md) plus
+`src/providers/github.rs` for a worked example.
 
 ## Status
 
@@ -50,7 +49,7 @@ provider MUST NOT replicate or override it.
 ### M1. Per-mint scope is a single repository
 
 Every token-issuing call to the provider MUST be scoped to
-exactly one repository — the one the git-credential request
+exactly one repository: the one the git-credential request
 named. No "all repos" tokens, no "multiple repos at once"
 tokens. The on-the-wire encoding is provider-specific (e.g.
 GitHub's `repository_ids: [<one>]`) but the cardinality MUST be
@@ -69,7 +68,7 @@ code change and an explicit AGENTS.md instruction.
 
 The provider private key (PEM file or equivalent) MUST be loaded
 once at daemon startup, before the sandbox is applied. The
-provider MUST NOT re-read the key from disk at runtime — the
+provider MUST NOT re-read the key from disk at runtime; the
 sandbox makes that path unreachable on purpose. To rotate, the
 operator restarts the daemon.
 
@@ -115,7 +114,7 @@ before the call and a `provider_call_done` breadcrumb after, with
 and `elapsed_ms`. See
 [`PROTOCOLS.md` § Logging schema](PROTOCOLS.md#logging-schema).
 The provider MAY add a per-provider correlation ID (e.g. GitHub's
-`X-GitHub-Request-Id` becomes the `gh_req_id` field) — but the
+`X-GitHub-Request-Id` becomes the `gh_req_id` field), but the
 core breadcrumb pair is mandatory.
 
 ## SHOULD

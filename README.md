@@ -1,11 +1,11 @@
-# Symbolon — git credentials broker
+# Symbolon: git credentials broker
 
 *Symbolon* (σύμβολον) keeps long-lived git credentials off your dev
 VMs. It holds the platform's privileged identity on a trusted
 broker host and mints short-lived, single-repository tokens to
 clients on demand.
 
-Currently supports **GitHub** — see
+Currently supports **GitHub**. See
 [docs/providers/github.md](docs/providers/github.md) for the
 per-provider setup, guarantees, and bounds. Other providers are
 designed to plug in without changing the daemon, transport, or
@@ -18,15 +18,15 @@ You want to clone and push from sandboxed clients (VMs evaluating
 untrusted code, containers running supply-chain-vulnerable build
 pipelines, machines running agentic coding tools) without putting
 long-lived credentials on them. SSH keys, personal access tokens,
-and OAuth tokens are all "good for everything the user can do" — a
-client compromise leaks them and the attacker has account-wide
+and OAuth tokens are all "good for everything the user can do":
+a client compromise leaks them and the attacker has account-wide
 access for as long as the credential lives.
 
 Symbolon holds the platform's privileged identity on a trusted
 broker host and mints short-lived, repository-scoped tokens on
 demand. A client compromise is bounded by the per-provider token
-lifetime and per-mint scope — the concrete numbers are in
-[docs/providers/](docs/providers/), the full architecture and
+lifetime and per-mint scope. The concrete numbers are in
+[docs/providers/](docs/providers/); the full architecture and
 threat model is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Non-goals
@@ -49,25 +49,21 @@ threat model is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Documentation
 
-Per [Diátaxis](https://diataxis.fr/), our docs split into modes:
-
-- **Explanation** — [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md):
-  how the system works (diagram, trust boundary, identity model,
-  sandbox, concurrency).
-- **How-to** — [docs/INSTALL.md](docs/INSTALL.md) to deploy;
-  [docs/OPERATIONS.md](docs/OPERATIONS.md) for day-to-day
-  operations and troubleshooting.
-- **Reference** — [docs/PROTOCOLS.md](docs/PROTOCOLS.md) for
-  wire / file / log schemas;
-  [docs/PROVIDER_CONTRACT.md](docs/PROVIDER_CONTRACT.md) for the
-  RFC-2119 provider contract;
-  [docs/REFERENCES.md](docs/REFERENCES.md) for external URLs.
-- **Per-provider** — [docs/providers/](docs/providers/), one file
-  per supported provider (setup, guarantees, commands, outbound
-  API contract, hardening).
-- **Agent guidance** — [AGENTS.md](./AGENTS.md): design
-  invariants, dependency audit, style, concurrency notes, for
-  contributors and LLM agents working on this codebase.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): how the system
+  works. Diagram, trust boundary, identity model, sandbox,
+  concurrency.
+- [docs/INSTALL.md](docs/INSTALL.md): deploy the daemon.
+- [docs/OPERATIONS.md](docs/OPERATIONS.md): day-to-day operations
+  and troubleshooting.
+- [docs/PROTOCOLS.md](docs/PROTOCOLS.md): wire formats, file
+  schemas, log event catalog.
+- [docs/PROVIDER_CONTRACT.md](docs/PROVIDER_CONTRACT.md): what a
+  provider implementation has to satisfy (RFC-2119).
+- [docs/providers/](docs/providers/): one file per supported
+  provider.
+- [docs/REFERENCES.md](docs/REFERENCES.md): external URLs.
+- [AGENTS.md](./AGENTS.md): design invariants, dependency audit,
+  style notes for contributors and LLM agents.
 
 ## Quick start
 

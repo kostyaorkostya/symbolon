@@ -1,17 +1,18 @@
 # Architecture
 
-How `symbolon` works as a system. This is the explanation doc —
-read it once to build a mental model. For lookup-while-working
-material, see the references below.
+How `symbolon` works.
 
-| Doc | Mode |
-|---|---|
-| [`PROTOCOLS.md`](PROTOCOLS.md) | Reference — wire formats, file schemas, logging schema |
-| [`PROVIDER_CONTRACT.md`](PROVIDER_CONTRACT.md) | Reference — RFC-2119 contract for providers |
-| [`INSTALL.md`](INSTALL.md) | How-to — deploy the daemon |
-| [`OPERATIONS.md`](OPERATIONS.md) | How-to — operate the daemon |
-| [`providers/`](providers/) | Per-provider setup, guarantees, contracts |
-| [`../AGENTS.md`](../AGENTS.md) | Agent-facing source-of-truth for design + style |
+See also:
+
+- [`PROTOCOLS.md`](PROTOCOLS.md): wire formats, file schemas,
+  log event catalog.
+- [`PROVIDER_CONTRACT.md`](PROVIDER_CONTRACT.md): RFC-2119
+  contract for providers.
+- [`INSTALL.md`](INSTALL.md): deploy the daemon.
+- [`OPERATIONS.md`](OPERATIONS.md): operate the daemon.
+- [`providers/`](providers/): per-provider setup and guarantees.
+- [`../AGENTS.md`](../AGENTS.md): design and style notes for
+  contributors and LLM agents.
 
 ## At a glance
 
@@ -56,7 +57,7 @@ A client compromise is bounded by:
   `git clone`. Never broader.
 - Per-provider token TTL: the lifetime of an issued token (e.g.
   ≤1 hour on GitHub). Outstanding tokens are not revocable from
-  the broker — see [`providers/<name>.md`](providers/) for the
+  the broker. See [`providers/<name>.md`](providers/) for the
   provider-specific hard-cutoff procedure.
 - Per-client PSK isolation: a compromised PSK lets the attacker
   use *that* client's identity. Other clients are unaffected.
@@ -67,8 +68,8 @@ A client compromise does NOT buy:
 - Anything outside the per-mint permission set the broker
   requests from the provider (provider-specific; see
   [`providers/<name>.md`](providers/) for the exact set).
-- Other clients' traffic — per-client unique PSKs.
-- Persistent access — no long-lived tokens; the provider's
+- Other clients' traffic. Per-client unique PSKs isolate them.
+- Persistent access. No long-lived tokens, and the provider's
   private key never leaves the broker host.
 
 ## Identity model
@@ -77,8 +78,8 @@ Identity is the **PSK identity surfaced by the Noise handshake**,
 not the TCP source address. The flow:
 
 1. Client sends a cleartext identity prelude (4-byte magic `SBLN`
-   + version + length + identity bytes). The identity is a stable
-   name (e.g. `dev-vm-1`); the wire format is in
+   plus version, length, and identity bytes). The identity is a
+   stable name (e.g. `dev-vm-1`); the wire format is in
    [`PROTOCOLS.md` § Identity prelude](PROTOCOLS.md).
 2. Broker looks up the PSK for that identity in its in-memory
    store.
@@ -102,7 +103,7 @@ Two architectural invariants:
 
 - **Per-mint scoping is mandatory.** Every mint requests exactly
   one repository plus the minimum permission set the provider
-  accepts for `git push` / `git clone`. Never broader. The exact
+  accepts for `git push` / `git clone`. Never broader. The
   on-the-wire encoding (`repository_ids: [<one>]` on GitHub, or
   the equivalent for other providers) is in
   [`providers/<name>.md`](providers/).
@@ -112,7 +113,7 @@ Two architectural invariants:
   Widening the set requires a code change plus an explicit
   AGENTS.md instruction.
 
-This makes the per-mint blast radius small and structurally
+This keeps the per-mint blast radius small and structurally
 non-configurable.
 
 ## Provider dispatch
@@ -120,7 +121,7 @@ non-configurable.
 The `host=` field in a git-credential request is matched
 **byte-exact** (case-sensitive, no normalisation, no suffix
 matching, no default) against the `host` values in configured
-`[provider.X]` sections of `config.toml`. Unknown host →
+`[provider.X]` sections of `config.toml`. Unknown host returns
 `evt=mint_denied reason=unknown_host`. See
 [`PROTOCOLS.md` § Host dispatch](PROTOCOLS.md#host-dispatch-byte-exact).
 
@@ -128,16 +129,17 @@ matching, no default) against the `host` values in configured
 
 State lives in two files on the broker:
 
-- `/var/lib/symbolon/clients.json` — the enrolled-clients table.
-- `/var/lib/symbolon/psks` — the per-client PSKs (`identity:hex` per line).
+- `/var/lib/symbolon/clients.json`: the enrolled-clients table.
+- `/var/lib/symbolon/psks`: the per-client PSKs
+  (`identity:hex` per line).
 
 Both are owned and atomically rewritten by the daemon (tempfile +
-fsync + rename + fsync-parent). The daemon is the **sole writer** —
+fsync + rename + fsync-parent). The daemon is the **sole writer**.
 CLI commands talk to the daemon via the admin Unix socket; the
 daemon serialises them. No file locks; no other process is
 expected to touch these files at runtime.
 
-Wire / file schemas in
+Wire and file schemas in
 [`PROTOCOLS.md` § File formats](PROTOCOLS.md#file-formats).
 
 ## Sandbox model
@@ -145,22 +147,22 @@ Wire / file schemas in
 At startup, after sockets are bound and the provider private key
 is loaded, the broker applies Landlock at ABI 6 to itself:
 
-- **FS allowlist** — only the state directory (`/var/lib/symbolon/`,
-  read-write), `/dev/urandom`, the CA bundle, and the nameservice
-  files libc's `getaddrinfo` reads are reachable. The
-  provider-key directory is deliberately *not* in the allowlist,
-  so a post-compromise process inside the daemon cannot re-open
-  the key (it was already loaded).
+- **FS allowlist.** Only the state directory
+  (`/var/lib/symbolon/`, read-write), `/dev/urandom`, the CA
+  bundle, and the nameservice files libc's `getaddrinfo` reads
+  are reachable. The provider-key directory stays out of the
+  allowlist, so a post-compromise process inside the daemon
+  cannot re-open the key (the daemon already loaded it).
 - **Outbound TCP-connect** restricted to port 443.
-- **Abstract Unix socket scope** — denies attaching to or creating
+- **Abstract Unix socket scope.** Denies attaching to or creating
   abstract namespace sockets.
-- **`Scope::Signal` (Linux 6.12+)** — denies sending signals to
+- **`Scope::Signal` (Linux 6.12+).** Denies sending signals to
   processes outside the broker's Landlock domain.
 
 Levels: `[security] sandbox = required | best_effort (default) | off`.
 On `best_effort`, missing kernel features degrade with a `warn`
 log; on `required`, missing features abort startup. The full
-ruleset (paths, scopes, edge cases) is in
+ruleset (paths, scopes, edge cases) lives in
 [`src/sandbox.rs`](../src/sandbox.rs).
 
 A complementary anti-swap defence is `mlockall(MCL_CURRENT |
@@ -171,17 +173,18 @@ off disk").
 
 ## Concurrency model
 
-The broker runs on a single-threaded [compio](https://docs.rs/compio)
-runtime (thread-per-core with one core today). Implications:
+The broker runs on a single-threaded
+[compio](https://docs.rs/compio) runtime (thread-per-core with
+one core today). Implications:
 
 - Tasks cooperatively yield at `.await` only. A long CPU-bound
-  section without an `.await` blocks every other task — including
+  section without an `.await` blocks every other task, including
   the accept loop. CPU work goes through
   `crate::cpu_worker::CpuWorker`, a dedicated OS thread (used
   today for JWT signing).
 - Shared mutable state uses `Rc<RefCell<T>>` (no Send/Sync
   needed). RefCell borrows MUST drop before any `.await` or the
-  daemon panics at runtime. The check is manual — see
+  daemon panics at runtime. The check is manual; see
   AGENTS.md "Diagnostic discipline" and the Axis 1a notes in
   prior code reviews.
 - The admin-socket loop and the per-connection accept loop are

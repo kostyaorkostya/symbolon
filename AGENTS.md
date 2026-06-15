@@ -1,4 +1,4 @@
-# AGENTS.md — `symbolon`, the git credentials broker
+# AGENTS.md: `symbolon`, the git credentials broker
 
 *Symbolon* (σύμβολον): in Ancient Greek, an object broken in two
 halves; each party kept one, and matching them proved identity.
@@ -9,21 +9,18 @@ Single source of truth for design decisions and conventions. Read it top
 to bottom before writing or modifying code. If anything here conflicts
 with an ad-hoc instruction in chat, ask before deviating.
 
-Detail lives in sibling documents (we follow
-[Diátaxis](https://diataxis.fr/) — each doc is one mode):
-- How the system works (explanation):
-  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-- Wire formats, file schemas, logging schema, daemon lifecycle
-  (reference): [`docs/PROTOCOLS.md`](docs/PROTOCOLS.md)
-- RFC-2119 contract for providers (reference):
+Detail lives in sibling documents:
+- How the system works: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- Wire formats, file schemas, logging schema, daemon lifecycle:
+  [`docs/PROTOCOLS.md`](docs/PROTOCOLS.md)
+- RFC-2119 contract for providers:
   [`docs/PROVIDER_CONTRACT.md`](docs/PROVIDER_CONTRACT.md)
-- Operator commands, logging recipes, troubleshooting (how-to):
+- Operator commands, logging recipes, troubleshooting:
   [`docs/OPERATIONS.md`](docs/OPERATIONS.md)
-- Deployment (how-to): [`docs/INSTALL.md`](docs/INSTALL.md)
+- Deployment: [`docs/INSTALL.md`](docs/INSTALL.md)
 - Per-provider setup, guarantees, outbound API contracts,
   hardening: [`docs/providers/`](docs/providers/)
-- Authoritative URLs (reference):
-  [`docs/REFERENCES.md`](docs/REFERENCES.md)
+- Authoritative URLs: [`docs/REFERENCES.md`](docs/REFERENCES.md)
 
 ### Where does a statement go?
 
@@ -71,7 +68,7 @@ publishes binaries with sha256 attestations. The workflow:
 4. Hands each target's binaries+sha256s to a single downstream
    `release` job via `actions/upload-artifact`. The release job
    downloads everything and makes ONE `softprops/action-gh-release`
-   call. The matrix legs never touch the release surface — that's
+   call. The matrix legs never touch the release surface. That's
    what avoids the "Cannot upload assets to an immutable release"
    race when two parallel runners both try to create + publish the
    same tag on an Immutable Releases-enabled repo.
@@ -160,7 +157,7 @@ and permission set per provider live in `docs/providers/<name>.md`.
     `mlockall(MCL_CURRENT|MCL_FUTURE)` at startup
     (`src/mlock.rs`) prevents pages reaching swap; controlled
     by `[security] mlock = required | best_effort (default) |
-    off`. `MCL_ONFAULT` is deliberately NOT used — deferred
+    off`. `MCL_ONFAULT` is deliberately NOT used. Deferred
     locks under finite `RLIMIT_MEMLOCK` create a footgun where
     `status=applied` is logged and the process then aborts at
     the first allocation that exceeds the limit. Pre-faulting
@@ -199,21 +196,21 @@ Pinned in `Cargo.toml`:
   (async runtime; `macros` for `#[compio::main]`; `net`+`fs`+`time`
   for the daemon surface; `io-uring` listed explicitly so a future
   change to compio's default features can't silently disable it.
-  `ring` selects the rustls crypto provider via `compio-tls/ring`
-  — without it `cyper`'s `rustls` feature alone leaves rustls
+  `ring` selects the rustls crypto provider via `compio-tls/ring`.
+  Without it `cyper`'s `rustls` feature alone leaves rustls
   unable to pick a provider at runtime and the first HTTPS call
-  panics. The `signal` feature is intentionally NOT enabled — we
+  panics. The `signal` feature is intentionally NOT enabled; we
   use signal-hook-registry directly for permanent signal handlers;
   see `src/signals.rs`.)
 - `cyper` with `default-features = false, features = ["rustls",
   "http2"]` (HTTPS client for provider APIs. We turn off cyper's
   `native-tls` default to keep the binary OpenSSL-free under musl,
-  and explicitly opt in to rustls — pure Rust, ALPN-driven h2 over
+  and explicitly opt in to rustls. Pure Rust, ALPN-driven h2 over
   TLS so a keep-alive connection from a preceding resolve call is
   reused for the follow-up mint without a fresh handshake. The
   crypto provider (`ring`) is enabled via the `compio` dep above.)
 - `rsa` with `default-features = false, features = ["pem", "std",
-  "u64_digit"]` + `sha2` (with `oid` feature) + `base64` — the
+  "u64_digit"]` + `sha2` (with `oid` feature) + `base64`. The
   trio underneath `src/providers/jwt_rs256.rs`, our minimal RS256
   signer. The explicit rsa feature list matches its current
   defaults but is spelled out so future contributors see the
@@ -252,7 +249,7 @@ Pinned in `Cargo.toml`:
   `[security] sandbox` in `config.toml` with default
   `best_effort`. Pure Rust + `libc` only; works on musl.
   Intra-process signals (panic handlers, libc `abort()`,
-  thread-local plumbing) remain permitted — which is correct,
+  thread-local plumbing) remain permitted. Which is correct,
   the threat surface worth blocking is *cross-process* signal
   attacks from a compromised broker.)
 - `libc` (the `mlockall(MCL_CURRENT | MCL_FUTURE)` call in
@@ -260,7 +257,7 @@ Pinned in `Cargo.toml`:
   so the explicit dep adds no surface.)
 - `sd-notify` (pure-Rust `sd_notify(READY=1)` so `Type=notify`
   systemd units mark the service active when `src/ready.rs::notify`
-  fires. No-op outside systemd. Daemon code never imports this —
+  fires. No-op outside systemd. Daemon code never imports this;
   only `src/ready.rs` does, and `src/ready.rs` is called from
   `src/main.rs`.)
 - `snow` with `default-features = false, features =
@@ -268,7 +265,7 @@ Pinned in `Cargo.toml`:
   "use-curve25519", "use-getrandom", "std"]` (pure-Rust Noise
   Protocol Framework implementation; tracks Noise spec rev 34,
   forbids `unsafe_code` internally. Drives `Noise_NNpsk0_25519_
-  ChaChaPoly_BLAKE2s` in `src/transport.rs` — the responder side
+  ChaChaPoly_BLAKE2s` in `src/transport.rs`. The responder side
   in the daemon, the initiator side in the `git-credential-
   symbolon` client binary. Feature trim drops aes-gcm / sha2 /
   blake3 / p256 / pqcrypto since our pattern uses only
@@ -282,7 +279,7 @@ Pinned in `Cargo.toml`:
 - `tracing` with `default-features = false, features = ["std",
   "release_max_level_info"]`. `release_max_level_info` compiles
   out every `debug!` / `trace!` callsite in our code and our
-  deps from release builds — h2 and rustls in particular are
+  deps from release builds. H2 and rustls in particular are
   heavily instrumented at those levels; gating them saves
   measurable `.rodata` + `.text` weight at no functional cost
   since we never log below info in production. `attributes` is
@@ -293,12 +290,12 @@ Pinned in `Cargo.toml`:
   `src/logging.rs` with `flatten_event(true)` so user-added fields
   like `evt` and `req_id` appear as top-level JSON keys. The
   defaults `ansi` (terminal colours we don't use) + `tracing-log`
-  (log→tracing bridge — no dep emits `log::` events for us
+  (log→tracing bridge. No dep emits `log::` events for us
   because rustls's `logging` feature is off) + `smallvec` are
   trimmed.)
 - `futures-util` (`select!` and `FutureExt::fuse()` for the
   accept-vs-signal race in `daemon::run`; compio's own examples
-  pull it in the same way — see compio-0.18 `examples/tick.rs`).
+  pull it in the same way. See compio-0.18 `examples/tick.rs`).
 - `futures-channel` (`oneshot` for the result hand-back in
   `src/cpu_worker.rs`; the dedicated OS thread sends the
   computed value back to the awaiting compio task.)
@@ -310,18 +307,18 @@ Pinned in `Cargo.toml`:
 - `rustix` with features `net,process`. `process` for `geteuid` on
   the admin path (used by the SO_PEERCRED gate in `admin.rs`).
   `net` for
-  `socket_peercred` on the admin UDS — the SO_PEERCRED check that
+  `socket_peercred` on the admin UDS. The SO_PEERCRED check that
   rejects connections from UIDs other than root or the daemon's
   own (defense in depth against a loose `/run/symbolon/` ACL).
 - `signal-hook-registry` (long-lived OS-level signal handler
   installed once at startup. Replaces `compio::signal::unix::signal`
   which is one-shot and reverts the kernel disposition to `SigDfl`
-  on listener drop — a SIGHUP delivered in that gap would kill the
+  on listener drop. A SIGHUP delivered in that gap would kill the
   daemon. We register synchronous handlers per signal that set an
   AtomicBool + call `AtomicWaker::wake` on a `SignalNotifier` struct;
   the compio task loop awaits a re-armable `Notified` future. Both
   the AtomicBool store and the AtomicWaker wake are lock-free,
-  alloc-free, reentrant — async-signal-safe, matching compio-signal's
+  alloc-free, reentrant. Async-signal-safe, matching compio-signal's
   internal handler at `compio/compio-signal/src/unix/mod.rs:15-26`
   but with a permanent rather than per-call registration.)
 - `synchrony` with features `async_flag,event` (sync primitives for
@@ -348,7 +345,7 @@ Pinned in `Cargo.toml`:
   pulls only `humantime`. Avoids the `_secs: u64` code smell where
   the unit had to leak into the field name.)
 - `thin-cell` (one-word `Rc<RefCell<T>>` replacement from the
-  compio-rs ecosystem, used for `ConnectionTracker.active` —
+  compio-rs ecosystem, used for `ConnectionTracker.active`. A
   shared counter across tracker and per-handler closures. Same
   API shape as `Rc<RefCell<T>>`; one pointer instead of two.)
 
@@ -364,10 +361,10 @@ semver, and works in environments where outbound HTTPS is restricted
 to the registry path. WebFetch is neither necessary nor reliable for
 this and may fail in sandboxed environments.
 
-- `cargo add <crate>` — adds the latest compatible version to
+- `cargo add <crate>`. Adds the latest compatible version to
   `Cargo.toml` and updates `Cargo.lock`. Use `cargo add <crate>@<req>`
   to pin to a specific version.
-- `cargo search <crate>` — inspect available versions if needed.
+- `cargo search <crate>`. Inspect available versions if needed.
 
 Never hand-edit version strings in `Cargo.toml` from guessed values.
 Let `cargo add` write them, then commit `Cargo.lock`.
@@ -391,7 +388,7 @@ Addenda:
 - No `#[allow(...)]` without an explanatory comment.
 - Default visibility is `pub(crate)`. Only `lib.rs` re-exports `pub`.
 - Default to no comments. Add a doc comment only when the *why* or the
-  contract isn't obvious from the name and signature — hidden
+  contract isn't obvious from the name and signature. Hidden
   invariants, surprising edge cases, security-load-bearing rules (e.g.
   the CR/LF rejection in `git_credential`). Don't restate what
   well-named code already says.
@@ -450,7 +447,7 @@ Compio uses **cooperative scheduling**: tasks only yield at `.await`
 points. A long CPU-bound section without an `.await` blocks the
 single-threaded compio runtime and starves every other task. This
 is the same model Tokio uses (Tokio mitigates with per-task
-operation budgets — compio doesn't ship that yet).
+operation budgets. Compio doesn't ship that yet).
 
 Goroutines differ: Go's runtime preempts via compile-time yield-
 point injection. Rust async can't, because the language doesn't
@@ -490,10 +487,10 @@ the submission/completion queue model), so the codebase's
 **Fuzzing** is set up for the two parsers that consume attacker-
 controlled bytes:
 
-- `symbolon::parse_identity_prelude` — the unencrypted prelude
+- `symbolon::parse_identity_prelude`. The unencrypted prelude
   bytes the client sends before the Noise handshake. Identity
   selection depends on it (AGENTS.md invariant #7).
-- `symbolon::git_credential::parse` — git-credential request block
+- `symbolon::git_credential::parse`. Git-credential request block
   (decrypted out of the Noise transport before parsing); carries
   the CR/LF Clone2Leak defence (AGENTS.md invariant #12).
 
@@ -510,7 +507,7 @@ cargo fuzz run identity_prelude_parse -- -max_total_time=600
 
 (The `+nightly` switch isn't needed because `fuzz/rust-toolchain.toml`
 pins it.) The 10-minute budget is a baseline; longer runs find
-more. libFuzzer writes any crashing input to
+more. LibFuzzer writes any crashing input to
 `fuzz/artifacts/<target>/` and exits non-zero. To reproduce:
 
 ```sh
@@ -519,7 +516,7 @@ cargo fuzz run git_credential_parse \
   artifacts/git_credential_parse/<artifact-name>
 ```
 
-No CI integration today — operator runs fuzz on demand.
+No CI integration today. Operator runs fuzz on demand.
 
 ## Out of scope (deferred)
 
@@ -548,7 +545,7 @@ Known omissions, not oversights:
   invalidation fires the event today. TTL expiry is silently
   re-resolved; the provider doesn't currently surface "I just
   dropped an expired entry" to the daemon.
-- **Multiple instances of the same provider** (e.g. github.com +
+- **Multiple instances of the same provider** (e.g. Github.com +
   github.example.com on one broker). Section name `[provider.X]` is
   also the dispatch key; introduce a `kind` field if/when needed.
 - **Async DNS via `hickory-resolver`.** Tokio-coupled
@@ -556,7 +553,7 @@ Known omissions, not oversights:
   + multiple users-forum threads confirm no compio/async-std
   backend exists). AGENTS.md hard-NOTs tokio. The sandbox allowlist
   therefore continues to include the nameservice files libc's
-  `getaddrinfo` actually reads — selected at compile time via
+  `getaddrinfo` actually reads. Selected at compile time via
   `cfg(target_env = "musl")` in `src/daemon.rs::nameservice_files`.
   musl reads `/etc/resolv.conf` and `/etc/hosts` only; glibc also
   reads `/etc/nsswitch.conf` and `/etc/gai.conf`. The musl release
@@ -565,7 +562,7 @@ Known omissions, not oversights:
   (b) a compio-native DNS crate appears on crates.io, or (c)
   operator need is concrete enough to justify hand-rolling a tiny
   UDP stub resolver on `compio-net` (~150–250 LOC, A/AAAA only).
-  DoT/DoH are out of scope for our threat model regardless — see
+  DoT/DoH are out of scope for our threat model regardless. See
   PROTOCOLS.md for the rationale.
 - **Socket activation via `listen-fds` / `listenfd`.** systemd can
   hand pre-bound sockets to the daemon; would eliminate our own
@@ -576,7 +573,7 @@ Known omissions, not oversights:
   pooled connection eventually fails, we surface `evt=provider_error`,
   and the next mint opens a fresh connection with a fresh DNS
   lookup. At our traffic (<<1 mint/s) the natural failure/retry
-  cycle covers IP rotation — no proactive resolver work needed.
+  cycle covers IP rotation. No proactive resolver work needed.
   High-mint-rate deployments would want a connection-lifetime cap.
 - **Per-read buffer reuse.** Both `src/daemon.rs::read_more` and
   `src/admin.rs::read_line` allocate a fresh `Vec` per read

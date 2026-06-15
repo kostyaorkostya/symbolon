@@ -1,22 +1,23 @@
 # Protocols & file formats
 
-Reference doc — wire formats and on-disk schemas for `symbolon`.
-Look here while working; for "how does this thing work" read
-[`ARCHITECTURE.md`](ARCHITECTURE.md) first.
+Wire formats and on-disk schemas for `symbolon`. Read
+[`ARCHITECTURE.md`](ARCHITECTURE.md) first if you want the
+"how does this thing work" pass; this file is for lookup.
 
-| Doc | Mode |
-|---|---|
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Explanation — how the system works |
-| [`PROVIDER_CONTRACT.md`](PROVIDER_CONTRACT.md) | Reference — RFC-2119 contract for providers |
-| [`INSTALL.md`](INSTALL.md) | How-to — deploy |
-| [`OPERATIONS.md`](OPERATIONS.md) | How-to — operate |
-| [`providers/`](providers/) | Per-provider setup, guarantees, outbound API |
-| [`REFERENCES.md`](REFERENCES.md) | Reference — external URLs |
-| [`../AGENTS.md`](../AGENTS.md) | Agent guidance — design + style |
+See also:
+
+- [`PROVIDER_CONTRACT.md`](PROVIDER_CONTRACT.md): RFC-2119
+  contract for providers.
+- [`INSTALL.md`](INSTALL.md): deploy.
+- [`OPERATIONS.md`](OPERATIONS.md): operate.
+- [`providers/`](providers/): per-provider setup, guarantees,
+  outbound API.
+- [`REFERENCES.md`](REFERENCES.md): external URLs.
+- [`../AGENTS.md`](../AGENTS.md): design and style notes.
 
 ## File formats
 
-### `/etc/symbolon/config.toml` — operator-authored
+### `/etc/symbolon/config.toml`: operator-authored
 
 ```toml
 [listen]
@@ -38,7 +39,7 @@ level = "info"   # trace | debug | info | warn | error
 [security]
 # Sandbox enforcement policy. Controls Landlock at ABI 6 (FS allowlist
 # + outbound TCP-connect to port 443 + abstract-UDS scope +
-# Scope::Signal denying cross-domain signal-sending — Linux 6.12+).
+# Scope::Signal denying cross-domain signal-sending. Linux 6.12+).
 #
 #   required    – refuse to start if the kernel can't enforce ABI 6.
 #   best_effort – default. Apply what the kernel supports; degrade and
@@ -66,7 +67,7 @@ mlock = "best_effort"
 [runtime]
 # Optional pidfile. When set, the daemon writes its PID here once
 # it's ready to serve. Required for OpenRC's `command_background=yes`
-# + `pidfile=...` convention. Leave unset under systemd —
+# + `pidfile=...` convention. Leave unset under systemd;
 # `Type=notify` + READY=1 covers readiness without a pidfile, and
 # modern systemd man pages discourage pidfiles when notify is
 # available.
@@ -75,7 +76,7 @@ mlock = "best_effort"
 # write-allowlist automatically.
 pidfile = "/run/symbolon/symbolon.pid"
 
-# Per-provider section — field reference in per-provider docs
+# Per-provider section. Field reference in per-provider docs
 # under docs/providers/. Example for GitHub:
 [provider.github]
 host = "github.com"
@@ -99,7 +100,7 @@ daemon cannot re-open the key. Keep the key file under
 do not place it in the directory granted write access for atomic
 state-file writes.
 
-### `/var/lib/symbolon/clients.json` — machine-authored
+### `/var/lib/symbolon/clients.json`: machine-authored
 
 ```json
 {
@@ -121,7 +122,7 @@ change can be detected and migrated rather than silently
 mis-parsed. The `providers` array allows multi-provider
 enrolment per client.
 
-### `/var/lib/symbolon/psks` — machine-authored
+### `/var/lib/symbolon/psks`: machine-authored
 
 Symbolon-owned PSK store. One identity per line:
 
@@ -146,7 +147,7 @@ invariant #10). The daemon writes both files atomically:
 
 A crash between steps leaves a tempfile, never a partial target. On
 startup the daemon ignores stale `.tmp.*` files; operators can delete
-them. No file locks are used — the daemon's single-writer invariant
+them. No file locks are used. The daemon's single-writer invariant
 makes them unnecessary.
 
 ## Wire formats
@@ -165,7 +166,7 @@ makes them unnecessary.
 - 1 byte version: `0x01`. Future-proofing.
 - 1 byte identity length `L`. Must be 1..=64.
 - `L` bytes identity. Charset enforced to `[A-Za-z0-9._-]+` (same rule
-  as git-credential values; CR/LF/NUL rejected — AGENTS.md invariant
+  as git-credential values; CR/LF/NUL rejected. AGENTS.md invariant
   #12 in spirit).
 
 Prelude bytes are cleartext on the wire. An attacker passively
@@ -302,7 +303,7 @@ Clone2Leak-class defence applied to the admin path).
 
 Per-provider outbound HTTPS contracts (endpoints, auth, headers,
 body shape, retry / cache behaviour) live in
-[providers/](providers/) — one file per supported provider.
+[providers/](providers/). One file per supported provider.
 Currently:
 
 - **GitHub** → [providers/github.md § Outbound API contract](providers/github.md#outbound-api-contract).
@@ -336,7 +337,7 @@ On `SIGTERM` or `SIGINT`:
 1. Stop accepting new connections on the listen socket.
 2. Drain in-flight handlers with a **5-second deadline**.
 3. Unlink and close the admin Unix socket; close the TCP
-   listen socket (no unlink — it's not a filesystem node).
+   listen socket (no unlink. It's not a filesystem node).
 4. Exit 0.
 
 Log `evt=shutdown signal=<sig> inflight_drained=<n> drain_ms=<ms>`.
@@ -348,7 +349,7 @@ On any other signal except SIGHUP: terminate fast; do not drain.
 | File | Reload mechanism |
 |---|---|
 | `clients.json` | SIGHUP re-reads from disk. |
-| `psks` | Read AND written by daemon: per-provider `enroll`/`revoke` commands route through the admin socket; the daemon parses, mutates the in-memory `PskStore`, and atomically rewrites the file. No external process to notify — symbolon owns the responder side of Noise NNpsk0 directly. |
+| `psks` | Read AND written by daemon: per-provider `enroll`/`revoke` commands route through the admin socket; the daemon parses, mutates the in-memory `PskStore`, and atomically rewrites the file. No external process to notify. Symbolon owns the responder side of Noise NNpsk0 directly. |
 | `config.toml` | Restart required. |
 | Provider private key | Restart required. |
 
@@ -361,12 +362,12 @@ top-level keys.
 
 **Required fields on every record:**
 
-- `timestamp` — RFC 3339 UTC, subsecond precision. Emitted by
+- `timestamp`. RFC 3339 UTC, subsecond precision. Emitted by
   `tracing-subscriber`'s default JSON timer.
-- `level` — `TRACE | DEBUG | INFO | WARN | ERROR` (uppercase,
+- `level`. `TRACE | DEBUG | INFO | WARN | ERROR` (uppercase,
   per the built-in formatter).
-- `evt` — event name (closed set, below). User-added field.
-- `req_id` — ULID generated at TCP accept, threaded through.
+- `evt`. Event name (closed set, below). User-added field.
+- `req_id`. ULID generated at TCP accept, threaded through.
   User-added field.
 
 **Per-event additional fields:**
@@ -394,22 +395,22 @@ extending the enum and adding a row below.
 | `config_reload` | `triggered_by` (`sighup`) |
 | `cache_invalidated` | `provider`, `repo`, `cause` (`404` \| `ttl_expired`) |
 | `sandbox_applied` | `policy` (`required` \| `best_effort` \| `off`), `abi` (Landlock ABI requested; `0` if off), `status` (`fully_enforced` \| `partially_enforced` \| `not_enforced` \| `off`), `fs`, `tcp`, `scope` (bool per Landlock layer actually engaged) |
-| `sandbox_path_skipped` | `path`, `reason` (`enoent` \| `open_failed`), `error` (when applicable) — emitted at `debug` for nameservice / CA-bundle paths absent on this host |
-| `prepare` | `version`, `config_path`, `listen_addr`, `admin_socket` — emitted by `Service::prepare` once config is loaded and sockets are bound (before selfcheck and readiness) |
-| `ready` | `pid` — emitted by `main` after `service.selfcheck()` returns and `ready::notify` has sent `READY=1` to systemd (if applicable) and written the pidfile (if configured) |
-| `run_failed` | `signal`, `error` — emitted at `error` lvl by `main` when `Service::run` returns `Err`. Mutually exclusive with `shutdown` (one or the other fires) |
-| `ready_pidfile_write_failed` | `path`, `error` — emitted at `warn` lvl by `ready::notify` if the configured pidfile can't be written (typically a sandbox or permission issue) |
-| `admin_denied` | `peer_uid`, `peer_pid` — emitted at `warn` lvl when SO_PEERCRED on the admin socket shows a UID that is neither root nor the daemon's own |
-| `admin_peercred_failed` | `error` — emitted at `warn` lvl when SO_PEERCRED itself fails; the connection is still admitted (refusing on a transient kernel error would be a self-DoS) |
-| `prelude_invalid` | `peer`, `reason` (`bad_magic` \| `bad_version` \| `bad_identity_len` \| `invalid_charset` \| `eof_before_prelude_head` \| `eof_before_identity`) — emitted when the identity prelude is malformed; connection dropped |
-| `handshake_failed` | `client`, `reason` (`handshake_read_failed` \| `handshake_write_failed` \| `handshake_into_transport_failed` \| `decrypt_failed` \| `frame_too_big`) — Noise handshake or transport error; connection dropped |
-| `drain_incomplete` | `inflight_drained`, `drain_ms` — emitted at `warn` lvl when the per-connection drain deadline elapses with handlers still in flight at shutdown |
-| `signal_registration_failed` | `signal`, `error` — emitted at `error` lvl by `main` when `signal-hook-registry::register` fails at startup. Treated as fatal (exit 1) — without it the daemon cannot honour SIGTERM/SIGINT/SIGHUP |
-| `mlock` | `status` (`applied` \| `skipped` \| `failed` \| `off`), `policy` (`required` \| `best_effort` \| `off`), `flags` (when applied) or `error` (when skipped/failed) — emitted once at startup by `main::run_daemon` after `setup_tracing`. `required` failure surfaces as the separate `mlock_required_failed` error event before exit |
-| `mlock_required_failed` | `error` — emitted at `error` lvl by `main` when `[security] mlock = "required"` and `mlockall` failed. Fatal (exit 1); operator should add `LimitMEMLOCK=infinity` to the systemd unit |
-| `admin_request` | `req_id`, `op` — emitted by the admin loop at entry of each request. The `req_id` (ULID) ties downstream `provider_call` / `mint` / `selfcheck` events back to this admin invocation |
-| `provider_call` | `req_id`, `out_req_id`, `endpoint` (`mint_metadata_token` \| `resolve_repo_id` \| `mint_token` \| `selfcheck`), `provider`, `timeout_ms` — emitted before each outbound HTTPS call |
-| `provider_call_done` | `req_id`, `out_req_id`, `status` (HTTP status code, 0 if no response), `gh_req_id` (X-GitHub-Request-Id, empty if absent), `elapsed_ms`, optional `error` — emitted after each outbound HTTPS call |
+| `sandbox_path_skipped` | `path`, `reason` (`enoent` \| `open_failed`), `error` (when applicable). Emitted at `debug` for nameservice / CA-bundle paths absent on this host |
+| `prepare` | `version`, `config_path`, `listen_addr`, `admin_socket`. Emitted by `Service::prepare` once config is loaded and sockets are bound (before selfcheck and readiness) |
+| `ready` | `pid`. Emitted by `main` after `service.selfcheck()` returns and `ready::notify` has sent `READY=1` to systemd (if applicable) and written the pidfile (if configured) |
+| `run_failed` | `signal`, `error`. Emitted at `error` lvl by `main` when `Service::run` returns `Err`. Mutually exclusive with `shutdown` (one or the other fires) |
+| `ready_pidfile_write_failed` | `path`, `error`. Emitted at `warn` lvl by `ready::notify` if the configured pidfile can't be written (typically a sandbox or permission issue) |
+| `admin_denied` | `peer_uid`, `peer_pid`. Emitted at `warn` lvl when SO_PEERCRED on the admin socket shows a UID that is neither root nor the daemon's own |
+| `admin_peercred_failed` | `error`. Emitted at `warn` lvl when SO_PEERCRED itself fails; the connection is still admitted (refusing on a transient kernel error would be a self-DoS) |
+| `prelude_invalid` | `peer`, `reason` (`bad_magic` \| `bad_version` \| `bad_identity_len` \| `invalid_charset` \| `eof_before_prelude_head` \| `eof_before_identity`). Emitted when the identity prelude is malformed; connection dropped |
+| `handshake_failed` | `client`, `reason` (`handshake_read_failed` \| `handshake_write_failed` \| `handshake_into_transport_failed` \| `decrypt_failed` \| `frame_too_big`). Noise handshake or transport error; connection dropped |
+| `drain_incomplete` | `inflight_drained`, `drain_ms`. Emitted at `warn` lvl when the per-connection drain deadline elapses with handlers still in flight at shutdown |
+| `signal_registration_failed` | `signal`, `error`. Emitted at `error` lvl by `main` when `signal-hook-registry::register` fails at startup. Treated as fatal (exit 1). Without it the daemon cannot honour SIGTERM/SIGINT/SIGHUP |
+| `mlock` | `status` (`applied` \| `skipped` \| `failed` \| `off`), `policy` (`required` \| `best_effort` \| `off`), `flags` (when applied) or `error` (when skipped/failed). Emitted once at startup by `main::run_daemon` after `setup_tracing`. `required` failure surfaces as the separate `mlock_required_failed` error event before exit |
+| `mlock_required_failed` | `error`. Emitted at `error` lvl by `main` when `[security] mlock = "required"` and `mlockall` failed. Fatal (exit 1); operator should add `LimitMEMLOCK=infinity` to the systemd unit |
+| `admin_request` | `req_id`, `op`. Emitted by the admin loop at entry of each request. The `req_id` (ULID) ties downstream `provider_call` / `mint` / `selfcheck` events back to this admin invocation |
+| `provider_call` | `req_id`, `out_req_id`, `endpoint` (`mint_metadata_token` \| `resolve_repo_id` \| `mint_token` \| `selfcheck`), `provider`, `timeout_ms`. Emitted before each outbound HTTPS call |
+| `provider_call_done` | `req_id`, `out_req_id`, `status` (HTTP status code, 0 if no response), `gh_req_id` (X-GitHub-Request-Id, empty if absent), `elapsed_ms`, optional `error`. Emitted after each outbound HTTPS call |
 
 `reason` values for `mint_denied`:
 `client_unknown | unknown_host | repo_not_accessible | provider_4xx | malformed_request`.
@@ -417,5 +418,5 @@ extending the enum and adding a row below.
 `endpoint` and `body_snippet` on `provider_error` are deferred
 pending a redaction layer to avoid leaking sensitive data (provider
 5xx responses can carry tokens). `cause = ttl_expired` on
-`cache_invalidated` is also deferred — only `cause = "404"` fires
+`cache_invalidated` is also deferred. Only `cause = "404"` fires
 today.

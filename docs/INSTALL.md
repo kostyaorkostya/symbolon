@@ -1,17 +1,19 @@
 # Installing `symbolon`
 
-How-to — fresh-deployment guide. Operational details (commands,
-paths, packaging) drift over time; the stable explanation is
-elsewhere.
+Fresh-deployment guide. Commands, paths, and packaging drift
+over time; the stable explanation is elsewhere.
 
-| Doc | Mode |
-|---|---|
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Explanation — how the system works |
-| [`PROTOCOLS.md`](PROTOCOLS.md) | Reference — wire / file / log schemas |
-| [`PROVIDER_CONTRACT.md`](PROVIDER_CONTRACT.md) | Reference — RFC-2119 provider contract |
-| [`OPERATIONS.md`](OPERATIONS.md) | How-to — day-to-day operations |
-| [`providers/`](providers/) | Per-provider setup (App creation, config block) |
-| [`../AGENTS.md`](../AGENTS.md) | Agent guidance — design + style |
+See also:
+
+- [`ARCHITECTURE.md`](ARCHITECTURE.md): how the system works.
+- [`PROTOCOLS.md`](PROTOCOLS.md): wire, file, log schemas.
+- [`PROVIDER_CONTRACT.md`](PROVIDER_CONTRACT.md): RFC-2119
+  provider contract.
+- [`OPERATIONS.md`](OPERATIONS.md): day-to-day operations.
+- [`providers/`](providers/): per-provider setup (App creation,
+  config block).
+- [`../AGENTS.md`](../AGENTS.md): design and style notes for
+  contributors.
 
 ## 1. Prerequisites
 
@@ -21,7 +23,7 @@ elsewhere.
 - A host for the broker. Any small Linux environment works; an
   Alpine LXC is a common choice. The host needs:
   - Outbound HTTPS to the configured provider API.
-  - Enough headroom for a ~3 MiB daemon. No TLS proxy needed —
+  - Enough headroom for a ~3 MiB daemon. No TLS proxy needed;
     symbolon terminates Noise NNpsk0 in-process.
   - **Linux kernel 6.12+** recommended. The broker self-sandboxes
     with Landlock at ABI 6: FS allowlist, outbound TCP-connect
@@ -39,7 +41,7 @@ elsewhere.
 ## 2. Per-provider setup
 
 Before deploying the broker, complete the setup for the provider
-you'll use — you'll need its private key file and identifiers to
+you'll use. You'll need its private key file and identifiers to
 fill in `config.toml` below.
 
 - **GitHub** → [providers/github.md](providers/github.md).
@@ -74,7 +76,7 @@ ruleset grants write access to `/var/lib/symbolon/`; putting the
 provider key under that dir would defeat the sandbox's protection
 of the key.
 
-The `/run/symbolon` directory is recreated on every boot — see
+The `/run/symbolon` directory is recreated on every boot; see
 §3.8/§3.9.
 
 ### 3.3 Fetch and verify the binary
@@ -131,7 +133,7 @@ level = "info"
 # sandbox = "best_effort"
 # extra_read_dirs = []
 
-# Per-provider section — one per provider you've set up.
+# Per-provider section. One per provider you've set up.
 # Field reference: per-provider docs under docs/providers/.
 [provider.github]
 host = "github.com"
@@ -158,13 +160,13 @@ install -o symbolon -g symbolon -m 0600 /dev/null /var/lib/symbolon/psks
 ```
 
 Both files are mutated atomically by the daemon (tempfile + fsync
-+ rename) — never hand-edit while the daemon is running unless
++ rename). Never hand-edit while the daemon is running unless
 recovering from corruption.
 
 ### 3.7 Optional: IP-level filtering
 
 Symbolon's access control is the per-client PSK and the Noise
-NNpsk0 handshake — a connection that doesn't present a known
+NNpsk0 handshake. A connection that doesn't present a known
 identity and the matching PSK never completes the handshake,
 regardless of where it originated. **IP-based filtering is
 optional defense-in-depth, not required.** The daemon binds
@@ -173,7 +175,7 @@ optional defense-in-depth, not required.** The daemon binds
 
 Three deployment patterns when you do want a network-level layer:
 
-**Bare metal — host-level nftables on the broker.** Replace
+**Bare metal: host-level nftables on the broker.** Replace
 `<lan-cidr>` with your trusted LAN (e.g. `192.168.122.0/24`):
 
 ```sh
@@ -191,15 +193,15 @@ EOF
 
 Persist via your distro's nftables service.
 
-**libvirt VM — apply [`clean-traffic`](https://libvirt.org/firewall.html)
+**libvirt VM: apply [`clean-traffic`](https://libvirt.org/firewall.html)
 at the host bridge.** The filter runs in the host's network
 namespace, so the guest doesn't need any in-VM nft rules and
 can't disable the policy from inside.
 
-**LXC / Docker / Incus containers — apply filtering at the bridge
+**LXC / Docker / Incus containers: apply filtering at the bridge
 layer on the host, NOT inside the container.** Unprivileged
-containers typically can't load nftables rules under their user
-namespace — `nft -f` will either silently no-op or fail with a
+containers can't load nftables rules under their user
+namespace; `nft -f` will either silently no-op or fail with a
 permission error. For Incus: `security.ipv4_filtering=true` /
 `security.ipv6_filtering=true` on the instance. For Docker: the
 default bridge anti-spoof behaviour. For raw LXC: whatever your
@@ -295,7 +297,7 @@ swapoff -a
 `Type=notify` makes systemd wait for the daemon's
 `sd_notify(READY=1)` call before marking the service active.
 **Leave `[runtime] pidfile` unset in `config.toml` under
-systemd** — `Type=notify` covers readiness; modern systemd man
+systemd.** `Type=notify` covers readiness; modern systemd man
 pages discourage pidfiles when notify is available.
 
 **OpenRC: also leave `[runtime] pidfile` unset.**
@@ -315,7 +317,7 @@ symbolon github selfcheck
 `selfcheck` should report the provider reachable and clock skew
 small. Exit code 0 means everything's good. (CLI commands talk to
 the daemon over its admin Unix socket, which is locked down by
-SO_PEERCRED to root or the daemon's UID — run the commands as one
+SO_PEERCRED to root or the daemon's UID; run the commands as one
 of those.)
 
 ## 4. Enroll a client

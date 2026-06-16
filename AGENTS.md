@@ -217,20 +217,19 @@ Pinned in `Cargo.toml`:
   audit: `pem` for PKCS#8 / PKCS#1 parsing, `std` for the
   digest/signature trait `std` glue, `u64_digit` for the 64-bit
   num-bigint backend (~2× faster RSA-2048 sign on x86_64/aarch64).
-  Replaces `jsonwebtoken`, whose monolithic `Algorithm` enum kept
-  ed25519-dalek / curve25519-dalek / p256 / p384 / hmac in the
-  binary even though we only call RS256; the linker can't prove
-  the unused enum arms unreachable. Byte-equivalence with the
-  prior jsonwebtoken output is pinned by
-  `tests::known_vector_matches_jsonwebtoken_baseline`. RSASSA-
+  Picked over `jsonwebtoken` because that crate's monolithic
+  `Algorithm` enum keeps ed25519-dalek / curve25519-dalek / p256 /
+  p384 / hmac in the binary even when only RS256 is called — the
+  linker can't prove the unused enum arms unreachable. RSASSA-
   PKCS1-v1_5 with SHA-256 is one of the most thoroughly specified
   JOSE algorithms; the actual signing is a single `rsa::SigningKey`
-  call.
+  call. Output is locked by a known-vector test in
+  `jwt_rs256::tests::known_vector_round_trip`.
 - `hex` (encode/decode for the per-line PSK file format in
   `src/psk_store.rs`, the enroll output's `psk_hex` field in
   `src/admin.rs`, and the client binary's PSK file load in
   `src/bin/git_credential_symbolon.rs`. Pure-Rust, zero runtime
-  deps, dual MIT/Apache. Replaces three hand-rolled hex codecs.)
+  deps, dual MIT/Apache.)
 - `landlock` (Linux LSM sandboxing at ABI 6: FS allowlist +
   outbound TCP-connect to port 443 + abstract-UDS scope +
   `Scope::Signal` (Linux 6.12+) denying cross-domain
@@ -302,17 +301,16 @@ Pinned in `Cargo.toml`:
   the daemon's own (defense in depth against a loose
   `/run/symbolon/` ACL).
 - `signal-hook-registry` (long-lived OS-level signal handler
-  installed once at startup. Replaces `compio::signal::unix::signal`
-  which is one-shot and reverts the kernel disposition to `SigDfl`
-  on listener drop. A SIGHUP delivered in that gap would kill the
-  daemon. We register synchronous handlers per signal that set an
-  AtomicBool + call `AtomicWaker::wake` on a `SignalNotifier` struct;
-  the compio task loop awaits a re-armable `Notified` future. Both
-  the AtomicBool store and the AtomicWaker wake are lock-free,
-  alloc-free, reentrant, and async-signal-safe; the handler matches
-  compio-signal's internal handler at
-  `compio/compio-signal/src/unix/mod.rs:15-26` but with a permanent
-  rather than per-call registration.)
+  installed once at startup; the kernel disposition stays bound
+  to our handler for the process lifetime. `compio::signal` would
+  be the obvious alternative but its `signal()` is one-shot — it
+  reverts to `SigDfl` on listener drop, and a SIGHUP delivered in
+  that gap would kill the daemon. We register synchronous handlers
+  per signal that set an AtomicBool + call `AtomicWaker::wake` on
+  a `SignalNotifier`; the compio task loop awaits a re-armable
+  `Notified` future. Both the AtomicBool store and the
+  AtomicWaker wake are lock-free, alloc-free, reentrant, and
+  async-signal-safe.)
 - `synchrony` with features `async_flag,event` (sync primitives for
   `compio`. `sync::event::Event` is the re-armable wakeup used by
   `ConnectionTracker`'s "drain empty" notification and by the
@@ -413,22 +411,30 @@ src/
   lib.rs               # crate-level docs, pub re-exports
   config.rs            # config.toml + clients.json parsing
   connection_tracker.rs# spawn / drain abstraction for accept loops
-  cpu_worker.rs        # Dedicated OS thread for CPU-bound work
+  cpu_worker.rs        # dedicated OS thread for CPU-bound work
+  events.rs            # closed-set EventKind enum for structured logs
   git_credential.rs    # protocol parse/emit; CR/LF rejection mandatory
-  transport.rs         # Noise NNpsk0 wrapper + identity prelude + framing
+  transport.rs         # Responder/Initiator sans-IO state machines, framing, prelude
   psk_store.rs         # in-memory identity → PSK store, file-backed
-  daemon.rs            # TCP accept loop, per-connection Noise handler, Service shape
+  daemon.rs            # TCP accept loop, per-connection driver, Service shape
   admin.rs             # admin Unix socket + CLI dispatch (enroll/revoke/etc.)
   signals.rs           # signal-hook-registry handlers → CancelToken
   ready.rs             # sd_notify + pidfile (atomic) at startup
   loader.rs            # async config/clients.json file reads
   logging.rs           # tracing-subscriber JSON setup (stdout/stderr split)
+  mlock.rs             # mlockall(MCL_CURRENT|MCL_FUTURE) wrapper
   sandbox.rs           # landlock (FS + TCP + UDS scope + signal scope)
   providers/
-    mod.rs             # Provider abstraction (lightweight)
+    mod.rs             # provider re-exports (one type today; trait when a 2nd lands)
     github.rs          # GitHub: JWT, repo-ID singleflight cache, mint
+    jwt_rs256.rs       # minimal RS256 JWS signer (rsa + sha2)
 tests/
-  integration.rs       # wiremock-rs against provider APIs
+  admin.rs             # admin UDS protocol against a spawned daemon
+  client_binary.rs     # end-to-end smoke against a one-shot Noise responder
+  daemon.rs            # TCP wire round-trip against the daemon
+  github_provider.rs   # wiremock-rs against the GitHub provider
+  common/              # shared test scaffolding
+  fixtures/            # test_app_key.pem
 fuzz/                  # cargo-fuzz subproject (nightly-pinned)
   fuzz_targets/        # parser harnesses (security tooling)
 ```
@@ -454,10 +460,16 @@ For CPU work, two options:
   and small (microseconds of communication overhead per call, no
   thread-spawn churn). Construct as
   `let worker = CpuWorker::new("descriptive-thread-name")?;` then
-  `worker.run(move || do_cpu_work()).await?`. The in-tree example
-  is `src/providers/github.rs::JwtSigner`, which holds an
-  `Arc<EncodingKey>` and dispatches each `sign_jwt_blocking` call
-  to a `symbolon-jwt-signer`-named worker thread.
+  `worker.run(move || do_cpu_work()).await?`. The daemon spawns
+  one shared worker (`symbolon-cpu-worker`) in `Service::prepare`
+  and clones the `Rc<CpuWorker>` into each consumer. The in-tree
+  consumer is `src/providers/github.rs::JwtSigner`, which holds an
+  `Arc<JwtSigningKey>` and dispatches each `sign_jwt_blocking`
+  call. **Invariant:** the closure passed to `CpuWorker::run` must
+  not capture an `Rc`/`Arc<CpuWorker>` for the same worker — a
+  cycle the destructor can't break (the worker thread joins on
+  Drop, but it's busy running a closure that holds a reference).
+  See the `CpuWorker::run` docstring.
 - **`compio::runtime::spawn_blocking(f)`** for one-off CPU bursts.
   Compio's pool lazily spawns up to 256 threads, 60 s idle reap.
   Good fit when work is occasional; bad fit for high-frequency

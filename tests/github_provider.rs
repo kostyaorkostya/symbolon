@@ -248,7 +248,7 @@ async fn mint_returns_500() {
             .mint("test-req", &format!("{OWNER}/{REPO}"))
             .await
             .unwrap_err(),
-        GithubError::ServerError(500)
+        GithubError::OtherStatus(500)
     ));
 }
 

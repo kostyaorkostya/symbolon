@@ -549,7 +549,7 @@ fn error_response_from_github(err: &GithubError) -> serde_json::Value {
         GithubError::Forbidden { body } => ("provider_4xx", format!("forbidden (403): {body}")),
         GithubError::RateLimited => ("provider_4xx", "rate limited (429)".to_string()),
         GithubError::MalformedPath(p) => ("bad_request", format!("malformed owner/repo path: {p}")),
-        GithubError::ServerError(s) => ("internal", format!("provider 5xx: {s}")),
+        GithubError::OtherStatus(s) => ("internal", format!("provider status {s}")),
         GithubError::ClientIdMismatch {
             configured,
             reported,

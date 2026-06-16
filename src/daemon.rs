@@ -1068,17 +1068,7 @@ fn log_mint_error(
                 provider_ms = provider_ms,
             );
         }
-        GithubError::ServerError(status) => {
-            warn!(
-                req_id = %req_id,
-                evt = %EventKind::ProviderError,
-                status = *status,
-                provider = %host,
-                repo = %path,
-                provider_ms = provider_ms,
-            );
-        }
-        GithubError::UnexpectedStatus(status) => {
+        GithubError::OtherStatus(status) => {
             warn!(
                 req_id = %req_id,
                 evt = %EventKind::ProviderError,

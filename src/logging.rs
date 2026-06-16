@@ -26,11 +26,11 @@ use crate::config::LogLevel;
 ///
 /// Safety: every error variant the daemon can produce has been
 /// audited for secret-leak via Display. In particular,
-/// `GithubError::JsonParse` (which would carry a response-body
+/// `GithubError::ParseResponse` (which would carry a response-body
 /// fragment that might include an access token) deliberately
 /// omits its `#[source]`, so the chain stops at the safe
-/// `context` string. See the rationale comment on that variant
-/// in `src/providers/github.rs`.
+/// `context` / `detail` `&'static` strings. See the rationale
+/// comment on that variant in `src/providers/github.rs`.
 pub struct ErrorChain<'a, E: std::error::Error>(pub &'a E);
 
 impl<E: std::error::Error> std::fmt::Display for ErrorChain<'_, E> {

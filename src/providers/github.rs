@@ -42,7 +42,7 @@ use crate::cpu_worker::CpuWorker;
 use crate::events::EventKind;
 use crate::git_credential;
 
-const GITHUB_API_VERSION: &str = "2022-11-28";
+const GITHUB_API_VERSION: &str = "2026-03-10";
 const ACCEPT_HEADER: &str = "application/vnd.github+json";
 const CACHE_TTL: Duration = Duration::from_secs(600);
 const JWT_LEEWAY_PAST: u64 = 60;

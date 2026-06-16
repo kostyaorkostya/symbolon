@@ -65,6 +65,13 @@ impl CpuWorker {
 
     /// Submit a closure for execution on the worker thread; await
     /// its return value.
+    ///
+    /// **Invariant:** `f` MUST NOT capture an `Rc<CpuWorker>` /
+    /// `Arc<CpuWorker>` / `JoinHandle` for *this* worker. Doing
+    /// so creates a cycle the destructor can't break — `Drop`
+    /// joins the worker thread, which is still executing the
+    /// closure that holds the reference. The daemon hangs at
+    /// exit. See the module-level docs for the rationale.
     pub async fn run<R>(&self, f: impl FnOnce() -> R + Send + 'static) -> Result<R, WorkerDead>
     where
         R: Send + 'static,

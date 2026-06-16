@@ -32,7 +32,6 @@ use tracing::info;
 use crate::daemon::{ResolvedClient, SharedState};
 use crate::events::EventKind;
 use crate::providers::github::GithubError;
-use zeroize::Zeroizing;
 
 const CLIENTS_FILE_MODE: u32 = 0o640;
 const PSK_FILE_MODE: u32 = 0o600;
@@ -341,7 +340,7 @@ async fn handle_enroll(
     let key_bytes = generate_psk_key()
         .await
         .map_err(|e| error_response("internal", &format!("rng: {e}")))?;
-    let psk_hex = hex::encode(key_bytes.as_slice());
+    let psk_hex = hex::encode(key_bytes);
 
     // Update the in-memory PSK store, then write the new on-disk file
     // (deterministic sorted render). Insert is idempotent — on a retry
@@ -349,7 +348,7 @@ async fn handle_enroll(
     state
         .psks
         .borrow_mut()
-        .insert(client.to_string(), *key_bytes);
+        .insert(client.to_string(), key_bytes);
     let psk_content = state.psks.borrow().render();
     if let Err(e) = atomic_write(
         &state.psk_file_path,
@@ -743,16 +742,14 @@ fn is_valid_client_name(s: &str) -> bool {
             .any(|c| c == ':' || c == '\n' || c == '\r' || c.is_whitespace())
 }
 
-async fn generate_psk_key() -> std::io::Result<Zeroizing<[u8; 32]>> {
+async fn generate_psk_key() -> std::io::Result<[u8; 32]> {
     use compio::io::AsyncReadAtExt;
     let file = compio::fs::File::open("/dev/urandom").await?;
     let buf = vec![0u8; 32];
     let BufResult(res, buf) = file.read_exact_at(buf, 0).await;
     res?;
-    let arr: [u8; 32] = buf
-        .try_into()
-        .map_err(|_| std::io::Error::other("short read from /dev/urandom"))?;
-    Ok(Zeroizing::new(arr))
+    buf.try_into()
+        .map_err(|_| std::io::Error::other("short read from /dev/urandom"))
 }
 
 pub(crate) async fn atomic_write(path: &Path, content: Vec<u8>, mode: u32) -> std::io::Result<()> {

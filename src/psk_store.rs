@@ -1,7 +1,3 @@
-// Allowed until Phase 5 wires this module into admin enroll/revoke and Phase
-// 4 wires it into the daemon's per-connection PSK lookup.
-#![allow(dead_code)]
-
 //! In-memory PSK store backed by the on-disk `psks` file.
 //!
 //! File format:
@@ -23,8 +19,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-
-use zeroize::Zeroizing;
 
 const PSK_LEN: usize = 32;
 const MAX_IDENTITY_LEN: usize = 64;
@@ -78,13 +72,13 @@ pub enum PskStoreError {
     },
 }
 
-/// In-memory map from identity → 32-byte PSK. Values are wrapped in
-/// `Zeroizing` so they are wiped from memory on remove and on store
-/// drop, defence-in-depth with `mlockall` (anti-swap) and
-/// `LimitCORE=0` (anti-coredump) per AGENTS.md invariant #14.
+/// In-memory map from identity → 32-byte PSK. The post-storage
+/// defence against page exfiltration is operator-side per AGENTS.md
+/// invariant #14: `mlockall(MCL_CURRENT|MCL_FUTURE)` (no swap) plus
+/// `LimitCORE=0` in the systemd unit (no coredump).
 #[derive(Debug, Default)]
 pub struct PskStore {
-    entries: HashMap<String, Zeroizing<[u8; PSK_LEN]>>,
+    entries: HashMap<String, [u8; PSK_LEN]>,
 }
 
 impl PskStore {
@@ -97,7 +91,7 @@ impl PskStore {
     /// Parse a PSK file's contents into a store. Caller passes `path` only for
     /// error context.
     pub fn parse(text: &str, path: &Path) -> Result<Self, PskStoreError> {
-        let mut entries: HashMap<String, Zeroizing<[u8; PSK_LEN]>> = HashMap::new();
+        let mut entries: HashMap<String, [u8; PSK_LEN]> = HashMap::new();
         for (idx, raw) in text.lines().enumerate() {
             let line_no = idx + 1;
             let line = raw.trim_end_matches(['\r', '\n']);
@@ -125,24 +119,17 @@ impl PskStore {
 
     /// Look up a PSK by identity. Returns `None` if the identity is not enrolled.
     pub fn lookup(&self, identity: &str) -> Option<&[u8; PSK_LEN]> {
-        self.entries.get(identity).map(|z| &**z)
+        self.entries.get(identity)
     }
 
-    /// Insert or replace an identity's PSK. The prior value (if any)
-    /// is dropped through `Zeroizing`, wiping it from memory.
+    /// Insert or replace an identity's PSK.
     pub fn insert(&mut self, identity: String, psk: [u8; PSK_LEN]) {
-        self.entries.insert(identity, Zeroizing::new(psk));
+        self.entries.insert(identity, psk);
     }
 
-    /// Remove an identity. Returns whether anything was removed. The
-    /// removed PSK is wiped through `Zeroizing`.
+    /// Remove an identity. Returns whether anything was removed.
     pub fn remove(&mut self, identity: &str) -> bool {
         self.entries.remove(identity).is_some()
-    }
-
-    /// Iterate identities in arbitrary order. Useful for listing.
-    pub fn identities(&self) -> impl Iterator<Item = &str> {
-        self.entries.keys().map(String::as_str)
     }
 
     /// Number of enrolled identities.
@@ -160,7 +147,7 @@ impl PskStore {
             let psk = self.entries.get(k).expect("key from same map");
             out.push_str(k);
             out.push(':');
-            out.push_str(&hex::encode(psk.as_slice()));
+            out.push_str(&hex::encode(psk));
             out.push('\n');
         }
         out
@@ -188,11 +175,7 @@ fn validate_identity(id: &str, path: &Path, line: usize) -> Result<(), PskStoreE
     Ok(())
 }
 
-fn decode_psk_hex(
-    hex_str: &str,
-    path: &Path,
-    line: usize,
-) -> Result<Zeroizing<[u8; PSK_LEN]>, PskStoreError> {
+fn decode_psk_hex(hex_str: &str, path: &Path, line: usize) -> Result<[u8; PSK_LEN], PskStoreError> {
     if hex_str.len() != PSK_LEN * 2 {
         return Err(PskStoreError::BadPskHexLen {
             path: path.to_path_buf(),
@@ -200,8 +183,8 @@ fn decode_psk_hex(
             got: hex_str.len(),
         });
     }
-    let mut out = Zeroizing::new([0u8; PSK_LEN]);
-    hex::decode_to_slice(hex_str, out.as_mut_slice()).map_err(|e| match e {
+    let mut out = [0u8; PSK_LEN];
+    hex::decode_to_slice(hex_str, &mut out).map_err(|e| match e {
         hex::FromHexError::InvalidHexCharacter { c, .. } => PskStoreError::BadPskHex {
             path: path.to_path_buf(),
             line,

@@ -225,16 +225,7 @@ Pinned in `Cargo.toml`:
   `tests::known_vector_matches_jsonwebtoken_baseline`. RSASSA-
   PKCS1-v1_5 with SHA-256 is one of the most thoroughly specified
   JOSE algorithms; the actual signing is a single `rsa::SigningKey`
-  call. `rsa` 0.9 carries `zeroize` as a non-optional transitive
-  dep, so `RsaPrivateKey` zeroes its key material on drop with no
-  feature opt-in needed.
-- `zeroize` (the `Zeroizing<[u8; 32]>` wrapper used in
-  `src/psk_store.rs` so per-client PSKs are wiped from memory on
-  `revoke` / drop, complementing the `mlockall` + `LimitCORE=0`
-  secrets-off-disk story per AGENTS.md invariant #14. The
-  freshly-generated PSK in `src/admin.rs::generate_psk_key` and
-  the per-connection stack copy in `src/daemon.rs::handle_connection`
-  use the same wrapper so the bytes never linger on a stack frame.)
+  call.
 - `hex` (encode/decode for the per-line PSK file format in
   `src/psk_store.rs`, the enroll output's `psk_hex` field in
   `src/admin.rs`, and the client binary's PSK file load in

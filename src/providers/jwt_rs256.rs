@@ -1,16 +1,6 @@
-//! Minimal RS256 JWS signer.
-//!
-//! Replaces `jsonwebtoken` for the one algorithm we actually use
-//! (RSASSA-PKCS1-v1_5 with SHA-256, JWA `alg = "RS256"`). Dropping
-//! the broader crate removes its monolithic `Algorithm` enum and
-//! the dead crypto paths the linker can't prove unreachable
-//! (`ed25519-dalek`, `curve25519-dalek`, `p256`, `p384`, `hmac`) —
-//! ~80–120 KB of `.text`.
-//!
-//! Header format is fixed at `{"typ":"JWT","alg":"RS256"}` — the
-//! same shape jsonwebtoken emits and what GitHub's App API
-//! accepts. We pin byte-equivalence with the prior implementation
-//! in `test::known_vector_matches_jsonwebtoken_baseline`.
+//! Minimal RS256 JWS signer: RSASSA-PKCS1-v1_5 with SHA-256, JWA
+//! `alg = "RS256"`. The only JOSE algorithm the GitHub provider
+//! uses. Header format is fixed at `{"typ":"JWT","alg":"RS256"}`.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -136,20 +126,16 @@ mod tests {
         assert_eq!(token.split('.').count(), 3);
     }
 
-    /// Pin byte-equivalence with the jsonwebtoken baseline
-    /// captured before the swap (R5). RSASSA-PKCS1-v1_5 is
-    /// deterministic — the token is fully reproducible for given
-    /// claims + key. If this test ever fails, either our
-    /// serialisation drifted (claim ordering, header shape) or
-    /// `rsa`/`sha2` upstream changed the signature output.
+    /// Pin the exact signed token. RSASSA-PKCS1-v1_5 is
+    /// deterministic — given the same claims + key, the token is
+    /// fully reproducible. If this fails, our serialisation
+    /// drifted (claim ordering, header shape) or `rsa`/`sha2`
+    /// upstream changed the signature output.
     #[test]
-    fn known_vector_matches_jsonwebtoken_baseline() {
+    fn known_vector_round_trip() {
         let expected = "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJJdjEudGVzdDQyIiwiaWF0IjoxNjk5OTk5OTQwLCJleHAiOjE3MDAwMDA1NDB9.yPTDonwO4souVu_3nk7Aq8ZbiAq3PBVLHRJ5J6B67JHmUxVh-yvIoXdQ8O_EAqj-H57GKRAo_b0nu6hQT_keD9-wB_ah8DC_ZqtV42S3jHACWAdEG066W1XdKUftU82QkdSM5hrpdg9OvFN6i7m0ObCJi3uJMWXYb8lY1LYJew0SWajBzLKQjw47Qmbq-AYiTgkdBoRfK5TrD64u6wd0aQCathxELkaiEacilUtU6ZH8jOQ_W5hYjjwxjTF7wbNWdx-v7M3yUSUn_01Sn9w2bTLeimsP4e81ydchLhIeJED4iF-j-QG_uBlhp0auwTPYqPaG6Zh-qhbkE0DJaV-log";
         let key = JwtSigningKey::from_pem(&fixture_pem_bytes()).unwrap();
         let got = key.sign_rs256(&test_claims()).unwrap();
-        assert_eq!(
-            got, expected,
-            "R5 RS256 swap must remain byte-equivalent to jsonwebtoken baseline"
-        );
+        assert_eq!(got, expected, "RS256 signature must be reproducible");
     }
 }

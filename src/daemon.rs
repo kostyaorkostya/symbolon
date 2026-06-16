@@ -1,33 +1,12 @@
-//! Daemon: bind the TCP listen socket the client connects to, accept
-//! connections, and run the per-connection state machine defined in
-//! `docs/PROTOCOLS.md`:
+//! Daemon: TCP accept loop driving `transport::Responder` per
+//! connection, plus the admin UDS loop and SIGHUP reload glue.
 //!
-//! Identity prelude → PSK lookup → Noise NNpsk0 handshake →
-//! git-credential parse → byte-exact host dispatch → provider mint →
-//! write response (encrypted via the Noise transport).
+//! Per-connection errors do not propagate: each failure point logs
+//! a structured event (`evt=prelude_invalid` /
+//! `evt=handshake_failed` / `evt=mint_denied` /
+//! `evt=provider_error` / `evt=mint`) and drops the connection.
 //!
-//! Per-connection errors do not propagate to the caller: each branch
-//! of the state machine emits the corresponding structured JSON log
-//! event (`evt=prelude_invalid`, `evt=handshake_failed`,
-//! `evt=mint_denied`, `evt=provider_error`, `evt=mint`) and closes
-//! the connection without writing a response. Per AGENTS.md invariant
-//! #7 the PSK identity from the Noise handshake is the daemon's sole
-//! source of client identity.
-//!
-//! Lifecycle: three long-lived tasks are spawned by `run`:
-//! the admin loop, the SIGHUP handler, and a SIGTERM/SIGINT watcher.
-//! Their `JoinHandle`s are kept in locals and `await`ed in `run`
-//! before it returns — structured concurrency, per the user's
-//! "all futures must return or have a timeout" rule. The watcher
-//! triggers `state.shutdown` (a compio `CancelToken`) on either
-//! signal; the admin loop and SIGHUP loop also race their work
-//! against `shutdown.wait()` and exit cleanly on cancellation. The
-//! per-connection handler tasks are the one exception: they keep
-//! `spawn(...).detach()` and are tracked via `DrainGuard` /
-//! `inflight: Cell<usize>` — bounded by `PER_CONNECTION_TIMEOUT`
-//! (5 s) and a 5 s drain deadline before sockets unlink. The
-//! `evt=shutdown` event is then logged. `SIGHUP` re-reads
-//! `clients.json` and swaps the in-memory table.
+//! See `docs/ARCHITECTURE.md` for the full lifecycle picture.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -474,6 +453,9 @@ async fn reload_clients_inner(state: &SharedState, path: &Path) {
     };
     let client_count = new_table.len();
     let psk_count = new_psks.len();
+    // No `.await` between these two assignments: the single-threaded
+    // compio runtime means no other task observes a split where
+    // `clients` has been swapped but `psks` hasn't (or vice-versa).
     *state.clients.borrow_mut() = new_table;
     *state.psks.borrow_mut() = new_psks;
     info!(
@@ -685,7 +667,7 @@ async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<Shar
 
             Step::NeedPsk { identity } => {
                 let psk = match state.psks.borrow().lookup(&identity) {
-                    Some(p) => zeroize::Zeroizing::new(*p),
+                    Some(p) => *p,
                     None => {
                         warn!(
                             req_id = %req_id,
@@ -716,7 +698,7 @@ async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<Shar
                     peer = ?peer,
                 );
                 client_name = Some(client.name);
-                if let Err(e) = sess.set_psk(*psk) {
+                if let Err(e) = sess.set_psk(psk) {
                     log_session_failure(&req_id, peer, sess.phase(), client_name.as_deref(), &e);
                     return;
                 }
@@ -874,11 +856,10 @@ async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<Shar
     }
 }
 
-/// Map a `SessionError` raised inside the responder state machine to
-/// the event the daemon would have logged with the old imperative code.
-/// Phase is the state we were in BEFORE the failing call — used for
-/// `FrameTooBig` whose meaning depends on whether we were doing the
-/// handshake or the transport read.
+/// Map a `SessionError` from the responder state machine to its
+/// log event. `phase` is the state we were in BEFORE the failing
+/// call — used for `FrameTooBig` whose meaning depends on whether
+/// we were doing the handshake or the transport read.
 fn log_session_failure(
     req_id: &str,
     peer: Option<std::net::SocketAddr>,

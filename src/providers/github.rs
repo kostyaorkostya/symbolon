@@ -21,6 +21,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::info;
 
 use crate::providers::jwt_rs256::{self, JwtSigningKey};
+use compio::bytes::Bytes;
 use compio::runtime::CancelToken;
 use cyper::redirect;
 use futures_util::FutureExt;
@@ -69,16 +70,10 @@ struct RepoIdCache(RefCell<HashMap<String, CacheEntry>>);
 
 enum CacheEntry {
     Done { id: u64, expires_at: SystemTime },
-    // Single-flight: when one mint task is resolving a key, other
-    // mint tasks for the same key store a clone of this Event and
-    // await `listen()` instead of issuing a duplicate resolve. The
-    // resolver `notify`s on completion (success or failure), and
-    // waiters retry the lookup — Done(id) by then, or evicted on
-    // failure. `event_listener::Event` (re-exported by synchrony)
-    // is the multi-listener primitive needed here:
-    // `synchrony::AsyncFlag::wait` consumes the flag and only
-    // supports one waiter, which doesn't fit N concurrent mints
-    // for the same uncached repo.
+    // Singleflight: concurrent mints for the same key share this
+    // Event. The resolver notifies all listeners on completion;
+    // waiters re-check the cache. `Event` is the multi-listener
+    // primitive — `AsyncFlag::wait` would only wake one waiter.
     InFlight(Rc<synchrony::sync::event::Event>),
 }
 
@@ -328,68 +323,46 @@ impl GitHubProvider {
     /// reachable at `api_base`. The reported App ID must match the
     /// configured one — a mismatch indicates a wrong key/App pairing.
     pub async fn selfcheck(&self, req_id: &str) -> Result<SelfcheckOutcome, GithubError> {
-        let (mut outcome, out_req_id, gh_req_id) = self
+        let (outcome, _, _) = self
             .with_breadcrumbs(req_id, "selfcheck", self.selfcheck_timeout, |out| {
                 self.selfcheck_inner(out)
             })
             .await?;
-        outcome.out_req_id = out_req_id;
-        outcome.gh_req_id = gh_req_id;
         Ok(outcome)
     }
 
+    /// `GET /app` to verify reachability + key/App pairing. Unlike
+    /// the other endpoints we need the `Date` response header for
+    /// clock-skew reporting, which has to be read BEFORE the body
+    /// consumes the response — so the request building uses the
+    /// shared `build_request` helper, but `http_call` is not.
     async fn selfcheck_inner(&self, out_req_id: String) -> ProviderCall<SelfcheckOutcome> {
         let jwt = match self.sign_jwt_now().await {
             Ok(j) => j,
-            Err(e) => {
-                return ProviderCall {
-                    status: 0,
-                    gh_req_id: None,
-                    result: Err(e),
-                };
-            }
+            Err(e) => return ProviderCall::pre_send(e),
         };
         let url = format!("{}/app", self.api_base);
-        let req = match self
-            .client
-            .get(&url)
-            .and_then(|r| r.bearer_auth(&jwt))
-            .and_then(|r| r.header("Accept", ACCEPT_HEADER))
-            .and_then(|r| r.header("X-GitHub-Api-Version", GITHUB_API_VERSION))
-            .and_then(|r| r.header("User-Agent", &self.user_agent))
-            .and_then(|r| r.header(X_REQUEST_ID_HEADER, &out_req_id))
-            .and_then(|r| {
-                r.header(
-                    REQUEST_TIMEOUT_HEADER,
-                    &self.selfcheck_timeout.as_secs().to_string(),
-                )
-            }) {
+        let req = match self.build_request(
+            Method::Get,
+            &url,
+            &jwt,
+            None,
+            &out_req_id,
+            self.selfcheck_timeout,
+        ) {
             Ok(r) => r,
-            Err(e) => {
-                return ProviderCall {
-                    status: 0,
-                    gh_req_id: None,
-                    result: Err(GithubError::from(e)),
-                };
-            }
+            Err(e) => return ProviderCall::pre_send(GithubError::from(e)),
         };
         let resp = match req.send().await {
             Ok(r) => r,
-            Err(e) => {
-                return ProviderCall {
-                    status: 0,
-                    gh_req_id: None,
-                    result: Err(GithubError::from(e)),
-                };
-            }
+            Err(e) => return ProviderCall::pre_send(GithubError::from(e)),
         };
         let status = resp.status().as_u16();
         let gh_req_id = read_gh_req_id(&resp);
         // HTTP `Date` header (IMF-fixdate per RFC 7231 § 7.1.1.1) is
         // accepted by `time`'s Rfc2822 parser (`GMT` → zero offset).
         // Silently 0 if the header is missing or unparseable; clock
-        // skew is informational, not a hard failure. Read BEFORE
-        // `resp.bytes()` since that consumes the response.
+        // skew is informational, not a hard failure.
         let clock_skew_sec = resp
             .headers()
             .get("date")
@@ -409,25 +382,14 @@ impl GitHubProvider {
                 };
             }
         };
-        let err: Option<GithubError> = match status {
-            200 => None,
-            401 => Some(GithubError::Unauthorized {
-                body: parse_github_error_body(&body),
-            }),
-            403 => Some(GithubError::Forbidden {
-                body: parse_github_error_body(&body),
-            }),
-            500..=599 => Some(GithubError::ServerError(status)),
-            other => Some(GithubError::UnexpectedStatus(other)),
-        };
-        if let Some(e) = err {
+        if status != 200 {
             return ProviderCall {
                 status,
                 gh_req_id,
-                result: Err(e),
+                result: Err(map_common_status(status, &body)),
             };
         }
-        let parsed: Result<SelfcheckOutcome, GithubError> = (|| {
+        let parsed = (|| {
             let v: serde_json::Value =
                 serde_json::from_slice(&body).map_err(|_| GithubError::JsonParse {
                     context: "selfcheck",
@@ -450,8 +412,8 @@ impl GitHubProvider {
                 installation_id: self.installation_id,
                 api_base: self.api_base.clone(),
                 clock_skew_sec,
-                out_req_id: String::new(),
-                gh_req_id: None,
+                out_req_id: out_req_id.clone(),
+                gh_req_id: gh_req_id.clone(),
             })
         })();
         ProviderCall {
@@ -578,177 +540,60 @@ impl GitHubProvider {
             utf8_percent_encode(owner, REPO_PATH_SAFE),
             utf8_percent_encode(repo, REPO_PATH_SAFE),
         );
-        let req = match self
-            .client
-            .get(&url)
-            .and_then(|r| r.bearer_auth(install_token))
-            .and_then(|r| r.header("Accept", ACCEPT_HEADER))
-            .and_then(|r| r.header("X-GitHub-Api-Version", GITHUB_API_VERSION))
-            .and_then(|r| r.header("User-Agent", &self.user_agent))
-            .and_then(|r| r.header(X_REQUEST_ID_HEADER, &out_req_id))
-            .and_then(|r| {
-                r.header(
-                    REQUEST_TIMEOUT_HEADER,
-                    &self.request_timeout.as_secs().to_string(),
-                )
-            }) {
-            Ok(r) => r,
-            Err(e) => {
-                return ProviderCall {
-                    status: 0,
-                    gh_req_id: None,
-                    result: Err(GithubError::from(e)),
-                };
-            }
-        };
-        let resp = match req.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                return ProviderCall {
-                    status: 0,
-                    gh_req_id: None,
-                    result: Err(GithubError::from(e)),
-                };
-            }
-        };
-        let status = resp.status().as_u16();
-        let gh_req_id = read_gh_req_id(&resp);
-        let body = match resp.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                return ProviderCall {
-                    status,
-                    gh_req_id,
-                    result: Err(GithubError::from(e)),
-                };
-            }
-        };
-        let err: Option<GithubError> = match status {
-            200 => None,
-            401 => Some(GithubError::Unauthorized {
-                body: parse_github_error_body(&body),
-            }),
-            403 => Some(GithubError::Forbidden {
-                body: parse_github_error_body(&body),
-            }),
-            404 => Some(GithubError::RepoNotFound {
+        let call = self
+            .http_call(
+                Method::Get,
+                &url,
+                install_token,
+                None,
+                &out_req_id,
+                self.request_timeout,
+            )
+            .await;
+        let status = call.status;
+        call.map(|body| match status {
+            200 => parse_repo_response(&body),
+            404 => Err(GithubError::RepoNotFound {
                 path: format!("{owner}/{repo}"),
             }),
-            429 => Some(GithubError::RateLimited),
-            500..=599 => Some(GithubError::ServerError(status)),
-            _ => Some(GithubError::UnexpectedStatus(status)),
-        };
-        if let Some(e) = err {
-            return ProviderCall {
-                status,
-                gh_req_id,
-                result: Err(e),
-            };
-        }
-        ProviderCall {
-            status,
-            gh_req_id,
-            result: parse_repo_response(&body),
-        }
+            s => Err(map_common_status(s, &body)),
+        })
     }
 
     /// Mint a metadata-only installation token (no
     /// `repository_ids`, `permissions: {metadata: read}`). Used to
     /// authenticate the `/repos/{owner}/{repo}` lookup that
-    /// precedes the actual narrow-scope mint. Same response shape
-    /// as a regular mint; only the request body differs.
+    /// precedes the actual narrow-scope mint. 404 here means
+    /// "installation not found" — surfaced as `UnexpectedStatus`
+    /// rather than `RepoNotFound` since this mint isn't repo-scoped.
     async fn mint_metadata_token_inner(
         &self,
         out_req_id: String,
     ) -> ProviderCall<(String, SystemTime)> {
         let jwt = match self.sign_jwt_now().await {
             Ok(j) => j,
-            Err(e) => {
-                return ProviderCall {
-                    status: 0,
-                    gh_req_id: None,
-                    result: Err(e),
-                };
-            }
+            Err(e) => return ProviderCall::pre_send(e),
         };
         let url = format!(
             "{}/app/installations/{}/access_tokens",
             self.api_base, self.installation_id
         );
         let body = build_metadata_token_body();
-        let req = match self
-            .client
-            .post(&url)
-            .and_then(|r| r.bearer_auth(&jwt))
-            .and_then(|r| r.header("Accept", ACCEPT_HEADER))
-            .and_then(|r| r.header("X-GitHub-Api-Version", GITHUB_API_VERSION))
-            .and_then(|r| r.header("User-Agent", &self.user_agent))
-            .and_then(|r| r.header("Content-Type", "application/json"))
-            .and_then(|r| r.header(X_REQUEST_ID_HEADER, &out_req_id))
-            .and_then(|r| {
-                r.header(
-                    REQUEST_TIMEOUT_HEADER,
-                    &self.request_timeout.as_secs().to_string(),
-                )
-            }) {
-            Ok(r) => r.body(body),
-            Err(e) => {
-                return ProviderCall {
-                    status: 0,
-                    gh_req_id: None,
-                    result: Err(GithubError::from(e)),
-                };
-            }
-        };
-        let resp = match req.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                return ProviderCall {
-                    status: 0,
-                    gh_req_id: None,
-                    result: Err(GithubError::from(e)),
-                };
-            }
-        };
-        let status = resp.status().as_u16();
-        let gh_req_id = read_gh_req_id(&resp);
-        let bytes = match resp.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                return ProviderCall {
-                    status,
-                    gh_req_id,
-                    result: Err(GithubError::from(e)),
-                };
-            }
-        };
-        let err: Option<GithubError> = match status {
-            201 => None,
-            401 => Some(GithubError::Unauthorized {
-                body: parse_github_error_body(&bytes),
-            }),
-            403 => Some(GithubError::Forbidden {
-                body: parse_github_error_body(&bytes),
-            }),
-            429 => Some(GithubError::RateLimited),
-            500..=599 => Some(GithubError::ServerError(status)),
-            // 404 here means "installation not found" — surface as
-            // UnexpectedStatus rather than RepoNotFound, since this
-            // mint isn't repo-scoped.
-            _ => Some(GithubError::UnexpectedStatus(status)),
-        };
-        if let Some(e) = err {
-            return ProviderCall {
-                status,
-                gh_req_id,
-                result: Err(e),
-            };
-        }
-        ProviderCall {
-            status,
-            gh_req_id,
-            result: parse_mint_response(&bytes),
-        }
+        let call = self
+            .http_call(
+                Method::Post,
+                &url,
+                &jwt,
+                Some(&body),
+                &out_req_id,
+                self.request_timeout,
+            )
+            .await;
+        let status = call.status;
+        call.map(|bytes| match status {
+            201 => parse_mint_response(&bytes),
+            s => Err(map_common_status(s, &bytes)),
+        })
     }
 
     async fn mint_token(
@@ -773,56 +618,95 @@ impl GitHubProvider {
     ) -> ProviderCall<(String, SystemTime)> {
         let jwt = match self.sign_jwt_now().await {
             Ok(j) => j,
-            Err(e) => {
-                return ProviderCall {
-                    status: 0,
-                    gh_req_id: None,
-                    result: Err(e),
-                };
-            }
+            Err(e) => return ProviderCall::pre_send(e),
         };
         let url = format!(
             "{}/app/installations/{}/access_tokens",
             self.api_base, self.installation_id
         );
         let body = build_mint_body(repo_id);
-        let req = match self
-            .client
-            .post(&url)
-            .and_then(|r| r.bearer_auth(&jwt))
-            .and_then(|r| r.header("Accept", ACCEPT_HEADER))
-            .and_then(|r| r.header("X-GitHub-Api-Version", GITHUB_API_VERSION))
-            .and_then(|r| r.header("User-Agent", &self.user_agent))
-            .and_then(|r| r.header("Content-Type", "application/json"))
-            .and_then(|r| r.header(X_REQUEST_ID_HEADER, &out_req_id))
-            .and_then(|r| {
-                r.header(
-                    REQUEST_TIMEOUT_HEADER,
-                    &self.request_timeout.as_secs().to_string(),
-                )
-            }) {
-            Ok(r) => r.body(body),
-            Err(e) => {
-                return ProviderCall {
-                    status: 0,
-                    gh_req_id: None,
-                    result: Err(GithubError::from(e)),
-                };
-            }
+        let call = self
+            .http_call(
+                Method::Post,
+                &url,
+                &jwt,
+                Some(&body),
+                &out_req_id,
+                self.request_timeout,
+            )
+            .await;
+        let status = call.status;
+        call.map(|bytes| match status {
+            201 => parse_mint_response(&bytes),
+            404 => Err(GithubError::RepoNotFound {
+                path: path.to_string(),
+            }),
+            s => Err(map_common_status(s, &bytes)),
+        })
+    }
+
+    async fn sign_jwt_now(&self) -> Result<String, GithubError> {
+        let claims = build_claims((self.clock)(), &self.client_id);
+        self.signer.sign(claims).await
+    }
+
+    /// Build a `RequestBuilder` with the shared GitHub headers
+    /// (Accept, API-Version, User-Agent, X-Request-ID,
+    /// Request-Timeout) and bearer auth applied. POST callers
+    /// receive a builder with `Content-Type: application/json` and
+    /// `json_body` already attached.
+    fn build_request(
+        &self,
+        method: Method,
+        url: &str,
+        bearer: &str,
+        json_body: Option<&[u8]>,
+        out_req_id: &str,
+        timeout: Duration,
+    ) -> Result<cyper::RequestBuilder, cyper::Error> {
+        let req = match method {
+            Method::Get => self.client.get(url)?,
+            Method::Post => self.client.post(url)?,
+        };
+        let mut req = req
+            .bearer_auth(bearer)?
+            .header("Accept", ACCEPT_HEADER)?
+            .header("X-GitHub-Api-Version", GITHUB_API_VERSION)?
+            .header("User-Agent", &self.user_agent)?
+            .header(X_REQUEST_ID_HEADER, out_req_id)?
+            .header(REQUEST_TIMEOUT_HEADER, &timeout.as_secs().to_string())?;
+        if let Some(body) = json_body {
+            req = req
+                .header("Content-Type", "application/json")?
+                .body(body.to_vec());
+        }
+        Ok(req)
+    }
+
+    /// Send a fully-built request and return the raw response body
+    /// alongside `status` + `gh_req_id`. Callers inspect `status`
+    /// and either parse `result` as a success body or coerce it
+    /// into an endpoint-specific error.
+    async fn http_call(
+        &self,
+        method: Method,
+        url: &str,
+        bearer: &str,
+        json_body: Option<&[u8]>,
+        out_req_id: &str,
+        timeout: Duration,
+    ) -> ProviderCall<Bytes> {
+        let req = match self.build_request(method, url, bearer, json_body, out_req_id, timeout) {
+            Ok(r) => r,
+            Err(e) => return ProviderCall::pre_send(GithubError::from(e)),
         };
         let resp = match req.send().await {
             Ok(r) => r,
-            Err(e) => {
-                return ProviderCall {
-                    status: 0,
-                    gh_req_id: None,
-                    result: Err(GithubError::from(e)),
-                };
-            }
+            Err(e) => return ProviderCall::pre_send(GithubError::from(e)),
         };
         let status = resp.status().as_u16();
         let gh_req_id = read_gh_req_id(&resp);
-        let bytes = match resp.bytes().await {
+        let body = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
                 return ProviderCall {
@@ -832,38 +716,29 @@ impl GitHubProvider {
                 };
             }
         };
-        let err: Option<GithubError> = match status {
-            201 => None,
-            401 => Some(GithubError::Unauthorized {
-                body: parse_github_error_body(&bytes),
-            }),
-            403 => Some(GithubError::Forbidden {
-                body: parse_github_error_body(&bytes),
-            }),
-            404 => Some(GithubError::RepoNotFound {
-                path: path.to_string(),
-            }),
-            429 => Some(GithubError::RateLimited),
-            500..=599 => Some(GithubError::ServerError(status)),
-            _ => Some(GithubError::UnexpectedStatus(status)),
-        };
-        if let Some(e) = err {
-            return ProviderCall {
-                status,
-                gh_req_id,
-                result: Err(e),
-            };
-        }
         ProviderCall {
             status,
             gh_req_id,
-            result: parse_mint_response(&bytes),
+            result: Ok(body),
         }
     }
+}
 
-    async fn sign_jwt_now(&self) -> Result<String, GithubError> {
-        let claims = build_claims((self.clock)(), &self.client_id);
-        self.signer.sign(claims).await
+/// Map the GitHub status codes that are shared across every
+/// endpoint to errors. Endpoint-specific cases (200 vs 201
+/// success, 404 → RepoNotFound) are handled by the caller before
+/// falling through to this helper.
+fn map_common_status(status: u16, body: &Bytes) -> GithubError {
+    match status {
+        401 => GithubError::Unauthorized {
+            body: parse_github_error_body(body),
+        },
+        403 => GithubError::Forbidden {
+            body: parse_github_error_body(body),
+        },
+        429 => GithubError::RateLimited,
+        500..=599 => GithubError::ServerError(status),
+        other => GithubError::UnexpectedStatus(other),
     }
 }
 
@@ -873,15 +748,43 @@ enum CacheAction {
     Resolve(Rc<synchrony::sync::event::Event>),
 }
 
-/// One outbound HTTPS call's bookkeeping: the parsed result, the
-/// response's HTTP status, and the `X-GitHub-Request-Id` header
-/// (if any). Even on error we still want status + gh_req_id for
-/// the `provider_call_done` log line, which is why this isn't a
-/// plain `Result`.
+/// One outbound HTTPS call's bookkeeping. `status` + `gh_req_id`
+/// are carried separately so the `provider_call_done` breadcrumb
+/// can log them even when `result` is an error.
 struct ProviderCall<T> {
     status: u16,
     gh_req_id: Option<String>,
     result: Result<T, GithubError>,
+}
+
+impl<T> ProviderCall<T> {
+    /// Failure with no HTTP exchange (signing failed, builder
+    /// rejected a header, etc.). The breadcrumb logs `status=0`
+    /// and `gh_req_id=""`.
+    fn pre_send(err: GithubError) -> Self {
+        Self {
+            status: 0,
+            gh_req_id: None,
+            result: Err(err),
+        }
+    }
+
+    /// Carry `status` + `gh_req_id` forward while transforming the
+    /// success payload. Used to layer body parsing on top of a raw
+    /// `ProviderCall<bytes::Bytes>` from `http_call`.
+    fn map<U>(self, f: impl FnOnce(T) -> Result<U, GithubError>) -> ProviderCall<U> {
+        ProviderCall {
+            status: self.status,
+            gh_req_id: self.gh_req_id,
+            result: self.result.and_then(f),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Method {
+    Get,
+    Post,
 }
 
 const REQUEST_TIMEOUT_HEADER: &str = "Request-Timeout";
@@ -1001,10 +904,8 @@ fn build_claims(now: SystemTime, client_id: &str) -> JwtClaims {
     }
 }
 
-/// Synchronous JWT signing. RSA-2048 with the App's private key —
-/// ~1-2 ms per call on commodity hardware. NEVER call from the
-/// compio runtime thread directly; the `JwtSigner` worker thread
-/// is the only caller (plus a unit test).
+/// Synchronous RSA-2048 JWT signing; ~1-2 ms per call. MUST run
+/// on the `CpuWorker` thread, never the compio runtime.
 fn sign_jwt_blocking(claims: &JwtClaims, key: &JwtSigningKey) -> Result<String, GithubError> {
     key.sign_rs256(claims).map_err(GithubError::JwtSign)
 }
@@ -1190,13 +1091,13 @@ mod tests {
         assert_eq!(parts.len(), 3);
     }
 
-    /// Pin byte-equivalence with jsonwebtoken's prior output for
-    /// the same (claims, key). The post-swap implementation lives
-    /// in `crate::providers::jwt_rs256` and has its own copy of
-    /// this assertion; this one belongs to the github.rs path so
-    /// `sign_jwt_blocking` itself is exercised.
+    /// Pin the exact signed token for known (claims, key).
+    /// RSASSA-PKCS1-v1_5 is deterministic; the
+    /// `crate::providers::jwt_rs256` test has the same assertion
+    /// for the lower-level helper, this one covers
+    /// `sign_jwt_blocking` end-to-end.
     #[test]
-    fn sign_jwt_blocking_matches_jsonwebtoken_baseline() {
+    fn sign_jwt_blocking_known_vector() {
         let key = JwtSigningKey::from_pem(FIXTURE_PEM.as_bytes()).unwrap();
         let claims = build_claims(t(1_700_000_000), "Iv1.test42");
         let token = sign_jwt_blocking(&claims, &key).unwrap();

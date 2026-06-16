@@ -2271,7 +2271,6 @@ dependencies = [
  "ulid",
  "url",
  "wiremock",
- "zeroize",
 ]
 
 [[package]]

@@ -27,7 +27,6 @@ hex = "0.4.3"
 humantime-serde = "1.1.1"
 landlock = "0.4.5"
 libc = "0.2.186"
-percent-encoding = "2.3.2"
 rsa = { version = "0.9", default-features = false, features = [
   "pem",
   "std",

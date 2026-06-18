@@ -2252,7 +2252,6 @@ dependencies = [
  "humantime-serde",
  "landlock",
  "libc",
- "percent-encoding",
  "rsa",
  "rustix",
  "sd-notify",

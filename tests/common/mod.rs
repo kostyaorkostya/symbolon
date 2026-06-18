@@ -92,9 +92,9 @@ pub fn canonical_mint_body() -> Vec<u8> {
 }
 
 /// Request body for the metadata-only installation token POST that
-/// precedes the `GET /repos/{owner}/{repo}` lookup. Must match
-/// `build_metadata_token_body()` in `src/providers/github.rs` byte
-/// for byte.
+/// precedes the `GET /repos/{owner}/{repo}` lookup. Must match the
+/// inline literal in `src/providers/github.rs::mint_metadata_token_inner`
+/// byte for byte.
 pub fn canonical_metadata_token_body() -> Vec<u8> {
     br#"{"permissions":{"metadata":"read"}}"#.to_vec()
 }

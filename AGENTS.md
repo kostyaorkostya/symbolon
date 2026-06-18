@@ -320,11 +320,6 @@ Pinned in `Cargo.toml`:
   consume-on-wait, which doesn't fit the permanent handler loop.
   `async_flag` feature stays enabled because synchrony co-builds
   the two primitives.)
-- `percent-encoding` (URL component encoding for the owner/repo
-  segments of GitHub API paths. The path parser already rejects
-  any byte outside `[A-Za-z0-9._-]`; the encoding is defense in
-  depth so a future char-class regression cannot become a URL
-  injection.)
 - `url` (parse `api_base` to extract its host string once at
   provider construction. The same-origin redirect policy on
   `cyper::ClientBuilder` compares `attempt.url().host_str()`

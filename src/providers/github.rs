@@ -401,14 +401,14 @@ impl GitHubProvider {
             Method::Post => self.client.post(url),
         }?
         .bearer_auth(bearer)?
-        .header("Accept", ACCEPT_HEADER)?
-        .header("X-GitHub-Api-Version", GITHUB_API_VERSION)?
-        .header("User-Agent", &self.user_agent)?
+        .header("accept", ACCEPT_HEADER)?
+        .header("x-github-api-version", GITHUB_API_VERSION)?
+        .header("user-agent", &self.user_agent)?
         .header(X_REQUEST_ID_HEADER, out_req_id)?
         .header(REQUEST_TIMEOUT_HEADER, &timeout.as_secs().to_string())?;
         if let Some(body) = json_body {
             req = req
-                .header("Content-Type", "application/json")?
+                .header("content-type", "application/json")?
                 .body(body.to_vec());
         }
         Ok(req)
@@ -731,8 +731,8 @@ struct MintToken {
 // HTTP plumbing
 // ============================================================================
 
-const REQUEST_TIMEOUT_HEADER: &str = "Request-Timeout";
-const X_REQUEST_ID_HEADER: &str = "X-Request-ID";
+const REQUEST_TIMEOUT_HEADER: &str = "request-timeout";
+const X_REQUEST_ID_HEADER: &str = "x-request-id";
 const GH_REQUEST_ID_HEADER: &str = "x-github-request-id";
 
 #[derive(Clone, Copy)]

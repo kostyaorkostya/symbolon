@@ -98,16 +98,16 @@ async fn mint_request_headers_and_body_exact() {
     mount_repo_ok(&server).await;
     Mock::given(method("POST"))
         .and(path(mint_path()))
-        .and(header("Accept", "application/vnd.github+json"))
-        .and(header("X-GitHub-Api-Version", "2026-03-10"))
-        .and(header("User-Agent", "symbolon"))
-        .and(header("Content-Type", "application/json"))
-        // X-Request-ID is a per-call ULID; just assert presence
+        .and(header("accept", "application/vnd.github+json"))
+        .and(header("x-github-api-version", "2026-03-10"))
+        .and(header("user-agent", "symbolon"))
+        .and(header("content-type", "application/json"))
+        // x-request-id is a per-call ULID; just assert presence
         // (per-call value is non-deterministic).
-        .and(header_exists("X-Request-ID"))
-        // Request-Timeout is derived from the per-call timeout (10s
+        .and(header_exists("x-request-id"))
+        // request-timeout is derived from the per-call timeout (10s
         // for mint per test fixture).
-        .and(header("Request-Timeout", "10"))
+        .and(header("request-timeout", "10"))
         .and(body_bytes(canonical_mint_body()))
         .respond_with(
             ResponseTemplate::new(201)
@@ -132,7 +132,7 @@ async fn mint_surfaces_github_request_id() {
         .and(path(mint_path()))
         .respond_with(
             ResponseTemplate::new(201)
-                .insert_header("X-GitHub-Request-Id", "ABC:DEF:1234")
+                .insert_header("x-github-request-id", "ABC:DEF:1234")
                 .set_body_json(json!({"token": TOKEN, "expires_at": EXPIRES_AT})),
         )
         .mount(&server)

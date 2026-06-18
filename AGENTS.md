@@ -382,6 +382,20 @@ Addenda:
   invariants, surprising edge cases, security-load-bearing rules
   (e.g. the CR/LF rejection in `git_credential`). Don't restate what
   well-named code already says.
+- Prefer `?` over `match { Ok(v) => v, Err(e) => return Err(<conv>) }`.
+  Add `impl From<OtherError> for <YourError>` next to the enum so
+  `?` performs the conversion automatically (see
+  `impl From<WorkerDead> for GithubError`). For error constructors
+  that need extra context (e.g. status code + body), use an
+  inherent `Self::from_*` method on the enum rather than a free
+  function or a tuple-receiving `From`.
+- RAII guards: default Drop is the rollback path; the success
+  path is an explicit `commit_*` method that consumes `self` and
+  transitions an internal state, so the shared Drop logic still
+  fires. See `InFlightGuard` in `src/providers/github.rs`: default
+  state is `Failed` (invalidate + notify on Drop); `commit_done`
+  transitions to `Done` (put_done + notify on Drop). Avoids
+  `armed: bool` + a separate `disarm_and_notify` shape.
 
 ## Diagnostic discipline (mandatory)
 

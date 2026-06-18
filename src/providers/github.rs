@@ -108,6 +108,31 @@ impl From<cyper::Error> for GithubError {
     }
 }
 
+impl From<WorkerDead> for GithubError {
+    fn from(_: WorkerDead) -> Self {
+        GithubError::JwtSignerDead
+    }
+}
+
+impl GithubError {
+    /// Map the GitHub HTTP status codes shared across every
+    /// endpoint to an error. Endpoint-specific cases (200 vs 201
+    /// success, 404 → `RepoNotFound`) are handled by the caller
+    /// before they fall through here.
+    fn from_common_status(status: u16, body: &Bytes) -> Self {
+        match status {
+            401 => Self::Unauthorized {
+                body: parse_github_error_body(body),
+            },
+            403 => Self::Forbidden {
+                body: parse_github_error_body(body),
+            },
+            429 => Self::RateLimited,
+            other => Self::OtherStatus(other),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SelfcheckOutcome {
     pub(crate) client_id: String,
@@ -466,18 +491,15 @@ impl GitHubProvider {
                     // raced ahead leaving Done expired.
                 }
                 CacheAction::Resolve(ev) => {
-                    // RAII: if the resolve future is dropped (shutdown,
-                    // caller cancel), the guard invalidates the
-                    // InFlight entry and wakes any waiters so they
-                    // retry rather than block forever on a notify
-                    // that will never come.
-                    let mut guard = InFlightGuard::new(&self.repo_ids, key, ev);
+                    // RAII: the guard defaults to Failed (invalidate
+                    // + notify on Drop) so a cancelled/errored resolve
+                    // wakes waiters automatically. `commit_done`
+                    // transitions to Done (put_done + notify).
+                    let guard = InFlightGuard::new(&self.repo_ids, key, ev);
                     let result = self.resolve_repo_id(req_id, owner, repo).await;
-                    match &result {
-                        Ok(id) => self.repo_ids.put_done(key, *id, now + CACHE_TTL),
-                        Err(_) => self.repo_ids.invalidate(key),
+                    if let Ok(id) = &result {
+                        guard.commit_done(*id, now + CACHE_TTL);
                     }
-                    guard.disarm_and_notify();
                     return result;
                 }
             }
@@ -534,75 +556,61 @@ impl GitHubProvider {
         })
     }
 
-    /// `GET /app` to verify reachability + key/App pairing. Unlike
-    /// the other endpoints we need the `Date` response header for
-    /// clock-skew reporting, which has to be read BEFORE the body
-    /// consumes the response — so the request building uses the
-    /// shared `build_request` helper, but `http_call` is not.
+    /// `GET /app` to verify reachability + key/App pairing.
+    /// Unlike the other endpoints, this one reads the `Date`
+    /// response header for clock-skew reporting BEFORE consuming
+    /// the body, so it can't use the body-eating `http_call`
+    /// helper. The async block lets `?` propagate inside the
+    /// future while the surrounding scope captures status +
+    /// gh_req_id for the partial-failure `ProviderCall`.
     async fn selfcheck_inner(&self, out_req_id: String) -> ProviderCall<SelfcheckOutcome> {
-        let jwt = match self.sign_jwt_now().await {
-            Ok(j) => j,
-            Err(e) => return ProviderCall::pre_send(e),
-        };
-        let url = format!("{}/app", self.api_base);
-        let req = match self.build_request(
-            Method::Get,
-            &url,
-            &jwt,
-            None,
-            &out_req_id,
-            self.selfcheck_timeout,
-        ) {
-            Ok(r) => r,
-            Err(e) => return ProviderCall::pre_send(GithubError::from(e)),
-        };
-        let resp = match req.send().await {
-            Ok(r) => r,
-            Err(e) => return ProviderCall::pre_send(GithubError::from(e)),
-        };
-        let status = resp.status().as_u16();
-        let gh_req_id = read_gh_req_id(&resp);
-        // HTTP `Date` header (IMF-fixdate per RFC 7231 § 7.1.1.1) is
-        // accepted by `time`'s Rfc2822 parser (`GMT` → zero offset).
-        // Silently 0 if the header is missing or unparseable; clock
-        // skew is informational, not a hard failure.
-        let clock_skew_sec = resp
-            .headers()
-            .get("date")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| OffsetDateTime::parse(s, &Rfc2822).ok())
-            .map(|server_t| server_t.unix_timestamp() - OffsetDateTime::now_utc().unix_timestamp())
-            .unwrap_or(0);
-        let body = match resp.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                return ProviderCall {
-                    status,
-                    gh_req_id,
-                    result: Err(GithubError::from(e)),
-                };
+        let mut status: u16 = 0;
+        let mut gh_req_id: Option<String> = None;
+        let result: Result<SelfcheckOutcome, GithubError> = async {
+            let jwt = self.sign_jwt_now().await?;
+            let url = format!("{}/app", self.api_base);
+            let resp = self
+                .send_authenticated(
+                    Method::Get,
+                    &url,
+                    &jwt,
+                    None,
+                    &out_req_id,
+                    self.selfcheck_timeout,
+                )
+                .await?;
+            status = resp.status().as_u16();
+            gh_req_id = read_gh_req_id(&resp);
+            // HTTP `Date` header (IMF-fixdate per RFC 7231 § 7.1.1.1)
+            // is accepted by `time`'s Rfc2822 parser (`GMT` → zero
+            // offset). Silently 0 if the header is missing or
+            // unparseable; clock skew is informational.
+            let clock_skew_sec = resp
+                .headers()
+                .get("date")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| OffsetDateTime::parse(s, &Rfc2822).ok())
+                .map(|t| t.unix_timestamp() - OffsetDateTime::now_utc().unix_timestamp())
+                .unwrap_or(0);
+            let body = resp.bytes().await?;
+            if status != 200 {
+                return Err(GithubError::from_common_status(status, &body));
             }
-        };
-        if status != 200 {
-            return ProviderCall {
-                status,
-                gh_req_id,
-                result: Err(map_common_status(status, &body)),
-            };
+            parse_selfcheck_body(
+                &body,
+                &self.client_id,
+                self.installation_id,
+                &self.api_base,
+                clock_skew_sec,
+                &out_req_id,
+                gh_req_id.as_deref(),
+            )
         }
-        let parsed = parse_selfcheck_body(
-            &body,
-            &self.client_id,
-            self.installation_id,
-            &self.api_base,
-            clock_skew_sec,
-            &out_req_id,
-            gh_req_id.as_deref(),
-        );
+        .await;
         ProviderCall {
             status,
             gh_req_id,
-            result: parsed,
+            result,
         }
     }
 
@@ -635,7 +643,7 @@ impl GitHubProvider {
             404 => Err(GithubError::RepoNotFound {
                 path: format!("{owner}/{repo}"),
             }),
-            s => Err(map_common_status(s, &body)),
+            s => Err(GithubError::from_common_status(s, &body)),
         })
     }
 
@@ -671,7 +679,7 @@ impl GitHubProvider {
         let status = call.status;
         call.map(|bytes| match status {
             201 => parse_mint_response(&bytes),
-            s => Err(map_common_status(s, &bytes)),
+            s => Err(GithubError::from_common_status(s, &bytes)),
         })
     }
 
@@ -706,7 +714,7 @@ impl GitHubProvider {
             404 => Err(GithubError::RepoNotFound {
                 path: path.to_string(),
             }),
-            s => Err(map_common_status(s, &bytes)),
+            s => Err(GithubError::from_common_status(s, &bytes)),
         })
     }
 }
@@ -773,23 +781,6 @@ fn read_gh_req_id(resp: &cyper::Response) -> Option<String> {
         .map(String::from)
 }
 
-/// Map the GitHub status codes that are shared across every
-/// endpoint to errors. Endpoint-specific cases (200 vs 201
-/// success, 404 → RepoNotFound) are handled by the caller before
-/// falling through to this helper.
-fn map_common_status(status: u16, body: &Bytes) -> GithubError {
-    match status {
-        401 => GithubError::Unauthorized {
-            body: parse_github_error_body(body),
-        },
-        403 => GithubError::Forbidden {
-            body: parse_github_error_body(body),
-        },
-        429 => GithubError::RateLimited,
-        other => GithubError::OtherStatus(other),
-    }
-}
-
 // ============================================================================
 // Repo-ID cache
 // ============================================================================
@@ -844,17 +835,21 @@ impl RepoIdCache {
     }
 }
 
-/// Holds the InFlight claim for the resolver task. On `Drop` (i.e.
-/// the resolver future was cancelled mid-flight) the guard
-/// invalidates the cache entry and notifies waiters so they retry
-/// the lookup. The resolver disarms the guard via
-/// `disarm_and_notify` once it has explicitly committed put_done or
-/// invalidate.
+/// Holds the InFlight claim for the resolver task. The guard's
+/// `Resolution` defaults to `Failed`, so a dropped or errored
+/// resolve invalidates the cache entry and notifies waiters
+/// automatically. `commit_done` transitions to `Done`, which
+/// drops with `put_done` + notify instead.
 struct InFlightGuard<'a> {
     cache: &'a RepoIdCache,
     key: String,
     event: Rc<Event>,
-    armed: bool,
+    resolution: Resolution,
+}
+
+enum Resolution {
+    Failed,
+    Done(u64, SystemTime),
 }
 
 impl<'a> InFlightGuard<'a> {
@@ -863,22 +858,25 @@ impl<'a> InFlightGuard<'a> {
             cache,
             key: key.to_string(),
             event,
-            armed: true,
+            resolution: Resolution::Failed,
         }
     }
 
-    fn disarm_and_notify(&mut self) {
-        self.armed = false;
-        self.event.notify(usize::MAX);
+    /// Mark the resolve as successful; on `Drop` the cache
+    /// receives `put_done(key, id, expires_at)` and waiters are
+    /// notified.
+    fn commit_done(mut self, id: u64, expires_at: SystemTime) {
+        self.resolution = Resolution::Done(id, expires_at);
     }
 }
 
 impl Drop for InFlightGuard<'_> {
     fn drop(&mut self) {
-        if self.armed {
-            self.cache.invalidate(&self.key);
-            self.event.notify(usize::MAX);
+        match self.resolution {
+            Resolution::Done(id, exp) => self.cache.put_done(&self.key, id, exp),
+            Resolution::Failed => self.cache.invalidate(&self.key),
         }
+        self.event.notify(usize::MAX);
     }
 }
 
@@ -926,14 +924,9 @@ struct JwtSigner {
 impl JwtSigner {
     async fn sign(&self, claims: JwtClaims) -> Result<String, GithubError> {
         let key = Arc::clone(&self.key);
-        match self
-            .worker
+        self.worker
             .run(move || sign_jwt_blocking(&claims, &key))
-            .await
-        {
-            Ok(res) => res,
-            Err(WorkerDead) => Err(GithubError::JwtSignerDead),
-        }
+            .await?
     }
 }
 
@@ -1414,7 +1407,7 @@ mod tests {
     }
 
     #[test]
-    fn inflight_guard_disarm_does_not_invalidate() {
+    fn inflight_guard_commit_done_puts_entry() {
         let cache = RepoIdCache::default();
         let now = t(1_000_000);
         let ev = match cache.get_or_claim("foo/bar", now) {
@@ -1422,12 +1415,13 @@ mod tests {
             _ => panic!("expected initial Resolve"),
         };
         {
-            let mut guard = InFlightGuard::new(&cache, "foo/bar", ev);
-            // Resolver committed put_done; then disarm.
-            cache.put_done("foo/bar", 42, now + Duration::from_secs(600));
-            guard.disarm_and_notify();
+            let guard = InFlightGuard::new(&cache, "foo/bar", ev);
+            // Resolve succeeded; commit_done transitions the guard to
+            // `Done`. On drop, the cache receives put_done(...) and
+            // waiters are notified.
+            guard.commit_done(42, now + Duration::from_secs(600));
         }
-        // Cache must show the committed entry; subsequent callers Hit.
+        // Subsequent callers Hit the committed entry.
         assert_hit(cache.get_or_claim("foo/bar", now), 42);
     }
 }

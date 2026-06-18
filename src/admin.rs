@@ -276,10 +276,11 @@ fn handle_status(state: &SharedState) -> serde_json::Value {
 }
 
 fn handle_list(state: &SharedState) -> serde_json::Value {
-    let mut entries: Vec<serde_json::Value> = state
-        .clients
-        .borrow()
-        .values()
+    let borrowed = state.clients.borrow();
+    let mut clients: Vec<&ResolvedClient> = borrowed.values().collect();
+    clients.sort_by_key(|c| c.name.as_str());
+    let entries: Vec<serde_json::Value> = clients
+        .into_iter()
         .map(|c| {
             let mut provs: Vec<&str> = c.providers.iter().map(String::as_str).collect();
             provs.sort();
@@ -291,8 +292,41 @@ fn handle_list(state: &SharedState) -> serde_json::Value {
             })
         })
         .collect();
-    entries.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     serde_json::json!({ "ok": true, "clients": entries })
+}
+
+/// RAII rollback for `handle_enroll`. The PSK is inserted into the
+/// in-memory store BEFORE we attempt the on-disk writes; on any
+/// failure between then and `commit()`, Drop rolls the in-memory
+/// insert back so memory and disk stay coherent. Same pattern as
+/// `InFlightGuard` in `providers::github` — default Drop is the
+/// rollback path; `commit(self)` consumes the guard to disarm it.
+struct EnrollRollback<'a> {
+    state: &'a SharedState,
+    client: String,
+    armed: bool,
+}
+
+impl<'a> EnrollRollback<'a> {
+    fn new(state: &'a SharedState, client: &str) -> Self {
+        Self {
+            state,
+            client: client.to_string(),
+            armed: true,
+        }
+    }
+
+    fn commit(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for EnrollRollback<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.state.psks.borrow_mut().remove(&self.client);
+        }
+    }
 }
 
 async fn handle_enroll(
@@ -343,58 +377,39 @@ async fn handle_enroll(
     let psk_hex = hex::encode(key_bytes);
 
     // Update the in-memory PSK store, then write the new on-disk file
-    // (deterministic sorted render). Insert is idempotent — on a retry
-    // the prior partial write is replaced atomically.
+    // (deterministic sorted render). RAII: the guard's default Drop
+    // removes the in-memory insert; on success we `commit()` to
+    // disarm it, mirroring the `InFlightGuard` pattern in github.rs.
     state
         .psks
         .borrow_mut()
         .insert(client.to_string(), key_bytes);
+    let rollback = EnrollRollback::new(state, client);
     let psk_content = state.psks.borrow().render();
-    if let Err(e) = atomic_write(
+    atomic_write(
         &state.psk_file_path,
         psk_content.into_bytes(),
         PSK_FILE_MODE,
     )
     .await
-    {
-        // Roll back the in-memory insert so memory and disk stay
-        // coherent on a write failure.
-        state.psks.borrow_mut().remove(client);
-        return Err(error_response("internal", &format!("write psks: {e}")));
-    }
+    .map_err(|e| error_response("internal", &format!("write psks: {e}")))?;
 
     // Update clients.json: read, append, atomic write.
     let enrolled_at = format_rfc3339_z(SystemTime::now());
-    let mut clients_doc = match read_clients_doc(&state.clients_file_path).await {
-        Ok(d) => d,
-        Err(e) => {
-            state.psks.borrow_mut().remove(client);
-            return Err(error_response("internal", &e));
-        }
-    };
+    let mut clients_doc = read_clients_doc(&state.clients_file_path)
+        .await
+        .map_err(|e| error_response("internal", &e))?;
     clients_doc.clients.push(crate::config::ClientEntry {
         name: client.to_string(),
         providers: vec![PROVIDER_GITHUB.to_string()],
         enrolled_at: enrolled_at.clone(),
         note: note.clone(),
     });
-    let clients_bytes = match serde_json::to_vec_pretty(&clients_doc) {
-        Ok(b) => b,
-        Err(e) => {
-            state.psks.borrow_mut().remove(client);
-            return Err(error_response(
-                "internal",
-                &format!("encode clients.json: {e}"),
-            ));
-        }
-    };
-    if let Err(e) = atomic_write(&state.clients_file_path, clients_bytes, CLIENTS_FILE_MODE).await {
-        state.psks.borrow_mut().remove(client);
-        return Err(error_response(
-            "internal",
-            &format!("write clients.json: {e}"),
-        ));
-    }
+    let clients_bytes = serde_json::to_vec_pretty(&clients_doc)
+        .map_err(|e| error_response("internal", &format!("encode clients.json: {e}")))?;
+    atomic_write(&state.clients_file_path, clients_bytes, CLIENTS_FILE_MODE)
+        .await
+        .map_err(|e| error_response("internal", &format!("write clients.json: {e}")))?;
 
     // Commit to in-memory clients table (keyed on identity now).
     state.clients.borrow_mut().insert(
@@ -406,6 +421,7 @@ async fn handle_enroll(
             note,
         },
     );
+    rollback.commit();
 
     info!(evt = %EventKind::Enroll, provider = provider, client = client);
     Ok(serde_json::json!({
@@ -483,8 +499,7 @@ async fn handle_mint(
             &format!("provider '{provider}' not configured"),
         )
     })?;
-    let known_client = state.clients.borrow().values().any(|c| c.name == client);
-    if !known_client {
+    if !state.clients.borrow().contains_key(client) {
         return Err(error_response(
             "unknown_client",
             &format!("no enrolled client named '{client}'"),
@@ -735,11 +750,13 @@ fn lookup_provider<'a>(
 }
 
 fn is_valid_client_name(s: &str) -> bool {
-    !s.is_empty()
-        && s.is_ascii()
-        && !s
-            .chars()
-            .any(|c| c == ':' || c == '\n' || c == '\r' || c.is_whitespace())
+    let bytes = s.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= crate::transport::MAX_IDENTITY_LEN
+        && bytes
+            .iter()
+            .copied()
+            .all(crate::transport::is_identity_byte)
 }
 
 async fn generate_psk_key() -> std::io::Result<[u8; 32]> {
@@ -792,10 +809,13 @@ pub(crate) async fn atomic_write(path: &Path, content: Vec<u8>, mode: u32) -> st
 async fn read_clients_doc(path: &Path) -> Result<crate::config::ClientsFile, String> {
     match compio::fs::read(path).await {
         Ok(bytes) => {
-            serde_json::from_slice(&bytes).map_err(|e| format!("parse {}: {e}", path.display()))
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|e| format!("non-utf8 {}: {e}", path.display()))?;
+            crate::config::parse_clients_file(text, path)
+                .map_err(|e| format!("parse {}: {e}", path.display()))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(crate::config::ClientsFile {
-            version: 2,
+            version: crate::config::CLIENTS_SCHEMA_VERSION,
             clients: Vec::new(),
         }),
         Err(e) => Err(format!("read {}: {e}", path.display())),
@@ -803,18 +823,33 @@ async fn read_clients_doc(path: &Path) -> Result<crate::config::ClientsFile, Str
 }
 
 fn format_rfc3339_z(t: SystemTime) -> String {
+    // Tries the clock; on any failure (pre-epoch clock, year-9999
+    // overflow on the time crate side, format-string error) falls
+    // back to the epoch. The caller stores this value verbatim into
+    // the on-disk `enrolled_at` field — better to record a wrong
+    // timestamp than to abort an otherwise-successful enroll.
     let secs = t
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // from_unix_timestamp accepts any i64 within ±9999 years; secs
-    // (u64) saturates to i64 just past the year-292B mark, so the
-    // cast is fine here. RFC3339 formatting of a valid OffsetDateTime
-    // is infallible. Both unwraps would only fire on internal bugs.
-    let dt = time::OffsetDateTime::from_unix_timestamp(secs as i64)
-        .expect("u64 seconds within i64::MAX");
-    dt.format(&time::format_description::well_known::Rfc3339)
-        .expect("RFC3339 format is infallible for OffsetDateTime")
+    let formatted = i64::try_from(secs)
+        .ok()
+        .and_then(|s| time::OffsetDateTime::from_unix_timestamp(s).ok())
+        .and_then(|dt| {
+            dt.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        });
+    match formatted {
+        Some(s) => s,
+        None => {
+            tracing::warn!(
+                evt = "rfc3339_format_failed",
+                secs = secs,
+                "falling back to epoch for enrolled_at timestamp"
+            );
+            "1970-01-01T00:00:00Z".to_string()
+        }
+    }
 }
 
 // Returns false (denial) only on a definitive non-root, non-self UID.
@@ -876,7 +911,14 @@ async fn read_line(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
         let BufResult(res, returned) = stream.read(chunk).await;
         chunk = returned;
         match res {
-            Ok(0) => return Ok(accumulated),
+            Ok(0) => {
+                // EOF without a trailing `\n`. Caller treats this as a
+                // bad request rather than an empty line.
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "admin connection closed mid-request",
+                ));
+            }
             Ok(_) => accumulated.extend_from_slice(&chunk),
             Err(e) => return Err(e),
         }

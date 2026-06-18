@@ -199,6 +199,12 @@ fn default_user_agent() -> String {
     "symbolon".to_string()
 }
 
+/// The on-disk schema version `parse_clients_file` accepts and
+/// every writer must use. Single source of truth — both
+/// `admin::handle_enroll` (file rewrites) and the daemon's
+/// startup parse compare against this constant.
+pub const CLIENTS_SCHEMA_VERSION: u32 = 1;
+
 /// Top-level parsed `clients.json`. Serialize side is used by
 /// `admin::handle_enroll` / `handle_revoke` when rewriting the
 /// file; the round-trip uses the same struct on both ends so the
@@ -206,7 +212,7 @@ fn default_user_agent() -> String {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientsFile {
-    /// Schema version. Only `1` is supported today.
+    /// Schema version. Must equal [`CLIENTS_SCHEMA_VERSION`].
     pub version: u32,
     pub clients: Vec<ClientEntry>,
 }
@@ -275,7 +281,7 @@ pub fn parse_clients_file(text: &str, path: &Path) -> Result<ClientsFile, Config
         path: path.to_path_buf(),
         source,
     })?;
-    if parsed.version != 1 {
+    if parsed.version != CLIENTS_SCHEMA_VERSION {
         return Err(ConfigError::UnsupportedClientsVersion(parsed.version));
     }
     Ok(parsed)

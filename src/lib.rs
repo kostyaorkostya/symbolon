@@ -39,6 +39,7 @@ pub(crate) mod psk_store;
 pub(crate) mod ready;
 pub(crate) mod sandbox;
 pub(crate) mod signals;
+#[doc(hidden)]
 pub mod transport;
 
 // Curated in-package surface. Cargo forces these to be `pub` because

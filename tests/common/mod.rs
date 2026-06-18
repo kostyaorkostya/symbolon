@@ -218,7 +218,7 @@ pub fn build_config(_unused: PathBuf, clients_path: PathBuf, api_base: String) -
     )
 }
 
-/// Write a `clients.json` (schema v2) with the given enrolled identities.
+/// Write a `clients.json` (schema v1) with the given enrolled identities.
 pub fn write_clients_json(path: &Path, entries: &[&str]) {
     let entries_json: Vec<String> = entries
         .iter()
@@ -320,8 +320,8 @@ pub async fn client_handshake_and_read_eof(
     };
 
     let prelude = match transport::encode_prelude(identity) {
-        Some(p) => p,
-        None => return Vec::new(),
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
     };
     let BufResult(res, _) = stream.write_all(prelude).await;
     if res.is_err() {

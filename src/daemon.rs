@@ -61,6 +61,12 @@ pub enum DaemonError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to chmod admin socket at {}", path.display())]
+    Chmod {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("failed to unlink stale socket at {}", path.display())]
     Unlink {
         path: PathBuf,
@@ -223,6 +229,12 @@ impl Service {
                     path: admin_path.clone(),
                     source,
                 })?;
+        // RAII: the next several `?` steps (chmod, sandbox, CpuWorker,
+        // provider construction) all happen AFTER the UDS bind. Any
+        // failure there leaves an orphaned socket on disk; this guard
+        // does best-effort cleanup on Drop. Disarmed on the success
+        // path below so the socket lives.
+        let admin_bind_guard = AdminBindGuard::new(admin_path.clone());
         // 0600: only root and the daemon UID can talk to admin.
         // SO_PEERCRED in run_admin_loop is the second gate.
         chmod_socket(admin_path, 0o600)?;
@@ -262,6 +274,7 @@ impl Service {
             admin_socket = %admin_path.display(),
         );
 
+        admin_bind_guard.disarm();
         Ok(Self {
             state,
             listener,
@@ -380,7 +393,7 @@ impl Service {
         // shutdown latency budget.
         let _ = admin_handle.await;
 
-        let drain_ms = shutdown_start.elapsed().as_millis() as u64;
+        let drain_ms = u64::try_from(shutdown_start.elapsed().as_millis()).unwrap_or(u64::MAX);
         if !drain_complete {
             tracing::warn!(
                 evt = %EventKind::DrainIncomplete,
@@ -422,48 +435,44 @@ impl SharedState {
     /// drive a reload through the state handle without importing
     /// daemon-internal helpers.
     pub async fn reload_clients(&self, path: &Path) {
-        reload_clients_inner(self, path).await
+        let file = match crate::loader::load_clients_file(path).await {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(evt = %EventKind::ConfigReload, triggered_by = "sighup", ok = false, error = %crate::logging::ErrorChain(&e));
+                return;
+            }
+        };
+        let new_table = match build_clients_table(file) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(evt = %EventKind::ConfigReload, triggered_by = "sighup", ok = false, error = %crate::logging::ErrorChain(&e));
+                return;
+            }
+        };
+        // Reload the PSK store alongside clients.json so hand-edits to
+        // the on-disk roster (rare; admin enroll/revoke is the normal
+        // path) are picked up coherently.
+        let new_psks = match load_psk_store(&self.psk_file_path).await {
+            Ok(store) => store,
+            Err(e) => {
+                warn!(evt = %EventKind::ConfigReload, triggered_by = "sighup", ok = false, error = %crate::logging::ErrorChain(&e));
+                return;
+            }
+        };
+        let client_count = new_table.len();
+        let psk_count = new_psks.len();
+        // No `.await` between these two assignments: the single-threaded
+        // compio runtime means no other task observes a split where
+        // `clients` has been swapped but `psks` hasn't (or vice-versa).
+        *self.clients.borrow_mut() = new_table;
+        *self.psks.borrow_mut() = new_psks;
+        info!(
+            evt = %EventKind::ConfigReload,
+            triggered_by = "sighup",
+            client_count = client_count,
+            psk_count = psk_count,
+        );
     }
-}
-
-async fn reload_clients_inner(state: &SharedState, path: &Path) {
-    let file = match crate::loader::load_clients_file(path).await {
-        Ok(f) => f,
-        Err(e) => {
-            warn!(evt = %EventKind::ConfigReload, triggered_by = "sighup", ok = false, error = %crate::logging::ErrorChain(&e));
-            return;
-        }
-    };
-    let new_table = match build_clients_table(file) {
-        Ok(t) => t,
-        Err(e) => {
-            warn!(evt = %EventKind::ConfigReload, triggered_by = "sighup", ok = false, error = %crate::logging::ErrorChain(&e));
-            return;
-        }
-    };
-    // Reload the PSK store alongside clients.json so hand-edits to
-    // the on-disk roster (rare; admin enroll/revoke is the normal
-    // path) are picked up coherently.
-    let new_psks = match load_psk_store(&state.psk_file_path).await {
-        Ok(store) => store,
-        Err(e) => {
-            warn!(evt = %EventKind::ConfigReload, triggered_by = "sighup", ok = false, error = %crate::logging::ErrorChain(&e));
-            return;
-        }
-    };
-    let client_count = new_table.len();
-    let psk_count = new_psks.len();
-    // No `.await` between these two assignments: the single-threaded
-    // compio runtime means no other task observes a split where
-    // `clients` has been swapped but `psks` hasn't (or vice-versa).
-    *state.clients.borrow_mut() = new_table;
-    *state.psks.borrow_mut() = new_psks;
-    info!(
-        evt = %EventKind::ConfigReload,
-        triggered_by = "sighup",
-        client_count = client_count,
-        psk_count = psk_count,
-    );
 }
 
 /// Read the on-disk PSK file and parse it into a `PskStore`. Treats
@@ -491,7 +500,7 @@ async fn load_psk_store(path: &Path) -> Result<PskStore, DaemonError> {
 fn chmod_socket(path: &Path, mode: u32) -> Result<(), DaemonError> {
     use std::os::unix::fs::PermissionsExt;
     let perms = std::fs::Permissions::from_mode(mode);
-    std::fs::set_permissions(path, perms).map_err(|source| DaemonError::Bind {
+    std::fs::set_permissions(path, perms).map_err(|source| DaemonError::Chmod {
         path: path.to_path_buf(),
         source,
     })
@@ -606,6 +615,35 @@ async fn unlink_stale(path: &Path) -> Result<(), DaemonError> {
     }
 }
 
+/// RAII guard: unlinks the admin UDS on Drop unless explicitly
+/// disarmed. Used during `prepare_inner` so any failure between
+/// `UnixListener::bind` and the success return doesn't leave an
+/// orphaned socket on disk. After the sandbox closes, the unlink
+/// will silently fail (Landlock blocks the syscall) — that's
+/// acceptable because the next `prepare_inner` cleans it via
+/// `unlink_stale`.
+struct AdminBindGuard {
+    path: Option<PathBuf>,
+}
+
+impl AdminBindGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn disarm(mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for AdminBindGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.path.take() {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+}
+
 fn build_clients_table(file: ClientsFile) -> Result<HashMap<String, ResolvedClient>, DaemonError> {
     let mut table = HashMap::new();
     for entry in file.clients {
@@ -623,20 +661,21 @@ fn build_clients_table(file: ClientsFile) -> Result<HashMap<String, ResolvedClie
     Ok(table)
 }
 
-/// Cross-step state the driver needs to stash so the final `evt=mint`
-/// log event (emitted only after the encrypted response is on the wire)
-/// can see everything from the earlier `Step::Request` arm.
-struct MintRecord {
-    host: String,
-    path: String,
-    response: git_credential::Response,
-    repo_id: u64,
-    out_req_id: String,
-    gh_req_id: Option<String>,
-    provider_ms: u64,
-}
-
 async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<SharedState>) {
+    /// Cross-step state the driver needs to stash so the final
+    /// `evt=mint` log event (emitted only after the encrypted
+    /// response is on the wire) can see everything from the
+    /// earlier `Step::Request` arm.
+    struct MintRecord {
+        host: String,
+        path: String,
+        response: git_credential::Response,
+        repo_id: u64,
+        out_req_id: String,
+        gh_req_id: Option<String>,
+        provider_ms: u64,
+    }
+
     let peer = stream.peer_addr().ok();
     let mut sess = Responder::new();
     let mut client_name: Option<String> = None;
@@ -761,7 +800,7 @@ async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<Shar
 
                 let started = Instant::now();
                 let mint_result = provider.mint(&req_id, &request.path).await;
-                let provider_ms = started.elapsed().as_millis() as u64;
+                let provider_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
                 let outcome = match mint_result {
                     Ok(o) => o,
@@ -941,8 +980,7 @@ fn log_session_failure(
                 got = got,
             ),
         },
-        SessionError::BadIdentity { .. }
-        | SessionError::BadPskLen { .. }
+        SessionError::BadPskLen { .. }
         | SessionError::RecvLen { .. }
         | SessionError::WrongState { .. } => warn!(
             req_id = %req_id,
@@ -1099,18 +1137,25 @@ fn log_mint_error(
 // `transport::Responder`.
 
 /// Read EXACTLY `n` bytes from `stream` into a fresh `Vec`. Returns
-/// `None` on EOF or I/O error.
+/// `None` on EOF or I/O error. Reuses the same chunk buffer across
+/// poll iterations — under a slow peer this is the difference
+/// between one allocation and one-per-byte.
 async fn read_exact_n(stream: &mut TcpStream, n: usize) -> Option<Vec<u8>> {
     let mut out: Vec<u8> = Vec::with_capacity(n);
+    let mut chunk: Vec<u8> = Vec::with_capacity(n);
     while out.len() < n {
         let remaining = n - out.len();
-        let buf = Vec::with_capacity(remaining);
-        let BufResult(res, mut filled) = stream.read(buf).await;
+        chunk.clear();
+        if chunk.capacity() < remaining {
+            chunk.reserve(remaining - chunk.capacity());
+        }
+        let BufResult(res, returned) = stream.read(chunk).await;
+        chunk = returned;
         match res {
             Ok(0) => return None,
             Ok(read) => {
-                filled.truncate(read);
-                out.extend_from_slice(&filled);
+                chunk.truncate(read);
+                out.extend_from_slice(&chunk);
             }
             Err(_) => return None,
         }
@@ -1141,7 +1186,7 @@ mod tests {
     #[test]
     fn build_clients_table_indexes_by_name() {
         let file = ClientsFile {
-            version: 2,
+            version: crate::config::CLIENTS_SCHEMA_VERSION,
             clients: vec![entry("vm-1", &["github"]), entry("vm-2", &["github"])],
         };
         let table = build_clients_table(file).unwrap();
@@ -1154,7 +1199,7 @@ mod tests {
     #[test]
     fn build_clients_table_rejects_duplicate_name() {
         let file = ClientsFile {
-            version: 2,
+            version: crate::config::CLIENTS_SCHEMA_VERSION,
             clients: vec![entry("vm-1", &["github"]), entry("vm-1", &["github"])],
         };
         let err = build_clients_table(file).unwrap_err();
@@ -1164,7 +1209,7 @@ mod tests {
     #[test]
     fn build_clients_table_empty_is_ok() {
         let file = ClientsFile {
-            version: 2,
+            version: crate::config::CLIENTS_SCHEMA_VERSION,
             clients: vec![],
         };
         assert_eq!(build_clients_table(file).unwrap().len(), 0);

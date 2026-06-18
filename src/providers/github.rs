@@ -340,7 +340,7 @@ impl GitHubProvider {
             out_req_id = %out_req_id,
             endpoint = endpoint,
             provider = %self.api_base,
-            timeout_ms = timeout.as_millis() as u64,
+            timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
         );
         let started = Instant::now();
         let raced = futures_util::select_biased! {
@@ -348,7 +348,7 @@ impl GitHubProvider {
             r = compio::time::timeout(timeout, mk_inner(out_req_id.clone())).fuse() =>
                 r.map_err(|_| GithubError::Timeout(timeout)),
         };
-        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         match raced {
             Ok(pc) => {
                 info!(

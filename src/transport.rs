@@ -113,10 +113,14 @@ impl std::fmt::Display for Identity<'_> {
     }
 }
 
-/// Validate the identity charset: ASCII alphanumeric or one of `.`, `_`, `-`.
-/// Rejects CR/LF/NUL/whitespace by construction. Same rule as the
-/// git-credential value rule (AGENTS.md invariant #12 in spirit).
-fn identity_byte_ok(b: u8) -> bool {
+/// Canonical "valid byte in a client identity" predicate: ASCII
+/// alphanumeric or one of `.`, `_`, `-`. Rejects CR/LF/NUL/
+/// whitespace by construction. Same rule as the git-credential
+/// value rule (AGENTS.md invariant #12 in spirit). Shared with
+/// `psk_store` (file-row validation) and `admin` (enroll-input
+/// validation) so drift between the three call sites is
+/// impossible.
+pub(crate) fn is_identity_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')
 }
 
@@ -125,23 +129,31 @@ pub const fn prelude_size(identity_len: usize) -> usize {
     6 + identity_len
 }
 
-/// Encode an identity into prelude bytes. Returns `None` if the identity
-/// length or charset is invalid (so the client can fail-fast rather than send
-/// bytes the server will reject).
-pub fn encode_prelude(identity: &str) -> Option<Vec<u8>> {
+/// Encode an identity into prelude bytes. Surfaces the same
+/// `PreludeError` variants the wire-side parser would emit, so
+/// the client can fail-fast with the actual reason rather than
+/// sending bytes the server will reject.
+pub fn encode_prelude(identity: &str) -> Result<Vec<u8>, PreludeError> {
     let bytes = identity.as_bytes();
-    if bytes.is_empty() || bytes.len() > MAX_IDENTITY_LEN {
-        return None;
-    }
-    if !bytes.iter().all(|b| identity_byte_ok(*b)) {
-        return None;
+    let id_len = u8::try_from(bytes.len())
+        .ok()
+        .filter(|&n| n >= 1 && (n as usize) <= MAX_IDENTITY_LEN)
+        .ok_or(PreludeError::BadIdentityLen {
+            got: bytes.len().min(u8::MAX as usize) as u8,
+        })?;
+    if let Some((offset, &byte)) = bytes
+        .iter()
+        .enumerate()
+        .find(|&(_, &b)| !is_identity_byte(b))
+    {
+        return Err(PreludeError::InvalidCharset { offset, byte });
     }
     let mut out = Vec::with_capacity(prelude_size(bytes.len()));
     out.extend_from_slice(&PRELUDE_MAGIC);
     out.push(PRELUDE_VERSION);
-    out.push(bytes.len() as u8);
+    out.push(id_len);
     out.extend_from_slice(bytes);
-    Some(out)
+    Ok(out)
 }
 
 /// Validate the 6-byte prelude head: magic, version, and identity length.
@@ -169,11 +181,11 @@ fn parse_prelude_head(head: &[u8; 6]) -> Result<u8, PreludeError> {
 /// declared `id_len`).
 fn parse_prelude_body(body: &[u8]) -> Result<Identity<'_>, PreludeError> {
     for (offset, &b) in body.iter().enumerate() {
-        if !identity_byte_ok(b) {
+        if !is_identity_byte(b) {
             return Err(PreludeError::InvalidCharset { offset, byte: b });
         }
     }
-    // SAFETY: identity_byte_ok only accepts ASCII bytes, so the slice is valid UTF-8.
+    // SAFETY: is_identity_byte only accepts ASCII bytes, so the slice is valid UTF-8.
     let id_str = std::str::from_utf8(body).expect("ascii-only by construction");
     Ok(Identity(id_str))
 }
@@ -360,8 +372,6 @@ pub enum SessionError {
     PreludeBadIdentityLen { got: u8 },
     #[error("prelude identity byte 0x{byte:02x} at offset {offset} is outside [A-Za-z0-9._-]")]
     PreludeInvalidCharset { offset: usize, byte: u8 },
-    #[error("identity {identity:?} fails prelude encoding (empty, too long, or disallowed bytes)")]
-    BadIdentity { identity: String },
     #[error("noise handshake read failed")]
     HandshakeRead(#[source] snow::Error),
     #[error("noise handshake write failed")]
@@ -441,6 +451,10 @@ enum RState {
     NeedPsk {
         identity: String,
     },
+    /// `Step::NeedPsk` has been emitted (identity moved out).
+    /// Caller must invoke `set_psk` next; another `step()` here is
+    /// a contract violation (`WrongState`).
+    AwaitingPsk,
     /// PSK provided; ask for the 2-byte handshake-msg-1 length.
     WantHsLen {
         hs: HandshakeState,
@@ -493,6 +507,7 @@ impl RState {
             RState::WantPreludeHead => "WantPreludeHead",
             RState::WantPreludeBody { .. } => "WantPreludeBody",
             RState::NeedPsk { .. } => "NeedPsk",
+            RState::AwaitingPsk => "AwaitingPsk",
             RState::WantHsLen { .. } => "WantHsLen",
             RState::WantHsBody { .. } => "WantHsBody",
             RState::WriteHs { .. } => "WriteHs",
@@ -511,7 +526,7 @@ impl RState {
         match self {
             RState::WantPreludeHead => Phase::PreludeHead,
             RState::WantPreludeBody { .. } => Phase::PreludeBody,
-            RState::NeedPsk { .. } => Phase::AwaitingPsk,
+            RState::NeedPsk { .. } | RState::AwaitingPsk => Phase::AwaitingPsk,
             RState::WantHsLen { .. }
             | RState::WantHsBody { .. }
             | RState::WriteHs { .. }
@@ -544,6 +559,13 @@ impl RState {
 /// ```
 pub struct Responder {
     state: RState,
+    /// One per-session scratch buffer reused across handshake-step
+    /// and transport-mode reads/writes. Snow needs an `out` slice
+    /// of at least `MAX_MESSAGE_SIZE` for both directions; the
+    /// session only ever uses it inside a single `recv` /
+    /// `set_response` call, never across `.await` boundaries, so a
+    /// single buffer suffices.
+    scratch: Box<[u8; MAX_MESSAGE_SIZE]>,
 }
 
 impl Default for Responder {
@@ -556,6 +578,7 @@ impl Responder {
     pub fn new() -> Self {
         Self {
             state: RState::WantPreludeHead,
+            scratch: Box::new([0u8; MAX_MESSAGE_SIZE]),
         }
     }
 
@@ -585,11 +608,12 @@ impl Responder {
                 Ok(Step::ReadExact { n })
             }
             RState::NeedPsk { identity } => {
-                let id_for_caller = identity.clone();
-                self.state = RState::NeedPsk { identity };
-                Ok(Step::NeedPsk {
-                    identity: id_for_caller,
-                })
+                // Move the identity into the Step (zero clone). The
+                // contract is: caller MUST call `set_psk` next. A
+                // second `step()` before that returns WrongState
+                // via the catch-all below.
+                self.state = RState::AwaitingPsk;
+                Ok(Step::NeedPsk { identity })
             }
             RState::WantHsLen { hs } => {
                 self.state = RState::WantHsLen { hs };
@@ -624,6 +648,7 @@ impl Responder {
                 Ok(Step::Done)
             }
             other @ (RState::Failed
+            | RState::AwaitingPsk
             | RState::WroteHsPending { .. }
             | RState::AwaitingResponse { .. }
             | RState::WroteRespPending) => {
@@ -666,12 +691,11 @@ impl Responder {
             }
             RState::WantHsBody { mut hs, body_len } => {
                 expect_len(body_len, bytes.len())?;
-                let mut scratch = vec![0u8; MAX_MESSAGE_SIZE];
-                handshake_read(&mut hs, bytes, &mut scratch).map_err(map_hs_read)?;
+                handshake_read(&mut hs, bytes, &mut self.scratch[..]).map_err(map_hs_read)?;
                 // Produce handshake msg 2 immediately so the driver can emit it.
-                let mut out_scratch = vec![0u8; MAX_MESSAGE_SIZE];
-                let n = handshake_write(&mut hs, &[], &mut out_scratch).map_err(map_hs_write)?;
-                let out = frame(&out_scratch[..n]).map_err(map_frame_oversize)?;
+                let n =
+                    handshake_write(&mut hs, &[], &mut self.scratch[..]).map_err(map_hs_write)?;
+                let out = frame(&self.scratch[..n]).map_err(map_frame_oversize)?;
                 self.state = RState::WriteHs { hs, out };
                 Ok(())
             }
@@ -684,12 +708,11 @@ impl Responder {
             }
             RState::WantReqBody { mut ts, body_len } => {
                 expect_len(body_len, bytes.len())?;
-                let mut scratch = vec![0u8; MAX_MESSAGE_SIZE];
-                let n = transport_read(&mut ts, bytes, &mut scratch).map_err(map_tx_read)?;
-                scratch.truncate(n);
+                let n =
+                    transport_read(&mut ts, bytes, &mut self.scratch[..]).map_err(map_tx_read)?;
                 self.state = RState::HaveRequest {
                     ts,
-                    plaintext: scratch,
+                    plaintext: self.scratch[..n].to_vec(),
                 };
                 Ok(())
             }
@@ -707,7 +730,7 @@ impl Responder {
     pub fn set_psk(&mut self, psk: [u8; 32]) -> Result<(), SessionError> {
         let state_name = self.state.name();
         match std::mem::replace(&mut self.state, RState::Failed) {
-            RState::NeedPsk { identity: _ } => {
+            RState::AwaitingPsk => {
                 let hs = responder(&psk).map_err(map_frame_oversize)?;
                 self.state = RState::WantHsLen { hs };
                 Ok(())
@@ -752,9 +775,9 @@ impl Responder {
         let state_name = self.state.name();
         match std::mem::replace(&mut self.state, RState::Failed) {
             RState::AwaitingResponse { mut ts } => {
-                let mut scratch = vec![0u8; MAX_MESSAGE_SIZE];
-                let n = transport_write(&mut ts, plaintext, &mut scratch).map_err(map_tx_write)?;
-                let out = frame(&scratch[..n]).map_err(map_frame_oversize)?;
+                let n = transport_write(&mut ts, plaintext, &mut self.scratch[..])
+                    .map_err(map_tx_write)?;
+                let out = frame(&self.scratch[..n]).map_err(map_frame_oversize)?;
                 self.state = RState::WriteResp { out };
                 Ok(())
             }
@@ -903,13 +926,14 @@ impl IState {
 /// then calls `take_response()` to recover the decrypted plaintext.
 pub struct Initiator {
     state: IState,
+    /// One per-session scratch buffer reused across handshake-step
+    /// and transport-mode reads/writes. See `Responder::scratch`.
+    scratch: Box<[u8; MAX_MESSAGE_SIZE]>,
 }
 
 impl Initiator {
     pub fn new(identity: &str, psk: [u8; 32], request: Vec<u8>) -> Result<Self, SessionError> {
-        let prelude = encode_prelude(identity).ok_or_else(|| SessionError::BadIdentity {
-            identity: identity.to_string(),
-        })?;
+        let prelude = encode_prelude(identity)?;
         let hs = initiator(&psk).map_err(map_frame_oversize)?;
         Ok(Self {
             state: IState::WritePrelude {
@@ -917,6 +941,7 @@ impl Initiator {
                 prelude,
                 request,
             },
+            scratch: Box::new([0u8; MAX_MESSAGE_SIZE]),
         })
     }
 
@@ -1001,12 +1026,12 @@ impl Initiator {
                 request,
             } => {
                 expect_len(body_len, bytes.len())?;
-                let mut scratch = vec![0u8; MAX_MESSAGE_SIZE];
-                handshake_read(&mut hs, bytes, &mut scratch).map_err(map_hs_read)?;
+                handshake_read(&mut hs, bytes, &mut self.scratch[..]).map_err(map_hs_read)?;
                 let mut ts = into_transport(hs).map_err(map_frame_oversize)?;
                 // Encrypt + frame the request now that we're in transport mode.
-                let n = transport_write(&mut ts, &request, &mut scratch).map_err(map_tx_write)?;
-                let out = frame(&scratch[..n]).map_err(map_frame_oversize)?;
+                let n = transport_write(&mut ts, &request, &mut self.scratch[..])
+                    .map_err(map_tx_write)?;
+                let out = frame(&self.scratch[..n]).map_err(map_frame_oversize)?;
                 self.state = IState::WriteReq { ts, out };
                 Ok(())
             }
@@ -1019,10 +1044,11 @@ impl Initiator {
             }
             IState::WantRespBody { mut ts, body_len } => {
                 expect_len(body_len, bytes.len())?;
-                let mut scratch = vec![0u8; MAX_MESSAGE_SIZE];
-                let n = transport_read(&mut ts, bytes, &mut scratch).map_err(map_tx_read)?;
-                scratch.truncate(n);
-                self.state = IState::Done { plaintext: scratch };
+                let n =
+                    transport_read(&mut ts, bytes, &mut self.scratch[..]).map_err(map_tx_read)?;
+                self.state = IState::Done {
+                    plaintext: self.scratch[..n].to_vec(),
+                };
                 Ok(())
             }
             other => {
@@ -1040,9 +1066,9 @@ impl Initiator {
         match std::mem::replace(&mut self.state, IState::Failed) {
             IState::WrotePreludePending { mut hs, request } => {
                 // Compute handshake msg 1 now that the prelude is on the wire.
-                let mut scratch = vec![0u8; MAX_MESSAGE_SIZE];
-                let n = handshake_write(&mut hs, &[], &mut scratch).map_err(map_hs_write)?;
-                let msg1 = frame(&scratch[..n]).map_err(map_frame_oversize)?;
+                let n =
+                    handshake_write(&mut hs, &[], &mut self.scratch[..]).map_err(map_hs_write)?;
+                let msg1 = frame(&self.scratch[..n]).map_err(map_frame_oversize)?;
                 self.state = IState::WriteHs1 { hs, msg1, request };
                 Ok(())
             }
@@ -1192,20 +1218,35 @@ mod tests {
 
     #[test]
     fn encode_rejects_empty_identity() {
-        assert!(encode_prelude("").is_none());
+        assert!(matches!(
+            encode_prelude(""),
+            Err(PreludeError::BadIdentityLen { got: 0 })
+        ));
     }
 
     #[test]
     fn encode_rejects_too_long() {
         let id = "a".repeat(MAX_IDENTITY_LEN + 1);
-        assert!(encode_prelude(&id).is_none());
+        assert!(matches!(
+            encode_prelude(&id),
+            Err(PreludeError::BadIdentityLen { .. })
+        ));
     }
 
     #[test]
     fn encode_rejects_bad_charset() {
-        assert!(encode_prelude("foo bar").is_none()); // space
-        assert!(encode_prelude("foo/bar").is_none()); // slash
-        assert!(encode_prelude("foo\nbar").is_none()); // LF
+        assert!(matches!(
+            encode_prelude("foo bar"),
+            Err(PreludeError::InvalidCharset { byte: b' ', .. })
+        ));
+        assert!(matches!(
+            encode_prelude("foo/bar"),
+            Err(PreludeError::InvalidCharset { byte: b'/', .. })
+        ));
+        assert!(matches!(
+            encode_prelude("foo\nbar"),
+            Err(PreludeError::InvalidCharset { byte: b'\n', .. })
+        ));
     }
 
     /// End-to-end Noise NNpsk0 handshake + a transport-mode message round-trip,
@@ -1449,7 +1490,7 @@ mod tests {
     fn initiator_rejects_bad_identity_at_construction() {
         let psk = [0x42u8; 32];
         match Initiator::new("foo bar", psk, vec![]) {
-            Err(SessionError::BadIdentity { .. }) => {}
+            Err(SessionError::PreludeInvalidCharset { byte: b' ', .. }) => {}
             Err(other) => panic!("wrong error: {other:?}"),
             Ok(_) => panic!("space in identity must reject"),
         }

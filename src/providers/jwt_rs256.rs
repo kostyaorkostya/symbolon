@@ -67,11 +67,23 @@ impl JwtSigningKey {
 
         let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
         let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
-        let signing_input = format!("{header_b64}.{payload_b64}");
 
-        let signature = self.inner.sign(signing_input.as_bytes());
+        // Build the signing input as bytes directly; an intermediate
+        // `String::format!` would allocate twice for no gain.
+        let mut signing_input = Vec::with_capacity(header_b64.len() + 1 + payload_b64.len());
+        signing_input.extend_from_slice(header_b64.as_bytes());
+        signing_input.push(b'.');
+        signing_input.extend_from_slice(payload_b64.as_bytes());
+
+        let signature = self.inner.sign(&signing_input);
         let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
-        Ok(format!("{signing_input}.{sig_b64}"))
+
+        // SAFETY-free: header_b64 / payload_b64 / sig_b64 are all
+        // url-safe base64, i.e. ASCII.
+        let mut token = String::from_utf8(signing_input).expect("base64 is ASCII");
+        token.push('.');
+        token.push_str(&sig_b64);
+        Ok(token)
     }
 }
 

@@ -54,22 +54,26 @@ pub fn setup_tracing(level: LogLevel) {
         LogLevel::Error => LevelFilter::ERROR,
     };
 
-    let stdout_layer = fmt::layer()
-        .json()
-        .flatten_event(true)
-        .with_current_span(false)
-        .with_span_list(false)
-        .with_target(false)
+    // Shared base config so a future edit can't make stdout and
+    // stderr disagree on JSON shape. Macro (not fn) avoids the
+    // monstrous fmt::Layer type signature.
+    macro_rules! base_json_layer {
+        () => {
+            fmt::layer()
+                .json()
+                .flatten_event(true)
+                .with_current_span(false)
+                .with_span_list(false)
+                .with_target(false)
+        };
+    }
+
+    let stdout_layer = base_json_layer!()
         .with_writer(std::io::stdout)
         .with_filter(filter_fn(|m| {
             !matches!(*m.level(), Level::WARN | Level::ERROR)
         }));
-    let stderr_layer = fmt::layer()
-        .json()
-        .flatten_event(true)
-        .with_current_span(false)
-        .with_span_list(false)
-        .with_target(false)
+    let stderr_layer = base_json_layer!()
         .with_writer(std::io::stderr)
         .with_filter(filter_fn(|m| {
             matches!(*m.level(), Level::WARN | Level::ERROR)

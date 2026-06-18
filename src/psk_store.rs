@@ -20,8 +20,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::transport::{MAX_IDENTITY_LEN, is_identity_byte};
+
 const PSK_LEN: usize = 32;
-const MAX_IDENTITY_LEN: usize = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PskStoreError {
@@ -163,7 +164,7 @@ fn validate_identity(id: &str, path: &Path, line: usize) -> Result<(), PskStoreE
         });
     }
     for (offset, &b) in bytes.iter().enumerate() {
-        if !(b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')) {
+        if !is_identity_byte(b) {
             return Err(PskStoreError::BadIdentityChar {
                 path: path.to_path_buf(),
                 line,

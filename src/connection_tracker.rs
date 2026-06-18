@@ -63,8 +63,9 @@ impl Drop for Token {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DrainStats {
     /// Per-tracker drain time. Only read by tests; the daemon
-    /// reports a wider shutdown window measured by the caller.
-    #[allow(dead_code)]
+    /// reports a wider shutdown window measured by the caller,
+    /// so the production path never reads this field.
+    #[allow(dead_code)] // read by tests only — see field docstring
     pub drain_ms: u64,
     pub inflight_drained: usize,
     pub drain_complete: bool,
@@ -124,7 +125,7 @@ impl ConnectionTracker {
         };
         let final_count = *self.active.borrow();
         DrainStats {
-            drain_ms: start.elapsed().as_millis() as u64,
+            drain_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
             inflight_drained: initial.saturating_sub(final_count),
             drain_complete,
         }

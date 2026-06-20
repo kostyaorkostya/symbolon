@@ -121,7 +121,7 @@ pub struct SharedState {
     pub(crate) psk_file_path: PathBuf,
     pub(crate) clients_file_path: PathBuf,
     pub(crate) admin_socket_path: PathBuf,
-    pub(crate) start_time: SystemTime,
+    pub(crate) start_time: Instant,
     /// Cancelled by `crate::signals` watchers on SIGTERM/SIGINT. The
     /// main accept loop and the admin loop both race `wait()` on it;
     /// the SIGHUP loop does too. Loops exit cleanly on cancel,
@@ -269,7 +269,7 @@ impl Service {
             psk_file_path: cfg.listen.psk_file.clone(),
             clients_file_path: cfg.clients.file.clone(),
             admin_socket_path: cfg.admin.socket_path.clone(),
-            start_time: SystemTime::now(),
+            start_time: Instant::now(),
             shutdown,
         });
 
@@ -1277,7 +1277,7 @@ mod tests {
             psk_file_path: nonexistent_psk,
             clients_file_path: clients_path.clone(),
             admin_socket_path: PathBuf::new(),
-            start_time: SystemTime::now(),
+            start_time: Instant::now(),
             shutdown: CancelToken::new(),
         });
         state.reload_clients(&clients_path).await;

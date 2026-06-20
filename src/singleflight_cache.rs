@@ -1,23 +1,26 @@
-//! Singleflight + TTL cache: at most one in-flight resolve per
-//! key, with cached results served until they expire.
+//! Singleflight memo: at most one in-flight resolve per key, with
+//! the resolved value cached for the lifetime of the store (no
+//! TTL).
 //!
 //! Used by providers (currently `providers::github`) to coalesce
-//! concurrent repository-id resolutions while keeping the result
-//! memoised between mints. Lives at the crate root rather than
-//! under `providers/` because the data structure is provider-
+//! concurrent repository-id resolutions and reuse the result on
+//! subsequent mints. Lives at the crate root rather than under
+//! `providers/` because the data structure is provider-
 //! independent: a future GitLab/Gitea/Forgejo provider with the
 //! same lookup-then-mint shape would use it unchanged.
 //!
-//! Both concerns share one `HashMap` allocation: `Cached` entries
-//! serve as the memo (with `expires_at`); `InFlight` entries
-//! serve as the singleflight marker (with the `Event` waiters
-//! listen on).
+//! Staleness is handled out-of-band by the caller via
+//! `invalidate()` — e.g. the GitHub provider invalidates a
+//! cached repo-id when a follow-up mint returns 404 (delete-and-
+//! recreate at the same path changes the underlying numeric id).
+//! There is no time-driven expiry, deliberately: the 404 path is
+//! the authoritative signal, and a TTL would only paper over a
+//! bug in that path.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::rc::Rc;
-use std::time::{Duration, SystemTime};
 
 use synchrony::sync::event::Event;
 
@@ -30,7 +33,7 @@ impl<K, V> Default for SingleflightCache<K, V> {
 }
 
 enum StoreEntry<V> {
-    Cached { value: V, expires_at: SystemTime },
+    Memo(V),
     // Singleflight marker. The resolver notifies on completion;
     // waiters re-check the store. `Event` is the multi-listener
     // primitive — `AsyncFlag::wait` would only wake one waiter.
@@ -38,7 +41,7 @@ enum StoreEntry<V> {
 }
 
 enum Claim<V> {
-    /// A fresh `Cached` entry covered the key — caller uses this value.
+    /// A memoised entry covered the key — caller uses this value.
     Hit(V),
     /// Another caller is already resolving this key — await this
     /// event, then re-`claim` to read the result.
@@ -53,27 +56,24 @@ where
     K: Hash + Eq + Clone,
     V: Clone,
 {
-    /// Singleflight + cache lookup wrapped as one call: returns a
-    /// fresh `Cached` value if one exists; otherwise admits this
+    /// Singleflight + memo lookup wrapped as one call: returns
+    /// the memoised value if one exists; otherwise admits this
     /// caller to perform the resolve while concurrent callers for
     /// the same key wait. The supplied `resolve` is invoked at
     /// most once per (key, resolution-cycle). Success populates
-    /// the cache until `now + ttl`; failure invalidates the in-
-    /// flight marker so the next caller re-resolves.
+    /// the memo; failure invalidates the in-flight marker so the
+    /// next caller re-resolves.
     pub(crate) async fn with<E>(
         &self,
         key: &K,
-        now: SystemTime,
-        ttl: Duration,
         resolve: impl AsyncFnOnce() -> Result<V, E>,
     ) -> Result<V, E> {
         loop {
-            match self.claim(key, now) {
+            match self.claim(key) {
                 Claim::Hit(value) => return Ok(value),
                 Claim::Wait(ev) => {
                     // Re-check via the loop; the resolver may have
-                    // landed a Cached entry, evicted on failure, or
-                    // raced ahead leaving Cached already expired.
+                    // landed a Memo entry or evicted on failure.
                     ev.listen().await;
                 }
                 Claim::Resolve(ev) => {
@@ -84,7 +84,7 @@ where
                     let guard = InFlightGuard::new(self, key.clone(), ev);
                     let result = resolve().await;
                     if let Ok(value) = &result {
-                        guard.commit_done(value.clone(), now + ttl);
+                        guard.commit_done(value.clone());
                     }
                     return result;
                 }
@@ -92,27 +92,26 @@ where
         }
     }
 
-    /// Drop a `Cached` entry without touching any singleflight
-    /// state. Useful when an external signal (e.g. a follow-up
-    /// 404 from the provider) tells the caller the cached value
-    /// is stale and the next request should re-resolve.
+    /// Drop a memoised entry without touching any singleflight
+    /// state. The authoritative staleness signal — e.g. the
+    /// GitHub provider calls this when a follow-up mint returns
+    /// 404, meaning the cached repo-id no longer refers to a
+    /// reachable repository.
     pub(crate) fn invalidate(&self, key: &K) {
         self.0.borrow_mut().remove(key);
     }
 
-    /// Atomic test-and-set. Returns `Hit` on a fresh `Cached`
-    /// entry, `Wait` when another task is already resolving (with
-    /// that resolver's completion event), or `Resolve` when this
+    /// Atomic test-and-set. Returns `Hit` on a memoised entry,
+    /// `Wait` when another task is already resolving (with that
+    /// resolver's completion event), or `Resolve` when this
     /// caller should perform the resolve (with a fresh event the
     /// caller's `release_*` will notify on).
-    fn claim(&self, key: &K, now: SystemTime) -> Claim<V> {
+    fn claim(&self, key: &K) -> Claim<V> {
         let mut entries = self.0.borrow_mut();
         match entries.get(key) {
-            Some(StoreEntry::Cached { value, expires_at }) if *expires_at > now => {
-                Claim::Hit(value.clone())
-            }
+            Some(StoreEntry::Memo(value)) => Claim::Hit(value.clone()),
             Some(StoreEntry::InFlight(ev)) => Claim::Wait(Rc::clone(ev)),
-            _ => {
+            None => {
                 let ev = Rc::new(Event::new());
                 entries.insert(key.clone(), StoreEntry::InFlight(Rc::clone(&ev)));
                 Claim::Resolve(ev)
@@ -121,12 +120,12 @@ where
     }
 
     /// Release a successful singleflight claim: replace the
-    /// `InFlight` marker with a fresh `Cached` entry and wake all
-    /// waiters so they re-`claim` and get the new `Hit`.
-    fn release_done(&self, key: &K, value: V, expires_at: SystemTime, event: &Event) {
+    /// `InFlight` marker with a `Memo` entry and wake all waiters
+    /// so they re-`claim` and get the new `Hit`.
+    fn release_done(&self, key: &K, value: V, event: &Event) {
         self.0
             .borrow_mut()
-            .insert(key.clone(), StoreEntry::Cached { value, expires_at });
+            .insert(key.clone(), StoreEntry::Memo(value));
         event.notify(usize::MAX);
     }
 
@@ -158,7 +157,7 @@ where
 
 enum Resolution<V> {
     Failed,
-    Done(V, SystemTime),
+    Done(V),
 }
 
 impl<'a, K, V> InFlightGuard<'a, K, V>
@@ -177,8 +176,8 @@ where
 
     /// Mark the resolve as successful. Consumes the guard so
     /// double-commit is impossible.
-    fn commit_done(mut self, value: V, expires_at: SystemTime) {
-        self.resolution = Resolution::Done(value, expires_at);
+    fn commit_done(mut self, value: V) {
+        self.resolution = Resolution::Done(value);
     }
 }
 
@@ -192,8 +191,8 @@ where
         // cloning; `Failed` is the harmless placeholder we leave
         // behind in a value about to be dropped anyway.
         match std::mem::replace(&mut self.resolution, Resolution::Failed) {
-            Resolution::Done(value, exp) => {
-                self.store.release_done(&self.key, value, exp, &self.event);
+            Resolution::Done(value) => {
+                self.store.release_done(&self.key, value, &self.event);
             }
             Resolution::Failed => self.store.release_failed(&self.key, &self.event),
         }
@@ -203,11 +202,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-
-    fn t(secs: u64) -> SystemTime {
-        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
-    }
 
     fn assert_hit(action: Claim<u64>, expected: u64) {
         match action {
@@ -225,7 +219,7 @@ mod tests {
         }
     }
 
-    /// Throwaway notifier for tests that pre-populate `Cached`
+    /// Throwaway notifier for tests that pre-populate `Memo`
     /// entries without going through the real singleflight claim
     /// flow. No waiters are listening, so `notify` is a no-op.
     fn fake_event() -> Event {
@@ -233,47 +227,32 @@ mod tests {
     }
 
     #[test]
-    fn cache_done_hit_within_ttl() {
+    fn memo_hit_after_release() {
         let cache: SingleflightCache<String, u64> = SingleflightCache::default();
-        let now = t(1_000_000);
         let key = "foo/bar".to_string();
-        cache.release_done(&key, 42, now + Duration::from_secs(600), &fake_event());
-        assert_hit(cache.claim(&key, now), 42);
-        assert_hit(cache.claim(&key, now + Duration::from_secs(599)), 42);
+        cache.release_done(&key, 42, &fake_event());
+        assert_hit(cache.claim(&key), 42);
     }
 
     #[test]
-    fn cache_done_miss_when_expired() {
+    fn invalidate_removes_entry() {
         let cache: SingleflightCache<String, u64> = SingleflightCache::default();
-        let now = t(1_000_000);
         let key = "foo/bar".to_string();
-        cache.release_done(&key, 42, now + Duration::from_secs(600), &fake_event());
-        // Expired entry yields Resolve (the new caller takes
-        // ownership of refreshing it).
-        assert_resolve(cache.claim(&key, now + Duration::from_secs(601)));
-    }
-
-    #[test]
-    fn cache_invalidate_removes_entry() {
-        let cache: SingleflightCache<String, u64> = SingleflightCache::default();
-        let now = t(1_000_000);
-        let key = "foo/bar".to_string();
-        cache.release_done(&key, 42, now + Duration::from_secs(600), &fake_event());
+        cache.release_done(&key, 42, &fake_event());
         cache.invalidate(&key);
-        assert_resolve(cache.claim(&key, now));
+        assert_resolve(cache.claim(&key));
     }
 
     #[test]
-    fn cache_singleflight_second_caller_waits() {
+    fn singleflight_second_caller_waits() {
         let cache: SingleflightCache<String, u64> = SingleflightCache::default();
-        let now = t(1_000_000);
         let key = "foo/bar".to_string();
         // First caller claims an in-flight slot.
-        assert_resolve(cache.claim(&key, now));
+        assert_resolve(cache.claim(&key));
         // Second caller for same key gets a Wait, sharing the
         // first caller's event. Don't call notify (the test only
         // verifies the state-machine transition).
-        match cache.claim(&key, now) {
+        match cache.claim(&key) {
             Claim::Wait(_) => {}
             Claim::Hit(_) => panic!("expected Wait, got Hit"),
             Claim::Resolve(_) => panic!("expected Wait, got Resolve"),
@@ -283,9 +262,8 @@ mod tests {
     #[test]
     fn inflight_guard_drop_invalidates_and_notifies() {
         let cache: SingleflightCache<String, u64> = SingleflightCache::default();
-        let now = t(1_000_000);
         let key = "foo/bar".to_string();
-        let ev = match cache.claim(&key, now) {
+        let ev = match cache.claim(&key) {
             Claim::Resolve(ev) => ev,
             _ => panic!("expected initial Resolve"),
         };
@@ -295,15 +273,14 @@ mod tests {
             let _guard = InFlightGuard::new(&cache, key.clone(), ev);
         }
         // Cache must be empty and a new caller must get Resolve.
-        assert_resolve(cache.claim(&key, now));
+        assert_resolve(cache.claim(&key));
     }
 
     #[test]
     fn inflight_guard_commit_done_puts_entry() {
         let cache: SingleflightCache<String, u64> = SingleflightCache::default();
-        let now = t(1_000_000);
         let key = "foo/bar".to_string();
-        let ev = match cache.claim(&key, now) {
+        let ev = match cache.claim(&key) {
             Claim::Resolve(ev) => ev,
             _ => panic!("expected initial Resolve"),
         };
@@ -312,9 +289,9 @@ mod tests {
             // Resolve succeeded; commit_done transitions the guard
             // to `Done`. On drop, the cache receives release_done
             // and waiters are notified.
-            guard.commit_done(42, now + Duration::from_secs(600));
+            guard.commit_done(42);
         }
         // Subsequent callers Hit the committed entry.
-        assert_hit(cache.claim(&key, now), 42);
+        assert_hit(cache.claim(&key), 42);
     }
 }

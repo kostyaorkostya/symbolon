@@ -387,11 +387,9 @@ impl GitHubProvider {
             parsed.owner().to_ascii_lowercase(),
             parsed.repo().to_ascii_lowercase()
         );
-        let now = (self.clock)();
-
         let repo_id = self
             .repo_ids
-            .with(&key, now, CACHE_TTL, async || {
+            .with(&key, async || {
                 self.resolve_repo_id(req_id, parsed.owner(), parsed.repo())
                     .await
             })
@@ -942,8 +940,6 @@ impl<T> ProviderCall<T> {
         }
     }
 }
-
-const CACHE_TTL: Duration = Duration::from_secs(600);
 
 // ============================================================================
 // JWT signing

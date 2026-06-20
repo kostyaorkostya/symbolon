@@ -249,10 +249,7 @@ async fn dispatch(
 // ---------------------------------------------------------------------------
 
 fn handle_status(state: &SharedState) -> serde_json::Value {
-    let uptime_sec = SystemTime::now()
-        .duration_since(state.start_time)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let uptime_sec = state.start_time.elapsed().as_secs();
     let mut providers: Vec<&str> = state.providers.iter().map(|p| p.host()).collect();
     providers.sort();
     let client_count = state.clients.borrow().len();

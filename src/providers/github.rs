@@ -395,8 +395,7 @@ impl GitHubProvider {
             .resolve_with_singleflight(req_id, &key, parsed.owner(), parsed.repo(), now)
             .await?;
 
-        let m = self
-            .mint_token(req_id, repo_id, path)
+        self.mint_token(req_id, repo_id, path)
             .await
             .inspect_err(|e| {
                 // Repo deleted/recreated since the resolve — drop the
@@ -404,17 +403,7 @@ impl GitHubProvider {
                 if matches!(e, GithubError::RepoNotFound { .. }) {
                     self.repo_ids.invalidate(&key);
                 }
-            })?;
-        Ok(MintData {
-            response: git_credential::Response {
-                username: "x-access-token".to_string(),
-                password: m.token,
-                password_expiry_utc: m.expires_at,
-            },
-            repo_id,
-            out_req_id: m.out_req_id,
-            provider_req_id: m.provider_req_id,
-        })
+            })
     }
 }
 
@@ -565,25 +554,11 @@ impl GitHubProvider {
             Ok(r) => r,
             Err(e) => return ProviderCall::pre_send(e),
         };
-        let status = resp.status().as_u16();
-        let provider_req_id = Self::read_provider_req_id(&resp);
-        let retry_after = Self::read_retry_after(&resp);
-        let body = match resp.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                return ProviderCall {
-                    status,
-                    provider_req_id,
-                    retry_after,
-                    result: Err(GithubError::from(e)),
-                };
-            }
-        };
         ProviderCall {
-            status,
-            provider_req_id,
-            retry_after,
-            result: Ok(body),
+            status: resp.status().as_u16(),
+            provider_req_id: Self::read_provider_req_id(&resp),
+            retry_after: Self::read_retry_after(&resp),
+            result: resp.bytes().await.map_err(GithubError::from),
         }
     }
 
@@ -665,24 +640,20 @@ impl GitHubProvider {
     ) -> Result<T, GithubError> {
         let token = self.mint_metadata_token(req_id).await?;
         let result = work(&token).await;
-        self.revoke_installation_token(req_id, &token).await;
-        result
-    }
-
-    /// Fire-and-forget `DELETE /installation/token` to revoke the
-    /// passed installation token. Failures are logged as a
-    /// `provider_call_done` breadcrumb but do NOT propagate — the
-    /// caller has already finished with the token, the worst case
-    /// is the token sticks around for its natural 1-hour TTL.
-    async fn revoke_installation_token(&self, req_id: &ReqId, install_token: &str) {
+        // Best-effort `DELETE /installation/token`: failures are
+        // already logged as `provider_call_done` breadcrumbs by
+        // with_breadcrumbs; we discard them here because the caller
+        // has already finished with the token and the worst case is
+        // the token sticks around for its natural 1-hour TTL.
         let _ = self
             .with_breadcrumbs(
                 req_id,
                 "revoke_install_token",
                 self.request_timeout,
-                async |out| self.revoke_token_inner(out, install_token).await,
+                async |out| self.revoke_token_inner(out, &token).await,
             )
             .await;
+        result
     }
 
     async fn revoke_token_inner(
@@ -691,17 +662,16 @@ impl GitHubProvider {
         install_token: &str,
     ) -> ProviderCall<()> {
         let url = format!("{}/installation/token", self.api_base);
-        let call = self
-            .http_call(
-                Method::Delete,
-                &url,
-                install_token,
-                None,
-                &out_req_id,
-                self.request_timeout,
-            )
-            .await;
-        call.map_with_meta(|_, m| match m.status {
+        self.http_call(
+            Method::Delete,
+            &url,
+            install_token,
+            None,
+            &out_req_id,
+            self.request_timeout,
+        )
+        .await
+        .map_with_meta(|_, m| match m.status {
             // 204 No Content = revoked.
             204 => Ok(()),
             s => Err(GithubError::from_common_status(
@@ -713,15 +683,13 @@ impl GitHubProvider {
     }
 
     async fn mint_metadata_token(&self, req_id: &ReqId) -> Result<String, GithubError> {
-        let (token, _expires) = self
-            .with_breadcrumbs(
-                req_id,
-                "mint_metadata_token",
-                self.request_timeout,
-                async |out| self.mint_metadata_token_inner(out).await,
-            )
-            .await?;
-        Ok(token)
+        self.with_breadcrumbs(
+            req_id,
+            "mint_metadata_token",
+            self.request_timeout,
+            async |out| self.mint_metadata_token_inner(out).await,
+        )
+        .await
     }
 
     async fn mint_token(
@@ -729,7 +697,7 @@ impl GitHubProvider {
         req_id: &ReqId,
         repo_id: RepoId,
         path: &str,
-    ) -> Result<MintToken, GithubError> {
+    ) -> Result<MintData, GithubError> {
         self.with_breadcrumbs(req_id, "mint_token", self.request_timeout, async |out| {
             self.mint_token_inner(out, repo_id, path).await
         })
@@ -767,23 +735,9 @@ impl GitHubProvider {
             if status != 200 {
                 return Err(GithubError::from_common_status(status, &body, retry_after));
             }
-            #[derive(Deserialize)]
-            struct Resp {
-                client_id: String,
-            }
-            let r: Resp =
-                serde_json::from_slice(&body).map_err(|_| GithubError::ParseResponse {
-                    context: "selfcheck",
-                    detail: "json",
-                })?;
-            if r.client_id != self.client_id {
-                return Err(GithubError::ClientIdMismatch {
-                    configured: self.client_id.clone(),
-                    reported: r.client_id,
-                });
-            }
+            let client_id = Self::check_app_identity(&body, &self.client_id)?;
             Ok(SelfcheckData {
-                client_id: r.client_id,
+                client_id,
                 installation_id: self.installation_id,
                 api_base: self.api_base.clone(),
                 clock_skew_sec,
@@ -844,10 +798,7 @@ impl GitHubProvider {
     /// precedes the actual narrow-scope mint. 404 here means
     /// "installation not found" — surfaced as `OtherStatus` rather
     /// than `RepoNotFound` since this mint isn't repo-scoped.
-    async fn mint_metadata_token_inner(
-        &self,
-        out_req_id: OutReqId,
-    ) -> ProviderCall<(String, SystemTime)> {
+    async fn mint_metadata_token_inner(&self, out_req_id: OutReqId) -> ProviderCall<String> {
         let jwt = match self.sign_jwt_now().await {
             Ok(j) => j,
             Err(e) => return ProviderCall::pre_send(e),
@@ -858,19 +809,21 @@ impl GitHubProvider {
         );
         // Inline body: metadata-only installation token, no `repository_ids`
         // — `GET /repos/{owner}/{repo}` accepts installation tokens but not
-        // the App JWT, so we mint a broad one for the lookup.
-        let call = self
-            .http_call(
-                Method::Post,
-                &url,
-                &jwt,
-                Some(br#"{"permissions":{"metadata":"read"}}"#.to_vec()),
-                &out_req_id,
-                self.request_timeout,
-            )
-            .await;
-        call.map_with_meta(|bytes, m| match m.status {
-            201 => Self::parse_mint_response(&bytes),
+        // the App JWT, so we mint a broad one for the lookup. We discard the
+        // `expires_at` half of the parsed response because the token is used
+        // for one call in milliseconds and revoked before the hour-long TTL
+        // could matter.
+        self.http_call(
+            Method::Post,
+            &url,
+            &jwt,
+            Some(br#"{"permissions":{"metadata":"read"}}"#.to_vec()),
+            &out_req_id,
+            self.request_timeout,
+        )
+        .await
+        .map_with_meta(|bytes, m| match m.status {
+            201 => Self::parse_mint_response(&bytes).map(|(token, _expires)| token),
             s => Err(GithubError::from_common_status(s, &bytes, m.retry_after)),
         })
     }
@@ -880,7 +833,7 @@ impl GitHubProvider {
         out_req_id: OutReqId,
         repo_id: RepoId,
         path: &str,
-    ) -> ProviderCall<MintToken> {
+    ) -> ProviderCall<MintData> {
         let jwt = match self.sign_jwt_now().await {
             Ok(j) => j,
             Err(e) => return ProviderCall::pre_send(e),
@@ -889,23 +842,26 @@ impl GitHubProvider {
             "{}/app/installations/{}/access_tokens",
             self.api_base, self.installation_id
         );
-        let call = self
-            .http_call(
-                Method::Post,
-                &url,
-                &jwt,
-                Some(Self::build_mint_body(repo_id)),
-                &out_req_id,
-                self.request_timeout,
-            )
-            .await;
-        call.map_with_meta(|bytes, m| match m.status {
+        self.http_call(
+            Method::Post,
+            &url,
+            &jwt,
+            Some(Self::build_mint_body(repo_id)),
+            &out_req_id,
+            self.request_timeout,
+        )
+        .await
+        .map_with_meta(move |bytes, m| match m.status {
             201 => {
                 let (token, expires_at) = Self::parse_mint_response(&bytes)?;
-                Ok(MintToken {
-                    token,
-                    expires_at,
-                    out_req_id: out_req_id.clone(),
+                Ok(MintData {
+                    response: git_credential::Response {
+                        username: "x-access-token".to_string(),
+                        password: token,
+                        password_expiry_utc: expires_at,
+                    },
+                    repo_id,
+                    out_req_id,
                     provider_req_id: m.provider_req_id.cloned(),
                 })
             }
@@ -915,14 +871,6 @@ impl GitHubProvider {
             s => Err(GithubError::from_common_status(s, &bytes, m.retry_after)),
         })
     }
-}
-
-/// Raw mint-token result before `mint` wraps it into a `MintData`.
-struct MintToken {
-    token: String,
-    expires_at: SystemTime,
-    out_req_id: OutReqId,
-    provider_req_id: Option<ProviderReqId>,
 }
 
 // ============================================================================
@@ -1214,6 +1162,28 @@ impl GitHubProvider {
             r#"{{"repository_ids":[{repo_id}],"permissions":{{"contents":"write","metadata":"read"}}}}"#
         )
         .into_bytes()
+    }
+
+    /// Parse `GET /app`'s body and verify the reported `client_id`
+    /// matches the configured one (`expected`). Returns the
+    /// confirmed `client_id` on success so the caller can fold it
+    /// into `SelfcheckData` without re-parsing.
+    fn check_app_identity(body: &[u8], expected: &str) -> Result<String, GithubError> {
+        #[derive(Deserialize)]
+        struct App {
+            client_id: String,
+        }
+        let app: App = serde_json::from_slice(body).map_err(|_| GithubError::ParseResponse {
+            context: "selfcheck",
+            detail: "json",
+        })?;
+        if app.client_id != expected {
+            return Err(GithubError::ClientIdMismatch {
+                configured: expected.to_string(),
+                reported: app.client_id,
+            });
+        }
+        Ok(app.client_id)
     }
 
     fn parse_mint_response(bytes: &[u8]) -> Result<(String, SystemTime), GithubError> {

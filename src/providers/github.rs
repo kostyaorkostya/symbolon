@@ -395,15 +395,17 @@ impl GitHubProvider {
             .resolve_with_singleflight(req_id, &key, parsed.owner(), parsed.repo(), now)
             .await?;
 
-        self.mint_token(req_id, repo_id, path)
-            .await
-            .inspect_err(|e| {
-                // Repo deleted/recreated since the resolve — drop the
-                // cached id so the next mint re-resolves.
-                if matches!(e, GithubError::RepoNotFound { .. }) {
-                    self.repo_ids.invalidate(&key);
-                }
-            })
+        self.with_breadcrumbs(req_id, "mint_token", self.request_timeout, async |out| {
+            self.mint_token_inner(out, repo_id, path).await
+        })
+        .await
+        .inspect_err(|e| {
+            // Repo deleted/recreated since the resolve — drop the
+            // cached id so the next mint re-resolves.
+            if matches!(e, GithubError::RepoNotFound { .. }) {
+                self.repo_ids.invalidate(&key);
+            }
+        })
     }
 }
 
@@ -638,7 +640,14 @@ impl GitHubProvider {
         req_id: &ReqId,
         work: impl AsyncFnOnce(&str) -> Result<T, GithubError>,
     ) -> Result<T, GithubError> {
-        let token = self.mint_metadata_token(req_id).await?;
+        let token = self
+            .with_breadcrumbs(
+                req_id,
+                "mint_metadata_token",
+                self.request_timeout,
+                async |out| self.mint_metadata_token_inner(out).await,
+            )
+            .await?;
         let result = work(&token).await;
         // Best-effort `DELETE /installation/token`: failures are
         // already logged as `provider_call_done` breadcrumbs by
@@ -682,28 +691,6 @@ impl GitHubProvider {
         })
     }
 
-    async fn mint_metadata_token(&self, req_id: &ReqId) -> Result<String, GithubError> {
-        self.with_breadcrumbs(
-            req_id,
-            "mint_metadata_token",
-            self.request_timeout,
-            async |out| self.mint_metadata_token_inner(out).await,
-        )
-        .await
-    }
-
-    async fn mint_token(
-        &self,
-        req_id: &ReqId,
-        repo_id: RepoId,
-        path: &str,
-    ) -> Result<MintData, GithubError> {
-        self.with_breadcrumbs(req_id, "mint_token", self.request_timeout, async |out| {
-            self.mint_token_inner(out, repo_id, path).await
-        })
-        .await
-    }
-
     /// `GET /app` to verify reachability + key/App pairing.
     /// Unlike the other endpoints, this one reads the `Date`
     /// response header for clock-skew reporting BEFORE consuming
@@ -730,7 +717,17 @@ impl GitHubProvider {
             status = resp.status().as_u16();
             provider_req_id = Self::read_provider_req_id(&resp);
             let retry_after = Self::read_retry_after(&resp);
-            let clock_skew_sec = Self::read_clock_skew(&resp);
+            // HTTP `Date` header (RFC 7231 § 7.1.1.1) parsed via
+            // `time`'s Rfc2822 (`GMT` → zero offset). Silently 0 on
+            // a missing or unparseable header — clock skew is
+            // informational, not load-bearing.
+            let clock_skew_sec = resp
+                .headers()
+                .get("date")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| OffsetDateTime::parse(s, &Rfc2822).ok())
+                .map(|t| t.unix_timestamp() - OffsetDateTime::now_utc().unix_timestamp())
+                .unwrap_or(0);
             let body = resp.bytes().await?;
             if status != 200 {
                 return Err(GithubError::from_common_status(status, &body, retry_after));
@@ -784,7 +781,18 @@ impl GitHubProvider {
             )
             .await;
         call.map_with_meta(|body, m| match m.status {
-            200 => Self::parse_repo_response(&body),
+            200 => {
+                #[derive(Deserialize)]
+                struct Resp {
+                    id: RepoId,
+                }
+                serde_json::from_slice::<Resp>(&body)
+                    .map(|r| r.id)
+                    .map_err(|_| GithubError::ParseResponse {
+                        context: "repo",
+                        detail: "json",
+                    })
+            }
             404 => Err(GithubError::RepoNotFound {
                 path: format!("{owner}/{repo}"),
             }),
@@ -842,11 +850,18 @@ impl GitHubProvider {
             "{}/app/installations/{}/access_tokens",
             self.api_base, self.installation_id
         );
+        // Per-mint body: exactly one repo, hard-coded permission set
+        // (AGENTS.md invariants #4, #5). Wire bytes pinned by
+        // `tests::mint_request_headers_and_body_exact` (integration).
+        let body = format!(
+            r#"{{"repository_ids":[{repo_id}],"permissions":{{"contents":"write","metadata":"read"}}}}"#
+        )
+        .into_bytes();
         self.http_call(
             Method::Post,
             &url,
             &jwt,
-            Some(Self::build_mint_body(repo_id)),
+            Some(body),
             &out_req_id,
             self.request_timeout,
         )
@@ -1136,32 +1151,12 @@ impl GitHubProvider {
     /// ignore the date form. Returns `None` on absent or malformed
     /// values — caller falls back to "wait at your own pace."
     /// HTTP `Date` header (IMF-fixdate per RFC 7231 § 7.1.1.1) is
-    /// accepted by `time`'s Rfc2822 parser (`GMT` → zero offset).
-    /// Returns 0 if the header is missing or unparseable; clock skew
-    /// is informational, not load-bearing.
-    fn read_clock_skew(resp: &cyper::Response) -> i64 {
-        resp.headers()
-            .get("date")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| OffsetDateTime::parse(s, &Rfc2822).ok())
-            .map(|t| t.unix_timestamp() - OffsetDateTime::now_utc().unix_timestamp())
-            .unwrap_or(0)
-    }
-
     fn read_retry_after(resp: &cyper::Response) -> Option<Duration> {
         resp.headers()
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.trim().parse::<u64>().ok())
             .map(Duration::from_secs)
-    }
-
-    /// `tests::build_mint_body_exact_bytes`.
-    fn build_mint_body(repo_id: RepoId) -> Vec<u8> {
-        format!(
-            r#"{{"repository_ids":[{repo_id}],"permissions":{{"contents":"write","metadata":"read"}}}}"#
-        )
-        .into_bytes()
     }
 
     /// Parse `GET /app`'s body and verify the reported `client_id`
@@ -1204,19 +1199,6 @@ impl GitHubProvider {
                 detail: "bad expires_at",
             })?;
         Ok((r.token, UNIX_EPOCH + Duration::from_secs(secs)))
-    }
-
-    fn parse_repo_response(bytes: &[u8]) -> Result<RepoId, GithubError> {
-        #[derive(Deserialize)]
-        struct Resp {
-            id: RepoId,
-        }
-        serde_json::from_slice::<Resp>(bytes)
-            .map(|r| r.id)
-            .map_err(|_| GithubError::ParseResponse {
-                context: "repo",
-                detail: "json",
-            })
     }
 }
 
@@ -1386,15 +1368,6 @@ mod tests {
     }
 
     #[test]
-    fn build_mint_body_exact_bytes() {
-        let bytes = GitHubProvider::build_mint_body(RepoId::from(42));
-        assert_eq!(
-            bytes,
-            br#"{"repository_ids":[42],"permissions":{"contents":"write","metadata":"read"}}"#
-        );
-    }
-
-    #[test]
     fn parse_mint_response_ok() {
         let body = br#"{"token":"ghs_x","expires_at":"2026-05-31T13:00:00Z","extra":"ignored"}"#;
         let (tok, exp) = GitHubProvider::parse_mint_response(body).unwrap();
@@ -1469,28 +1442,6 @@ mod tests {
             assert!(!s.contains(token_like), "chain leaks token: {s}");
             cur = e.source();
         }
-    }
-
-    #[test]
-    fn parse_repo_response_ok() {
-        let body = br#"{"id":12345,"name":"Hello-World"}"#;
-        assert_eq!(
-            GitHubProvider::parse_repo_response(body).unwrap(),
-            RepoId::from(12345)
-        );
-    }
-
-    #[test]
-    fn parse_repo_response_missing_id() {
-        let body = br#"{"name":"Hello-World"}"#;
-        let err = GitHubProvider::parse_repo_response(body).unwrap_err();
-        assert!(matches!(
-            err,
-            GithubError::ParseResponse {
-                context: "repo",
-                detail: "json",
-            }
-        ));
     }
 
     #[test]

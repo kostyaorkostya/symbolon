@@ -15,7 +15,11 @@ pub mod jwt_rs256;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use derive_more::{AsRef, Display, From};
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+
+use crate::ids::{OutReqId, ReqId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString)]
 #[strum(serialize_all = "snake_case")]
@@ -83,15 +87,31 @@ pub enum ProviderError {
     Internal(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 }
 
+/// Upstream provider's own correlation id, surfaced on the
+/// abstract outcome shapes and on the `provider_call_done`
+/// breadcrumb. For GitHub, this is `X-GitHub-Request-Id`. Other
+/// providers fill it from whatever their equivalent header is.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, AsRef, Display, From, Serialize, Deserialize)]
+#[as_ref(str)]
+#[from(String)]
+#[serde(transparent)]
+pub struct ProviderReqId(String);
+
+impl ProviderReqId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 pub struct MintOutcome {
     pub response: crate::git_credential::Response,
-    pub out_req_id: String,
-    pub provider_req_id: Option<String>,
+    pub out_req_id: OutReqId,
+    pub provider_req_id: Option<ProviderReqId>,
 }
 
 pub struct SelfcheckOutcome {
-    pub out_req_id: String,
-    pub provider_req_id: Option<String>,
+    pub out_req_id: OutReqId,
+    pub provider_req_id: Option<ProviderReqId>,
     pub clock_skew_sec: i64,
     /// Provider-specific diagnostic dump — flattened into the
     /// admin JSON response under `details`. Shape is documented
@@ -111,10 +131,10 @@ pub trait Provider {
     /// `path` is the `owner/repo` (or namespace/project) from the
     /// git-credential request. `req_id` is the broker-side ULID
     /// for log correlation.
-    async fn mint(&self, req_id: &str, path: &str) -> Result<MintOutcome, ProviderError>;
+    async fn mint(&self, req_id: &ReqId, path: &str) -> Result<MintOutcome, ProviderError>;
 
     /// Verify the configured credential can talk to the provider's
     /// API and return diagnostic info. Called once per provider at
     /// startup and on-demand via `symbolon <provider> selfcheck`.
-    async fn selfcheck(&self, req_id: &str) -> Result<SelfcheckOutcome, ProviderError>;
+    async fn selfcheck(&self, req_id: &ReqId) -> Result<SelfcheckOutcome, ProviderError>;
 }

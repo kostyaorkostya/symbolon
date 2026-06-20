@@ -31,6 +31,7 @@ pub(crate) mod cpu_worker;
 pub(crate) mod daemon;
 pub(crate) mod events;
 pub(crate) mod git_credential;
+pub(crate) mod ids;
 pub(crate) mod loader;
 pub(crate) mod logging;
 pub(crate) mod mlock;
@@ -62,13 +63,17 @@ pub use crate::daemon::{Service, ServiceHandle, run as run_daemon};
 #[doc(hidden)]
 pub use crate::events::EventKind;
 #[doc(hidden)]
+pub use crate::ids::{OutReqId, ReqId};
+#[doc(hidden)]
 pub use crate::loader::load_config;
 #[doc(hidden)]
 pub use crate::logging::{ErrorChain, setup_tracing};
 #[doc(hidden)]
 pub use crate::mlock::{MlockRequiredFailed, apply as mlock_apply};
 #[doc(hidden)]
-pub use crate::providers::github::{GitHubProvider, GithubError};
+pub use crate::providers::ProviderReqId;
+#[doc(hidden)]
+pub use crate::providers::github::{GitHubProvider, GithubError, InstallationId, RepoId};
 #[doc(hidden)]
 pub use crate::ready::notify as ready_notify;
 #[doc(hidden)]

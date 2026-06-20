@@ -31,6 +31,7 @@ use tracing::info;
 
 use crate::daemon::{ResolvedClient, SharedState};
 use crate::events::EventKind;
+use crate::ids::ReqId;
 use crate::providers::ProviderError;
 
 const CLIENTS_FILE_MODE: u32 = 0o640;
@@ -196,7 +197,7 @@ pub(crate) async fn run_admin_loop(
 }
 
 async fn handle_admin(mut stream: UnixStream, state: Rc<SharedState>) {
-    let req_id = ulid::Ulid::new().to_string();
+    let req_id = ReqId::new();
     let raw = match read_line(&mut stream).await {
         Ok(bytes) if !bytes.is_empty() => bytes,
         _ => return,
@@ -219,7 +220,7 @@ async fn handle_admin(mut stream: UnixStream, state: Rc<SharedState>) {
 }
 
 async fn dispatch(
-    req_id: &str,
+    req_id: &ReqId,
     request: &Request,
     state: &Rc<SharedState>,
 ) -> Result<serde_json::Value, serde_json::Value> {
@@ -318,7 +319,7 @@ impl Drop for EnrollRollback<'_> {
 }
 
 async fn handle_enroll(
-    req_id: &str,
+    req_id: &ReqId,
     state: &SharedState,
     provider: &str,
     client: &str,
@@ -421,7 +422,7 @@ async fn handle_enroll(
 }
 
 async fn handle_revoke(
-    req_id: &str,
+    req_id: &ReqId,
     state: &SharedState,
     provider: &str,
     client: &str,
@@ -475,7 +476,7 @@ async fn handle_revoke(
 }
 
 async fn handle_mint(
-    req_id: &str,
+    req_id: &ReqId,
     state: &Rc<SharedState>,
     provider: &str,
     client: &str,
@@ -515,7 +516,7 @@ async fn handle_mint(
 }
 
 async fn handle_selfcheck(
-    req_id: &str,
+    req_id: &ReqId,
     state: &Rc<SharedState>,
     provider: &str,
 ) -> Result<serde_json::Value, serde_json::Value> {

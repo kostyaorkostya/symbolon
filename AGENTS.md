@@ -219,6 +219,19 @@ Pinned in `Cargo.toml`:
   panics. The `signal` feature is intentionally NOT enabled; we
   use signal-hook-registry directly for permanent signal handlers;
   see `src/signals.rs`.)
+- `derive_more` with `default-features = false, features = ["as_ref",
+  "display", "from"]` (proc-macro derives for newtype boilerplate
+  on the correlation-ID types in `src/ids.rs` and the GitHub-specific
+  ID types in `src/providers/github.rs`. `Display` makes
+  `tracing::info!(req_id = %req_id, …)` transparent; `From<T>` gives
+  ergonomic construction from the inner primitive; `AsRef<str>`
+  lets the newtypes pass through `&str`-taking APIs at FFI
+  boundaries (HTTP headers, JSON serialisation) without manual
+  `.as_str()` calls everywhere. Feature trim drops the rest of
+  derive_more's catalog (~30 derives we don't use) to keep compile
+  surface narrow. `syn`/`quote`/`proc-macro2` are already in our
+  build graph via serde-derive and thiserror, so the marginal
+  build cost is one small derive crate.)
 - `cyper` with `default-features = false, features = ["rustls",
   "http2"]` (HTTPS client for provider APIs. We turn off cyper's
   `native-tls` default to keep the binary OpenSSL-free under musl,

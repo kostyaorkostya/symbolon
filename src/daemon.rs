@@ -27,8 +27,9 @@ use crate::connection_tracker::ConnectionTracker;
 use crate::cpu_worker::CpuWorker;
 use crate::events::EventKind;
 use crate::git_credential;
+use crate::ids::{OutReqId, ReqId};
 use crate::providers::github::{GitHubProvider, GithubError};
-use crate::providers::{Provider, ProviderError};
+use crate::providers::{Provider, ProviderError, ProviderReqId};
 use crate::psk_store::{PskStore, PskStoreError};
 use crate::sandbox::{self, SandboxError, SandboxPaths};
 use crate::transport::{Phase, Responder, SessionError, Step};
@@ -307,14 +308,14 @@ impl Service {
     /// startup.
     pub async fn selfcheck(&self) {
         for provider in &self.state.providers {
-            let req_id = ulid::Ulid::new().to_string();
+            let req_id = ReqId::new();
             match provider.selfcheck(&req_id).await {
                 Ok(outcome) => {
                     info!(
                         evt = %EventKind::Selfcheck,
                         req_id = %req_id,
                         out_req_id = %outcome.out_req_id,
-                        provider_req_id = outcome.provider_req_id.as_deref().unwrap_or(""),
+                        provider_req_id = outcome.provider_req_id.as_ref().map(|p| p.as_str()).unwrap_or(""),
                         provider = %provider.host(),
                         ok = true,
                         clock_skew_sec = outcome.clock_skew_sec,
@@ -373,7 +374,7 @@ impl Service {
                         drop(stream);
                         continue;
                     }
-                    let req_id = ulid::Ulid::new().to_string();
+                    let req_id = ReqId::new();
                     let state = state.clone();
                     tracker.spawn(async move || {
                         handle_connection(stream, req_id, state).await;
@@ -685,7 +686,7 @@ impl TryFrom<ClientsFile> for HashMap<String, ResolvedClient> {
     }
 }
 
-async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<SharedState>) {
+async fn handle_connection(mut stream: TcpStream, req_id: ReqId, state: Rc<SharedState>) {
     /// Cross-step state the driver needs to stash so the final
     /// `evt=mint` log event (emitted only after the encrypted
     /// response is on the wire) can see everything from the
@@ -694,8 +695,8 @@ async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<Shar
         host: String,
         path: String,
         response: git_credential::Response,
-        out_req_id: String,
-        provider_req_id: Option<String>,
+        out_req_id: OutReqId,
+        provider_req_id: Option<ProviderReqId>,
         provider_ms: u64,
     }
 
@@ -903,7 +904,7 @@ async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<Shar
                     info!(
                         req_id = %req_id,
                         out_req_id = %rec.out_req_id,
-                        provider_req_id = rec.provider_req_id.as_deref().unwrap_or(""),
+                        provider_req_id = rec.provider_req_id.as_ref().map(|p| p.as_str()).unwrap_or(""),
                         evt = %EventKind::Mint,
                         provider = %rec.host,
                         client = %client_str,
@@ -924,7 +925,7 @@ async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<Shar
 /// call — used for `FrameTooBig` whose meaning depends on whether
 /// we were doing the handshake or the transport read.
 fn log_session_failure(
-    req_id: &str,
+    req_id: &ReqId,
     peer: Option<std::net::SocketAddr>,
     phase: Phase,
     client_name: Option<&str>,
@@ -1019,7 +1020,7 @@ fn log_session_failure(
 /// Log a clean EOF (read returned 0 bytes) attributed to the current
 /// protocol phase.
 fn log_phase_eof(
-    req_id: &str,
+    req_id: &ReqId,
     peer: Option<std::net::SocketAddr>,
     phase: Phase,
     client_name: Option<&str>,
@@ -1061,7 +1062,7 @@ fn log_phase_eof(
 }
 
 fn log_mint_error(
-    req_id: &str,
+    req_id: &ReqId,
     client_name: &str,
     host: &str,
     path: &str,

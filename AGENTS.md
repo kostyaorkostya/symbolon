@@ -192,6 +192,23 @@ Pinned in `Cargo.toml`:
   `clap` for code-size and over hand-rolled parsing for maintainability.
   All subcommands (`daemon`, `status`, `list`, `github …`) are regular
   argh subcommands; bare `symbolon` prints help and exits non-zero.)
+- `async-trait` (proc macro that rewrites `async fn` trait methods
+  to return `Pin<Box<dyn Future + 'async_trait>>`. Required because
+  AFIT + `dyn Trait` is not yet dyn-compatible on stable Rust as
+  of 1.96 — the only way to get a heterogeneous
+  `Vec<Box<dyn Provider>>` for the `Provider` trait in
+  `src/providers/mod.rs`. We invoke it as `#[async_trait(?Send)]`
+  because compio is single-threaded; the `?Send` drops the default
+  `Send + 'static` bound on the returned future. Cost: one
+  `Box::pin` per `mint` / `selfcheck` call — invisible next to
+  the outbound HTTPS round-trip these methods perform. Build cost:
+  `syn`/`quote`/`proc-macro2` are already in our graph via
+  `serde_derive` / `thiserror_impl`. Picked over hand-rolled
+  `Pin<Box<dyn Future>>` returns (identical alloc cost, but every
+  method signature becomes noise) and over the enum-with-match
+  alternative (would have foreclosed the trait shape PROVIDER_CONTRACT.md
+  promised, and forced provider variants to live in a single
+  central enum rather than as sibling modules).)
 - `compio` with features `runtime,macros,net,fs,time,io-uring,ring`
   (async runtime; `macros` for `#[compio::main]`; `net`+`fs`+`time`
   for the daemon surface; `io-uring` listed explicitly so a future
@@ -384,6 +401,10 @@ Addenda:
   that need extra context (e.g. status code + body), use an
   inherent `Self::from_*` method on the enum rather than a free
   function or a tuple-receiving `From`.
+- Trait async methods: declare with `#[async_trait::async_trait(?Send)]`.
+  `?Send` is required because compio is single-threaded; the default
+  `Send + 'static` bound would force an unnecessary contract on every
+  impl. See `impl Provider for GitHubProvider` in `src/providers/github.rs`.
 - RAII guards: default Drop is the rollback path; the success
   path is an explicit `commit_*` method that consumes `self` and
   transitions an internal state, so the shared Drop logic still
@@ -434,7 +455,7 @@ src/
   mlock.rs             # mlockall(MCL_CURRENT|MCL_FUTURE) wrapper
   sandbox.rs           # landlock (FS + TCP + UDS scope + signal scope)
   providers/
-    mod.rs             # provider re-exports (one type today; trait when a 2nd lands)
+    mod.rs             # `Provider` trait + abstract `ProviderError` / outcomes
     github.rs          # GitHub: JWT, repo-ID singleflight cache, mint
     jwt_rs256.rs       # minimal RS256 JWS signer (rsa + sha2)
 tests/

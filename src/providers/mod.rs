@@ -1,10 +1,113 @@
-//! Provider abstraction.
+//! Provider abstraction. The daemon talks to every configured
+//! provider through this trait — repo-ID resolution, per-mint
+//! token issuance, startup selfcheck. Each concrete provider is
+//! a sibling module (`github`, future `gitlab`, etc.) holding
+//! its own private-key/PAT machinery, HTTP client, and caches.
+//! AGENTS.md invariant #1: one identity per (broker, provider).
 //!
-//! Single responsibility: the trait (or enum) the daemon uses to
-//! talk to a configured provider — repo-ID resolution and per-mint
-//! token issuance. Each concrete provider is a sibling module with
-//! its own private-key handling and HTTP client. AGENTS.md invariant
-//! #1: one identity per (broker, provider).
+//! Trait dispatch goes through `Vec<Box<dyn Provider>>` in
+//! `SharedState`; methods use `#[async_trait(?Send)]` because
+//! compio is single-threaded.
 
 pub mod github;
 pub mod jwt_rs256;
+
+use std::time::Duration;
+
+use async_trait::async_trait;
+use serde_json::Value as JsonValue;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderKind {
+    Github,
+}
+
+/// Abstract failure modes the daemon switches on. Generalizable
+/// variants come from observed behaviour across GitHub, GitLab,
+/// Gitea, Forgejo, Bitbucket. GitHub-private failures (PEM load,
+/// JWT signer dead, identity mismatch) collapse into `Internal`
+/// with the original error boxed as a `source` so
+/// `crate::logging::ErrorChain` can walk the chain in the catch-all
+/// log arm.
+#[derive(Debug, thiserror::Error)]
+pub enum ProviderError {
+    #[error("transport error")]
+    Transport(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+
+    #[error("unauthorized: {body}")]
+    Unauthorized { body: String },
+
+    #[error("forbidden: {body}")]
+    Forbidden { body: String },
+
+    #[error("repository '{path}' not found or credential lacks access")]
+    RepoNotFound { path: String },
+
+    #[error("rate limited")]
+    RateLimited,
+
+    #[error("provider returned unexpected status {status}")]
+    UnexpectedStatus { status: u16 },
+
+    #[error("malformed repository path: {path}")]
+    MalformedPath { path: String },
+
+    // `context` and `detail` are `&'static` deliberately — provider
+    // responses can carry token bytes in 2xx bodies, and Display on
+    // a parse error commonly includes a fragment of the offending
+    // input. Static strings here forbid any payload from reaching
+    // a log line via this variant.
+    #[error("malformed response from {context} ({detail})")]
+    MalformedResponse {
+        context: &'static str,
+        detail: &'static str,
+    },
+
+    #[error("provider request timed out after {elapsed:?}")]
+    Timeout { elapsed: Duration },
+
+    #[error("provider request cancelled (daemon shutting down)")]
+    Cancelled,
+
+    /// Provider-private failure (PEM load, JWT signer dead,
+    /// identity mismatch, ...). The boxed source preserves the
+    /// `source()` chain for `crate::logging::ErrorChain`.
+    #[error("internal provider error")]
+    Internal(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+}
+
+pub struct MintOutcome {
+    pub response: crate::git_credential::Response,
+    pub out_req_id: String,
+    pub provider_req_id: Option<String>,
+}
+
+pub struct SelfcheckOutcome {
+    pub out_req_id: String,
+    pub provider_req_id: Option<String>,
+    pub clock_skew_sec: i64,
+    /// Provider-specific diagnostic dump — flattened into the
+    /// admin JSON response under `details`. Shape is documented
+    /// per-provider in `docs/providers/<name>.md`.
+    pub details: JsonValue,
+}
+
+#[async_trait(?Send)]
+pub trait Provider {
+    /// Host string the client's `host=` field must match byte-exact
+    /// (AGENTS.md invariant #11).
+    fn host(&self) -> &str;
+
+    fn kind(&self) -> ProviderKind;
+
+    /// Mint a short-lived credential scoped to one repository.
+    /// `path` is the `owner/repo` (or namespace/project) from the
+    /// git-credential request. `req_id` is the broker-side ULID
+    /// for log correlation.
+    async fn mint(&self, req_id: &str, path: &str) -> Result<MintOutcome, ProviderError>;
+
+    /// Verify the configured credential can talk to the provider's
+    /// API and return diagnostic info. Called once per provider at
+    /// startup and on-demand via `symbolon <provider> selfcheck`.
+    async fn selfcheck(&self, req_id: &str) -> Result<SelfcheckOutcome, ProviderError>;
+}

@@ -30,11 +30,18 @@ use tracing::info;
 use ulid::Ulid;
 use url::Url;
 
+use async_trait::async_trait;
+use serde_json::json;
+
 use crate::config::ProviderGithub;
 use crate::cpu_worker::{CpuWorker, WorkerDead};
 use crate::events::EventKind;
 use crate::git_credential;
 use crate::providers::jwt_rs256::{self, JwtSigningKey};
+use crate::providers::{
+    MintOutcome as AbstractMintOutcome, Provider, ProviderError, ProviderKind,
+    SelfcheckOutcome as AbstractSelfcheckOutcome,
+};
 
 const GITHUB_API_VERSION: &str = "2026-03-10";
 const ACCEPT_HEADER: &str = "application/vnd.github+json";
@@ -132,8 +139,35 @@ impl GithubError {
     }
 }
 
+impl From<GithubError> for ProviderError {
+    fn from(e: GithubError) -> Self {
+        match e {
+            GithubError::Http(src) => Self::Transport(Box::new(src)),
+            GithubError::Unauthorized { body } => Self::Unauthorized { body },
+            GithubError::Forbidden { body } => Self::Forbidden { body },
+            GithubError::RepoNotFound { path } => Self::RepoNotFound { path },
+            GithubError::RateLimited => Self::RateLimited,
+            GithubError::OtherStatus(s) => Self::UnexpectedStatus { status: s },
+            GithubError::MalformedPath(p) => Self::MalformedPath { path: p },
+            GithubError::ParseResponse { context, detail } => {
+                Self::MalformedResponse { context, detail }
+            }
+            GithubError::Timeout(d) => Self::Timeout { elapsed: d },
+            GithubError::Cancelled => Self::Cancelled,
+            // GitHub-private grab bag (PEM load, JWT signer, identity
+            // mismatch). The source chain is walked by `ErrorChain` in
+            // the daemon's catch-all log arm.
+            other @ (GithubError::PemRead { .. }
+            | GithubError::PemParse { .. }
+            | GithubError::JwtSign(_)
+            | GithubError::JwtSignerDead
+            | GithubError::ClientIdMismatch { .. }) => Self::Internal(Box::new(other)),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
-pub struct SelfcheckOutcome {
+pub struct SelfcheckData {
     pub(crate) client_id: String,
     pub(crate) installation_id: u64,
     pub(crate) api_base: String,
@@ -146,7 +180,7 @@ pub struct SelfcheckOutcome {
 }
 
 #[derive(Debug, Clone)]
-pub struct MintOutcome {
+pub struct MintData {
     pub response: git_credential::Response,
     pub repo_id: u64,
     /// ULID of the outbound `mint_token` HTTPS call. Pairs with
@@ -157,6 +191,12 @@ pub struct MintOutcome {
 }
 
 pub struct GitHubProvider {
+    /// Configured `[provider.github].host` — the value the daemon
+    /// matches `host=` against in incoming git-credential requests
+    /// (AGENTS.md invariant #11). Exposed via [`Self::host`] so the
+    /// `Provider` trait impl can dispatch on it without re-reading
+    /// the original config.
+    host: String,
     api_base: String,
     client_id: String,
     installation_id: u64,
@@ -239,6 +279,7 @@ impl GitHubProvider {
             key,
         };
         Ok(Self {
+            host: cfg.host.clone(),
             api_base,
             client_id: cfg.client_id.clone(),
             installation_id: cfg.installation_id,
@@ -259,10 +300,16 @@ impl GitHubProvider {
 // ============================================================================
 
 impl GitHubProvider {
+    /// Host this provider serves — the value the daemon matches
+    /// the incoming git-credential `host=` against (byte-exact).
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
     /// Verify the App private key signs a valid JWT and the App is
     /// reachable at `api_base`. The reported App ID must match the
     /// configured one — a mismatch indicates a wrong key/App pairing.
-    pub async fn selfcheck(&self, req_id: &str) -> Result<SelfcheckOutcome, GithubError> {
+    pub async fn selfcheck(&self, req_id: &str) -> Result<SelfcheckData, GithubError> {
         let (outcome, _, _) = self
             .with_breadcrumbs(req_id, "selfcheck", self.selfcheck_timeout, |out| {
                 self.selfcheck_inner(out)
@@ -271,7 +318,7 @@ impl GitHubProvider {
         Ok(outcome)
     }
 
-    pub async fn mint(&self, req_id: &str, path: &str) -> Result<MintOutcome, GithubError> {
+    pub async fn mint(&self, req_id: &str, path: &str) -> Result<MintData, GithubError> {
         let (owner, repo) = split_owner_repo(path)?;
         let key = format!(
             "{}/{}",
@@ -294,7 +341,7 @@ impl GitHubProvider {
                     self.repo_ids.invalidate(&key);
                 }
             })?;
-        Ok(MintOutcome {
+        Ok(MintData {
             response: git_credential::Response {
                 username: "x-access-token".to_string(),
                 password: m.token,
@@ -356,7 +403,11 @@ impl GitHubProvider {
                     req_id = %req_id,
                     out_req_id = %out_req_id,
                     status = pc.status,
-                    gh_req_id = pc.gh_req_id.as_deref().unwrap_or(""),
+                    // GitHub's `X-GitHub-Request-Id`. The PROTOCOLS.md
+                    // logging schema names this `provider_req_id` so
+                    // future providers (GitLab, Gitea, ...) emit the
+                    // same key with their own upstream correlation id.
+                    provider_req_id = pc.gh_req_id.as_deref().unwrap_or(""),
                     elapsed_ms = elapsed_ms,
                 );
                 pc.result.map(|v| (v, out_req_id, pc.gh_req_id))
@@ -367,7 +418,7 @@ impl GitHubProvider {
                     req_id = %req_id,
                     out_req_id = %out_req_id,
                     status = 0,
-                    gh_req_id = "",
+                    provider_req_id = "",
                     elapsed_ms = elapsed_ms,
                     error = %e,
                 );
@@ -560,10 +611,10 @@ impl GitHubProvider {
     /// helper. The async block lets `?` propagate inside the
     /// future while the surrounding scope captures status +
     /// gh_req_id for the partial-failure `ProviderCall`.
-    async fn selfcheck_inner(&self, out_req_id: String) -> ProviderCall<SelfcheckOutcome> {
+    async fn selfcheck_inner(&self, out_req_id: String) -> ProviderCall<SelfcheckData> {
         let mut status: u16 = 0;
         let mut gh_req_id: Option<String> = None;
-        let result: Result<SelfcheckOutcome, GithubError> = async {
+        let result: Result<SelfcheckData, GithubError> = async {
             let jwt = self.sign_jwt_now().await?;
             let url = format!("{}/app", self.api_base);
             let resp = self
@@ -608,7 +659,7 @@ impl GitHubProvider {
                     reported: r.client_id,
                 });
             }
-            Ok(SelfcheckOutcome {
+            Ok(SelfcheckData {
                 client_id: r.client_id,
                 installation_id: self.installation_id,
                 api_base: self.api_base.clone(),
@@ -731,7 +782,7 @@ impl GitHubProvider {
     }
 }
 
-/// Raw mint-token result before `mint` wraps it into a `MintOutcome`.
+/// Raw mint-token result before `mint` wraps it into a `MintData`.
 struct MintToken {
     token: String,
     expires_at: SystemTime,
@@ -1066,6 +1117,44 @@ fn encode_repo_segment(s: &str) -> std::borrow::Cow<'_, str> {
         }
     }
     std::borrow::Cow::Owned(out)
+}
+
+// ============================================================================
+// Provider trait impl
+// ============================================================================
+
+#[async_trait(?Send)]
+impl Provider for GitHubProvider {
+    fn host(&self) -> &str {
+        self.host()
+    }
+
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Github
+    }
+
+    async fn mint(&self, req_id: &str, path: &str) -> Result<AbstractMintOutcome, ProviderError> {
+        let data = GitHubProvider::mint(self, req_id, path).await?;
+        Ok(AbstractMintOutcome {
+            response: data.response,
+            out_req_id: data.out_req_id,
+            provider_req_id: data.gh_req_id,
+        })
+    }
+
+    async fn selfcheck(&self, req_id: &str) -> Result<AbstractSelfcheckOutcome, ProviderError> {
+        let data = GitHubProvider::selfcheck(self, req_id).await?;
+        Ok(AbstractSelfcheckOutcome {
+            out_req_id: data.out_req_id,
+            provider_req_id: data.gh_req_id,
+            clock_skew_sec: data.clock_skew_sec,
+            details: json!({
+                "client_id": data.client_id,
+                "installation_id": data.installation_id,
+                "api_base": data.api_base,
+            }),
+        })
+    }
 }
 
 #[cfg(test)]

@@ -271,6 +271,9 @@ async fn admin_selfcheck_against_wiremock() {
         serde_json::json!(true),
         "selfcheck failed: {resp:?}"
     );
-    assert_eq!(resp["client_id"], CLIENT_ID);
+    // GitHub-specific selfcheck fields now nest under `details`
+    // (the abstract `SelfcheckOutcome` carries only the generalizable
+    // ones at the top level).
+    assert_eq!(resp["details"]["client_id"], CLIENT_ID);
     paths.cleanup();
 }

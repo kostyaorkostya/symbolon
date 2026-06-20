@@ -28,6 +28,7 @@ use crate::cpu_worker::CpuWorker;
 use crate::events::EventKind;
 use crate::git_credential;
 use crate::providers::github::{GitHubProvider, GithubError};
+use crate::providers::{Provider, ProviderError};
 use crate::psk_store::{PskStore, PskStoreError};
 use crate::sandbox::{self, SandboxError, SandboxPaths};
 use crate::transport::{Phase, Responder, SessionError, Step};
@@ -110,7 +111,12 @@ pub struct SharedState {
     /// reads this on every accepted connection to seed the Noise
     /// responder.
     pub(crate) psks: RefCell<PskStore>,
-    pub(crate) providers: HashMap<String, GitHubProvider>,
+    /// One concrete provider per configured `[provider.<name>]`
+    /// section. Wire dispatch picks by `provider.host()`; admin
+    /// dispatch picks by `provider.kind()`. Cardinality is 1 today;
+    /// when GitLab/Gitea land, add a sibling module + `ProviderKind`
+    /// variant.
+    pub(crate) providers: Vec<Box<dyn Provider>>,
     pub(crate) psk_file_path: PathBuf,
     pub(crate) clients_file_path: PathBuf,
     pub(crate) admin_socket_path: PathBuf,
@@ -248,11 +254,11 @@ impl Service {
             Rc::new(CpuWorker::new("symbolon-cpu-worker").map_err(DaemonError::CpuWorker)?);
 
         // Post-sandbox: construct providers with pre-loaded keys.
-        let mut providers: HashMap<String, GitHubProvider> = HashMap::new();
+        let mut providers: Vec<Box<dyn Provider>> = Vec::new();
         if let Some(gh) = &cfg.provider.github {
             let key = github_key.expect("github_key loaded above when gh is Some");
             let provider = GitHubProvider::new(gh, key, cpu_worker.clone(), shutdown.clone())?;
-            providers.insert(gh.host.clone(), provider);
+            providers.push(Box::new(provider));
         }
 
         let state = Rc::new(SharedState {
@@ -295,12 +301,12 @@ impl Service {
     /// Per-provider startup selfcheck. Logs `evt=selfcheck` once per
     /// provider and never returns Err (soft-fail per PROTOCOLS.md).
     /// Each provider's selfcheck is itself bounded by its configured
-    /// `selfcheck_timeout` and races the shutdown token from inside
-    /// `GitHubProvider::with_breadcrumbs` — so a SIGTERM during this
-    /// call returns quickly with `GithubError::Cancelled` rather
-    /// than hanging the daemon at startup.
+    /// timeout and races the shutdown token from inside the provider
+    /// — so a SIGTERM during this call returns quickly with
+    /// `ProviderError::Cancelled` rather than hanging the daemon at
+    /// startup.
     pub async fn selfcheck(&self) {
-        for (host, provider) in &self.state.providers {
+        for provider in &self.state.providers {
             let req_id = ulid::Ulid::new().to_string();
             match provider.selfcheck(&req_id).await {
                 Ok(outcome) => {
@@ -308,8 +314,8 @@ impl Service {
                         evt = %EventKind::Selfcheck,
                         req_id = %req_id,
                         out_req_id = %outcome.out_req_id,
-                        gh_req_id = outcome.gh_req_id.as_deref().unwrap_or(""),
-                        provider = %host,
+                        provider_req_id = outcome.provider_req_id.as_deref().unwrap_or(""),
+                        provider = %provider.host(),
                         ok = true,
                         clock_skew_sec = outcome.clock_skew_sec,
                     );
@@ -318,7 +324,7 @@ impl Service {
                     warn!(
                         evt = %EventKind::Selfcheck,
                         req_id = %req_id,
-                        provider = %host,
+                        provider = %provider.host(),
                         ok = false,
                         error = %crate::logging::ErrorChain(&e),
                     );
@@ -335,7 +341,7 @@ impl Service {
             listener,
             admin_listener,
         } = self;
-        let provider_names: Vec<&str> = state.providers.keys().map(String::as_str).collect();
+        let provider_names: Vec<&str> = state.providers.iter().map(|p| p.host()).collect();
         info!(evt = %EventKind::Startup, providers = ?provider_names, "daemon started");
 
         // Admin loop: held as a JoinHandle and awaited after the
@@ -670,9 +676,8 @@ async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<Shar
         host: String,
         path: String,
         response: git_credential::Response,
-        repo_id: u64,
         out_req_id: String,
-        gh_req_id: Option<String>,
+        provider_req_id: Option<String>,
         provider_ms: u64,
     }
 
@@ -787,7 +792,8 @@ async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<Shar
                 };
                 drop(request_bytes);
 
-                let Some(provider) = state.providers.get(&request.host) else {
+                let Some(provider) = state.providers.iter().find(|p| p.host() == request.host)
+                else {
                     warn!(
                         req_id = %req_id,
                         evt = %EventKind::MintDenied,
@@ -806,9 +812,9 @@ async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<Shar
                     Ok(o) => o,
                     Err(e) => {
                         // RepoNotFound at mint-time = the provider just
-                        // invalidated a (possibly cached) repo-id; surface
+                        // invalidated a (possibly cached) repo handle; surface
                         // that as a distinct event per PROTOCOLS.md.
-                        if matches!(e, GithubError::RepoNotFound { .. }) {
+                        if matches!(e, ProviderError::RepoNotFound { .. }) {
                             info!(
                                 req_id = %req_id,
                                 evt = %EventKind::CacheInvalidated,
@@ -852,9 +858,8 @@ async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<Shar
                     host: request.host,
                     path: request.path,
                     response: outcome.response,
-                    repo_id: outcome.repo_id,
                     out_req_id: outcome.out_req_id,
-                    gh_req_id: outcome.gh_req_id,
+                    provider_req_id: outcome.provider_req_id,
                     provider_ms,
                 });
             }
@@ -878,12 +883,11 @@ async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<Shar
                     info!(
                         req_id = %req_id,
                         out_req_id = %rec.out_req_id,
-                        gh_req_id = rec.gh_req_id.as_deref().unwrap_or(""),
+                        provider_req_id = rec.provider_req_id.as_deref().unwrap_or(""),
                         evt = %EventKind::Mint,
                         provider = %rec.host,
                         client = %client_str,
                         repo = %rec.path,
-                        repo_id = rec.repo_id,
                         ttl_sec = ttl_sec,
                         expires_at_unix = expires_at_secs,
                         provider_ms = rec.provider_ms,
@@ -1042,10 +1046,10 @@ fn log_mint_error(
     host: &str,
     path: &str,
     provider_ms: u64,
-    err: GithubError,
+    err: ProviderError,
 ) {
     match &err {
-        GithubError::RepoNotFound { .. } => {
+        ProviderError::RepoNotFound { .. } => {
             warn!(
                 req_id = %req_id,
                 evt = %EventKind::MintDenied,
@@ -1057,7 +1061,7 @@ fn log_mint_error(
                 provider_ms = provider_ms,
             );
         }
-        GithubError::Unauthorized { body } => {
+        ProviderError::Unauthorized { body } => {
             warn!(
                 req_id = %req_id,
                 evt = %EventKind::MintDenied,
@@ -1070,7 +1074,7 @@ fn log_mint_error(
                 error = %body,
             );
         }
-        GithubError::Forbidden { body } => {
+        ProviderError::Forbidden { body } => {
             warn!(
                 req_id = %req_id,
                 evt = %EventKind::MintDenied,
@@ -1083,7 +1087,7 @@ fn log_mint_error(
                 error = %body,
             );
         }
-        GithubError::RateLimited => {
+        ProviderError::RateLimited => {
             warn!(
                 req_id = %req_id,
                 evt = %EventKind::MintDenied,
@@ -1095,7 +1099,7 @@ fn log_mint_error(
                 provider_ms = provider_ms,
             );
         }
-        GithubError::MalformedPath(_) => {
+        ProviderError::MalformedPath { .. } => {
             warn!(
                 req_id = %req_id,
                 evt = %EventKind::MintDenied,
@@ -1106,7 +1110,7 @@ fn log_mint_error(
                 provider_ms = provider_ms,
             );
         }
-        GithubError::OtherStatus(status) => {
+        ProviderError::UnexpectedStatus { status } => {
             warn!(
                 req_id = %req_id,
                 evt = %EventKind::ProviderError,
@@ -1247,7 +1251,7 @@ mod tests {
                 m
             }),
             psks: RefCell::new(PskStore::empty()),
-            providers: HashMap::new(),
+            providers: Vec::new(),
             psk_file_path: nonexistent_psk,
             clients_file_path: clients_path.clone(),
             admin_socket_path: PathBuf::new(),

@@ -284,8 +284,16 @@ Op fields (request → response):
 | `list` | — | `clients` (array of `{name, providers, enrolled_at, note}`) |
 | `enroll` | `provider`, `client`, `note` (nullable) | `identity`, `psk_hex` (64 hex chars), `client_name` |
 | `revoke` | `provider`, `client` | — |
-| `mint` | `provider`, `client`, `path` | `username`, `password`, `expires_at_unix`, `repo_id` |
-| `selfcheck` | `provider` | `client_id`, `installation_id`, `api_base`, `clock_skew_sec` |
+| `mint` | `provider`, `client`, `path` | `username`, `password`, `expires_at_unix`, `out_req_id`, `provider_req_id` |
+| `selfcheck` | `provider` | `clock_skew_sec`, `out_req_id`, `provider_req_id`, `details` |
+
+The `selfcheck` response's `details` carries provider-specific
+diagnostic fields (e.g. for GitHub: `client_id`,
+`installation_id`, `api_base`) — shape documented in
+`docs/providers/<name>.md`.
+
+`provider_req_id` is the provider's own upstream correlation id
+(e.g. GitHub's `X-GitHub-Request-Id`), if any.
 
 Error codes:
 `bad_request | unknown_provider | unknown_client |
@@ -373,8 +381,8 @@ top-level keys.
 **Per-event additional fields:**
 
 Every event additionally carries `req_id` when one is in scope,
-plus `out_req_id` + `gh_req_id` for provider-call-derived events
-(`mint`, `selfcheck`, `mint_denied`, `provider_error`,
+plus `out_req_id` + `provider_req_id` for provider-call-derived
+events (`mint`, `selfcheck`, `mint_denied`, `provider_error`,
 `cache_invalidated`). These are not repeated per row.
 
 The closed-set catalog of `evt` values is encoded in
@@ -386,7 +394,7 @@ extending the enum and adding a row below.
 | `startup` | `providers` |
 | `shutdown` | `signal`, `inflight_drained`, `drain_ms`, `drain_complete` |
 | `accept` | `psk_identity` (from the Noise prelude), `peer` (TCP source addr, audit-only) |
-| `mint` | `provider`, `repo`, `repo_id`, `client`, `ttl_sec`, `expires_at_unix`, `provider_ms` |
+| `mint` | `provider`, `repo`, `client`, `ttl_sec`, `expires_at_unix`, `provider_ms` |
 | `mint_denied` | `provider`, `client`, `repo`, `reason`, `provider_status` |
 | `provider_error` | `provider`, `endpoint`, `status`, `body_snippet` |
 | `selfcheck` | `provider`, `ok`, `clock_skew_sec` |
@@ -410,7 +418,7 @@ extending the enum and adding a row below.
 | `mlock_required_failed` | `error`: emitted at `error` lvl by `main` when `[security] mlock = "required"` and `mlockall` failed. Fatal (exit 1); operator should add `LimitMEMLOCK=infinity` to the systemd unit |
 | `admin_request` | `req_id`, `op`: emitted by the admin loop at entry of each request. The `req_id` (ULID) ties downstream `provider_call` / `mint` / `selfcheck` events back to this admin invocation |
 | `provider_call` | `req_id`, `out_req_id`, `endpoint` (`mint_metadata_token` \| `resolve_repo_id` \| `mint_token` \| `selfcheck`), `provider`, `timeout_ms`: emitted before each outbound HTTPS call |
-| `provider_call_done` | `req_id`, `out_req_id`, `status` (HTTP status code, 0 if no response), `gh_req_id` (X-GitHub-Request-Id, empty if absent), `elapsed_ms`, optional `error`: emitted after each outbound HTTPS call |
+| `provider_call_done` | `req_id`, `out_req_id`, `status` (HTTP status code, 0 if no response), `provider_req_id` (provider's upstream correlation id — `X-GitHub-Request-Id` etc.; empty if absent), `elapsed_ms`, optional `error`: emitted after each outbound HTTPS call |
 
 `reason` values for `mint_denied`:
 `client_unknown | unknown_host | repo_not_accessible | provider_4xx | malformed_request`.

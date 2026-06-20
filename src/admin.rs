@@ -31,7 +31,7 @@ use tracing::info;
 
 use crate::daemon::{ResolvedClient, SharedState};
 use crate::events::EventKind;
-use crate::providers::github::GithubError;
+use crate::providers::{Provider, ProviderError, ProviderKind};
 
 const CLIENTS_FILE_MODE: u32 = 0o640;
 const PSK_FILE_MODE: u32 = 0o600;
@@ -264,7 +264,7 @@ fn handle_status(state: &SharedState) -> serde_json::Value {
         .duration_since(state.start_time)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let mut providers: Vec<&str> = state.providers.keys().map(String::as_str).collect();
+    let mut providers: Vec<&str> = state.providers.iter().map(|p| p.host()).collect();
     providers.sort();
     let client_count = state.clients.borrow().len();
     serde_json::json!({
@@ -518,12 +518,11 @@ async fn handle_mint(
                 "username": outcome.response.username,
                 "password": outcome.response.password,
                 "expires_at_unix": expires_unix,
-                "repo_id": outcome.repo_id,
                 "out_req_id": outcome.out_req_id,
-                "gh_req_id": outcome.gh_req_id,
+                "provider_req_id": outcome.provider_req_id,
             }))
         }
-        Err(e) => Err(error_response_from_github(&e)),
+        Err(e) => Err(error_response_from_provider(&e)),
     }
 }
 
@@ -541,38 +540,35 @@ async fn handle_selfcheck(
     match provider_obj.selfcheck(req_id).await {
         Ok(outcome) => Ok(serde_json::json!({
             "ok": true,
-            "client_id": outcome.client_id,
-            "installation_id": outcome.installation_id,
-            "api_base": outcome.api_base,
             "clock_skew_sec": outcome.clock_skew_sec,
             "out_req_id": outcome.out_req_id,
-            "gh_req_id": outcome.gh_req_id,
+            "provider_req_id": outcome.provider_req_id,
+            "details": outcome.details,
         })),
-        Err(e) => Err(error_response_from_github(&e)),
+        Err(e) => Err(error_response_from_provider(&e)),
     }
 }
 
-fn error_response_from_github(err: &GithubError) -> serde_json::Value {
+fn error_response_from_provider(err: &ProviderError) -> serde_json::Value {
     let (code, msg) = match err {
-        GithubError::RepoNotFound { path } => (
+        ProviderError::RepoNotFound { path } => (
             "repo_not_accessible",
-            format!("repository '{path}' not found or App lacks access"),
+            format!("repository '{path}' not found or credential lacks access"),
         ),
-        GithubError::Unauthorized { body } => {
-            ("provider_4xx", format!("unauthorized (401): {body}"))
+        ProviderError::Unauthorized { body } => ("provider_4xx", format!("unauthorized: {body}")),
+        ProviderError::Forbidden { body } => ("provider_4xx", format!("forbidden: {body}")),
+        ProviderError::RateLimited => ("provider_4xx", "rate limited".to_string()),
+        ProviderError::MalformedPath { path } => {
+            ("bad_request", format!("malformed repository path: {path}"))
         }
-        GithubError::Forbidden { body } => ("provider_4xx", format!("forbidden (403): {body}")),
-        GithubError::RateLimited => ("provider_4xx", "rate limited (429)".to_string()),
-        GithubError::MalformedPath(p) => ("bad_request", format!("malformed owner/repo path: {p}")),
-        GithubError::OtherStatus(s) => ("internal", format!("provider status {s}")),
-        GithubError::ClientIdMismatch {
-            configured,
-            reported,
-        } => (
-            "internal",
-            format!("Client ID mismatch: configured {configured}, GitHub reports {reported}"),
-        ),
-        _ => ("internal", format!("{err}")),
+        ProviderError::UnexpectedStatus { status } => {
+            ("internal", format!("provider status {status}"))
+        }
+        // Transport / Timeout / Cancelled / MalformedResponse /
+        // Internal all collapse to `internal`. The source chain is
+        // walked by ErrorChain so the message includes the GitHub-
+        // specific cause (ClientIdMismatch, JWT failures, etc.).
+        _ => ("internal", format!("{}", crate::logging::ErrorChain(err))),
     };
     error_response(code, &msg)
 }
@@ -708,12 +704,17 @@ fn print_success(command: &CliCommand, response: &serde_json::Value) {
             println!("expires_at_unix={exp}");
         }
         CliCommand::GithubSelfcheck => {
-            let client_id = response
-                .get("client_id")
+            // Provider-specific fields nest under `details` per
+            // PROVIDER_CONTRACT.md § A3 — only the abstract fields
+            // (`clock_skew_sec`, `provider_req_id`, `out_req_id`)
+            // live at the top level.
+            let details = response.get("details");
+            let client_id = details
+                .and_then(|d| d.get("client_id"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("?");
-            let api = response
-                .get("api_base")
+            let api = details
+                .and_then(|d| d.get("api_base"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("?");
             let skew = response
@@ -733,20 +734,19 @@ fn error_response(code: &str, msg: &str) -> serde_json::Value {
     serde_json::json!({ "ok": false, "code": code, "error": msg })
 }
 
-fn lookup_provider<'a>(
-    state: &'a SharedState,
-    provider: &str,
-) -> Option<&'a crate::providers::github::GitHubProvider> {
-    // Single-provider build: the wire protocol carries the provider
-    // *type* ("github"), but the daemon's HashMap is keyed by host
-    // string ("github.com"). For now, "github" → the (one) configured
-    // GitHub provider. When a second provider type lands, this routing
-    // grows a type→provider map.
-    if provider == PROVIDER_GITHUB {
-        state.providers.values().next()
-    } else {
-        state.providers.get(provider)
-    }
+fn lookup_provider<'a>(state: &'a SharedState, provider: &str) -> Option<&'a (dyn Provider + 'a)> {
+    // The admin wire protocol carries the provider *type*
+    // (`PROVIDER_GITHUB` etc.). Translate to a `ProviderKind`, then
+    // pick the configured instance.
+    let kind = match provider {
+        PROVIDER_GITHUB => ProviderKind::Github,
+        _ => return None,
+    };
+    state
+        .providers
+        .iter()
+        .find(|p| p.kind() == kind)
+        .map(|b| b.as_ref())
 }
 
 fn is_valid_client_name(s: &str) -> bool {

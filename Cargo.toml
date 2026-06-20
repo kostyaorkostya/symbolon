@@ -7,6 +7,7 @@ description = "Daemon that mints short-lived, single-repository git credentials 
 
 [dependencies]
 argh = { version = "0.1.19", default-features = false, features = ["help"] }
+async-trait = "0.1.89"
 base64 = "0.22"
 compio = { version = "0.19", features = [
   "fs",

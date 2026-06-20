@@ -176,8 +176,9 @@ with-same-name case where the numeric ID changes.
     attacker can't narrow the applicable CVE list.
   - `X-Request-ID: <out_req_id>`. Fresh ULID per outbound call.
     Same value flows into the `provider_call` /
-    `provider_call_done` breadcrumbs and into `MintOutcome` /
-    `SelfcheckOutcome` for operator-side correlation.
+    `provider_call_done` breadcrumbs and into the abstract
+    `MintOutcome` / `SelfcheckOutcome` for operator-side
+    correlation.
   - `Request-Timeout: <seconds>`. Best-effort hint per the
     expired IETF draft (`draft-thomson-hybi-http-timeout`).
     Integer seconds derived from the per-call timeout. GitHub
@@ -195,9 +196,28 @@ with-same-name case where the numeric ID changes.
   `evt=provider_error`.
 
 Response headers (read on every call): `X-GitHub-Request-Id` is
-captured into `gh_req_id` on the outcome / breadcrumb so an
+captured into the abstract `provider_req_id` field on the
+outcome and on the `provider_call_done` breadcrumb so an
 operator can join the broker's log to GitHub's side when filing
-a ticket.
+a ticket. The field name is shared with other providers so
+cross-provider log queries stay simple; the value here is
+GitHub-specific.
+
+## Admin response shape: selfcheck `details`
+
+`SelfcheckOutcome.details` for this provider is:
+
+```json
+{
+  "client_id": "Iv23liXXXXXXXXXXXXXX",
+  "installation_id": 789012,
+  "api_base": "https://api.github.com"
+}
+```
+
+The CLI's `symbolon github selfcheck` reads these from
+`response["details"]` (per the provider-shape convention in
+[`PROVIDER_CONTRACT.md` § A3](../PROVIDER_CONTRACT.md#a3-provider-specific-selfcheck-details)).
 
 ## Hardening recommendations
 

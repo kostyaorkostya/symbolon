@@ -10,13 +10,43 @@ providers, and the existing GitHub provider in
 
 ## Status
 
-The abstraction is **implicit** in the codebase today
-(`src/providers/mod.rs` is a one-line module that re-exports the
-single `github` provider). This document defines the contract a
-provider satisfies; landing a second provider is what will
-crystallise it into a Rust trait. The rules here apply now
-(GitHub satisfies them by construction); they bind any future
-provider too.
+The abstraction is the [`Provider` trait in
+`src/providers/mod.rs`](../src/providers/mod.rs), with one
+concrete impl today (`GitHubProvider`). The daemon holds
+configured providers as `Vec<Box<dyn Provider>>` and dispatches
+on `provider.host()` for the wire path and on `provider.kind()`
+for the admin path. The trait methods (`mint`, `selfcheck`)
+return the abstract `MintOutcome` / `SelfcheckOutcome` types
+defined alongside the trait, and fail with the abstract
+[`ProviderError`](../src/providers/mod.rs) enum (10
+generalizable variants plus an `Internal(Box<dyn Error>)` grab
+bag for provider-private failures whose source chain is walked
+by `crate::logging::ErrorChain`).
+
+The rules here bind every implementation.
+
+### Error convention
+
+Generalizable failure modes — anything the daemon switches on
+to produce a log `reason` code or an admin wire `code` —
+**MUST** map to one of the named `ProviderError` variants:
+`Transport`, `Unauthorized`, `Forbidden`, `RepoNotFound`,
+`RateLimited`, `UnexpectedStatus`, `MalformedPath`,
+`MalformedResponse`, `Timeout`, `Cancelled`. Provider-private
+failures (PEM-load, JWT, identity-mismatch, ...) **SHOULD** wrap
+their concrete error in `ProviderError::Internal(Box::new(e))`
+so the daemon's `ErrorChain` walker can surface the cause in
+the catch-all log arm without the abstract enum learning the
+concrete type.
+
+### Outcome convention
+
+Each provider returns the broker-facing fields directly on
+`MintOutcome` / `SelfcheckOutcome` (`response`, `out_req_id`,
+`provider_req_id`, `clock_skew_sec`). Provider-specific
+diagnostic fields **MUST** be packed into `SelfcheckOutcome.details`
+(a `serde_json::Value`); the admin selfcheck JSON response
+exposes that blob under a top-level `details` key.
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**,
 and **MAY** in this document are to be interpreted as described
@@ -113,9 +143,10 @@ before the call and a `provider_call_done` breadcrumb after, with
 `req_id`, `out_req_id` (a ULID), `endpoint` (a short string label),
 and `elapsed_ms`. See
 [`PROTOCOLS.md` § Logging schema](PROTOCOLS.md#logging-schema).
-The provider MAY add a per-provider correlation ID (e.g. GitHub's
-`X-GitHub-Request-Id` becomes the `gh_req_id` field), but the
-core breadcrumb pair is mandatory.
+The provider SHOULD emit the upstream correlation ID under the
+common `provider_req_id` field on `provider_call_done` (e.g.
+GitHub fills it from `X-GitHub-Request-Id`); using the shared
+field name keeps cross-provider log queries simple.
 
 ## SHOULD
 
@@ -157,19 +188,25 @@ keys in the provider's doc under [`providers/`](providers/).
 
 ### A2. Provider-specific error variants
 
-The provider's error enum MAY have arbitrarily many variants
-beyond the common HTTP-status-derived ones (Unauthorized,
-Forbidden, RateLimited, ServerError, UnexpectedStatus,
-RepoNotFound, Timeout, Cancelled). Provider-specific variants
-SHOULD be documented in `providers/<name>.md`.
+The provider's *internal* error enum (e.g. `GithubError`) MAY have
+arbitrarily many variants beyond the abstract `ProviderError` set.
+At the trait boundary the internal enum MUST convert (via
+`impl From<MyError> for ProviderError`) into the abstract
+variants — generalizable failures map to their named
+counterpart; everything else goes into
+`ProviderError::Internal(Box::new(e))` so the source chain
+survives for `ErrorChain` logging. Document provider-private
+variants in `providers/<name>.md` if helpful.
 
-### A3. Provider-specific correlation IDs
+### A3. Provider-specific selfcheck details
 
-The provider MAY add provider-specific fields to the
-`provider_call_done` breadcrumb (e.g. `gh_req_id` from GitHub's
-`X-GitHub-Request-Id` header). Such fields are non-standard
-across providers; consumers of the logs (jq queries, dashboards)
-should treat them as optional.
+Provider-specific diagnostic fields surfaced by selfcheck (e.g.
+GitHub's `client_id`, `installation_id`, `api_base`) MUST go in
+`SelfcheckOutcome.details` (a `serde_json::Value`); they appear
+on the admin response under the top-level `details` key. The
+admin response's other top-level keys (`out_req_id`,
+`provider_req_id`, `clock_skew_sec`) are the generalizable set
+and stay byte-identical across providers.
 
 ## FORBIDDEN
 

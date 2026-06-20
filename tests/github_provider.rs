@@ -144,7 +144,7 @@ async fn mint_surfaces_github_request_id() {
         .await
         .unwrap();
     assert_eq!(
-        outcome.gh_req_id.as_ref().map(|p| p.as_str()),
+        outcome.provider_req_id.as_ref().map(|p| p.as_str()),
         Some("ABC:DEF:1234")
     );
     assert!(

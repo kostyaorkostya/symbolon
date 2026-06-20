@@ -12,7 +12,6 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::future::Future;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -30,7 +29,7 @@ use tracing::info;
 use url::Url;
 
 use async_trait::async_trait;
-use derive_more::{AsRef, Display, From};
+use derive_more::{AsRef, Display, From, Into};
 use serde_json::json;
 
 use crate::config::ProviderGithub;
@@ -57,6 +56,7 @@ use crate::providers::{
     AsRef,
     Display,
     From,
+    Into,
     serde::Deserialize,
     serde::Serialize,
 )]
@@ -64,12 +64,6 @@ use crate::providers::{
 #[from(u64)]
 #[serde(transparent)]
 pub struct InstallationId(u64);
-
-impl InstallationId {
-    pub fn get(self) -> u64 {
-        self.0
-    }
-}
 
 /// GitHub **repository** numeric id (the `id` field on the repo
 /// REST resource; used in the mint body's `repository_ids` array).
@@ -83,6 +77,7 @@ impl InstallationId {
     AsRef,
     Display,
     From,
+    Into,
     serde::Deserialize,
     serde::Serialize,
 )]
@@ -90,12 +85,6 @@ impl InstallationId {
 #[from(u64)]
 #[serde(transparent)]
 pub struct RepoId(u64);
-
-impl RepoId {
-    pub fn get(self) -> u64 {
-        self.0
-    }
-}
 
 const GITHUB_API_VERSION: &str = "2026-03-10";
 const ACCEPT_HEADER: &str = "application/vnd.github+json";
@@ -253,7 +242,7 @@ pub struct SelfcheckData {
     /// `provider_call` / `provider_call_done` breadcrumbs.
     pub(crate) out_req_id: OutReqId,
     /// `X-GitHub-Request-Id` returned by the API, if any.
-    pub(crate) gh_req_id: Option<ProviderReqId>,
+    pub(crate) provider_req_id: Option<ProviderReqId>,
 }
 
 #[derive(Debug, Clone)]
@@ -264,7 +253,7 @@ pub struct MintData {
     /// the `provider_call` / `provider_call_done` breadcrumbs.
     pub out_req_id: OutReqId,
     /// `X-GitHub-Request-Id` returned by the mint endpoint, if any.
-    pub gh_req_id: Option<ProviderReqId>,
+    pub provider_req_id: Option<ProviderReqId>,
 }
 
 pub struct GitHubProvider {
@@ -387,12 +376,10 @@ impl GitHubProvider {
     /// reachable at `api_base`. The reported App ID must match the
     /// configured one — a mismatch indicates a wrong key/App pairing.
     pub async fn selfcheck(&self, req_id: &ReqId) -> Result<SelfcheckData, GithubError> {
-        let (outcome, _, _) = self
-            .with_breadcrumbs(req_id, "selfcheck", self.selfcheck_timeout, |out| {
-                self.selfcheck_inner(out)
-            })
-            .await?;
-        Ok(outcome)
+        self.with_breadcrumbs(req_id, "selfcheck", self.selfcheck_timeout, async |out| {
+            self.selfcheck_inner(out).await
+        })
+        .await
     }
 
     pub async fn mint(&self, req_id: &ReqId, path: &str) -> Result<MintData, GithubError> {
@@ -426,7 +413,7 @@ impl GitHubProvider {
             },
             repo_id,
             out_req_id: m.out_req_id,
-            gh_req_id: m.gh_req_id,
+            provider_req_id: m.provider_req_id,
         })
     }
 }
@@ -439,24 +426,25 @@ impl GitHubProvider {
     /// Wrap one outbound HTTPS call: emits the `provider_call`
     /// breadcrumb before, races shutdown + timeout around the
     /// inner future, then emits `provider_call_done` with status +
-    /// `gh_req_id` + elapsed_ms.
+    /// `provider_req_id` + elapsed_ms.
     ///
-    /// Returns the inner `T` together with the outbound `out_req_id`
-    /// (the ULID we minted for this call) and the response's
-    /// `X-GitHub-Request-Id` if present. On timeout/cancel/
-    /// transport-error a `provider_call_done` is still emitted
-    /// with `status = 0`.
-    async fn with_breadcrumbs<T, F, Fut>(
+    /// On timeout/cancel/transport-error a `provider_call_done` is
+    /// still emitted with `status = 0`. The inner closure receives the
+    /// minted `OutReqId` and is expected to embed it (plus any
+    /// upstream correlation id from the response) into the success
+    /// type `T` it returns — see `MintToken`, `SelfcheckData`,
+    /// `MintData` for the in-tree shapes. This lets the breadcrumb
+    /// wrapper stay payload-agnostic and return a flat
+    /// `Result<T, GithubError>` rather than the
+    /// `(T, OutReqId, Option<ProviderReqId>)` tuple every caller used
+    /// to immediately destructure.
+    async fn with_breadcrumbs<T>(
         &self,
         req_id: &ReqId,
         endpoint: &'static str,
         timeout: Duration,
-        mk_inner: F,
-    ) -> Result<(T, OutReqId, Option<ProviderReqId>), GithubError>
-    where
-        F: FnOnce(OutReqId) -> Fut,
-        Fut: Future<Output = ProviderCall<T>>,
-    {
+        mk_inner: impl AsyncFnOnce(OutReqId) -> ProviderCall<T>,
+    ) -> Result<T, GithubError> {
         let out_req_id = OutReqId::new();
         info!(
             evt = %EventKind::ProviderCall,
@@ -484,10 +472,10 @@ impl GitHubProvider {
                     // logging schema names this `provider_req_id` so
                     // future providers (GitLab, Gitea, ...) emit the
                     // same key with their own upstream correlation id.
-                    provider_req_id = pc.gh_req_id.as_ref().map(|p| p.as_str()).unwrap_or(""),
+                    provider_req_id = pc.provider_req_id.as_ref().map(|p| p.as_str()).unwrap_or(""),
                     elapsed_ms = elapsed_ms,
                 );
-                pc.result.map(|v| (v, out_req_id, pc.gh_req_id))
+                pc.result
             }
             Err(e) => {
                 info!(
@@ -558,7 +546,7 @@ impl GitHubProvider {
     }
 
     /// Send a request and read the response body. Returns the raw
-    /// body alongside `status` + `gh_req_id`. Callers inspect
+    /// body alongside `status` + `provider_req_id`. Callers inspect
     /// `status` and either parse `result` as a success body or
     /// coerce it into an endpoint-specific error.
     async fn http_call(
@@ -578,14 +566,14 @@ impl GitHubProvider {
             Err(e) => return ProviderCall::pre_send(e),
         };
         let status = resp.status().as_u16();
-        let gh_req_id = Self::read_gh_req_id(&resp);
+        let provider_req_id = Self::read_provider_req_id(&resp);
         let retry_after = Self::read_retry_after(&resp);
         let body = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
                 return ProviderCall {
                     status,
-                    gh_req_id,
+                    provider_req_id,
                     retry_after,
                     result: Err(GithubError::from(e)),
                 };
@@ -593,7 +581,7 @@ impl GitHubProvider {
         };
         ProviderCall {
             status,
-            gh_req_id,
+            provider_req_id,
             retry_after,
             result: Ok(body),
         }
@@ -648,21 +636,37 @@ impl GitHubProvider {
         // installation token first, then use it as the bearer for
         // the actual repo lookup. Logged as two distinct
         // `provider_call` breadcrumbs.
-        let install_token = self.mint_metadata_token(req_id).await?;
-        let result = self
-            .with_breadcrumbs(req_id, "resolve_repo_id", self.request_timeout, |out| {
-                self.resolve_repo_id_inner(out, &install_token, owner, repo)
-            })
-            .await;
-        // Best-effort revoke: we're done with this metadata token, so
-        // shorten its useful life from "up to 1 hour" to "now". The
-        // mint token returned to the client (in mint_token_inner)
-        // CANNOT be revoked from our side — the client holds it for
-        // the duration of its git operation, and revoking would break
-        // the in-flight clone/fetch/push. Documented asymmetry.
-        self.revoke_installation_token(req_id, &install_token).await;
-        let (id, _out, _gh) = result?;
-        Ok(id)
+        self.with_metadata_token(req_id, async |token| {
+            self.with_breadcrumbs(
+                req_id,
+                "resolve_repo_id",
+                self.request_timeout,
+                async |out| self.resolve_repo_id_inner(out, token, owner, repo).await,
+            )
+            .await
+        })
+        .await
+    }
+
+    /// Mint a scratch metadata-only installation token, hand it to
+    /// `work`, and revoke it best-effort regardless of whether `work`
+    /// succeeded, failed, or panicked-mid-await. The structural
+    /// guarantee replaces the open-coded "mint / use / revoke"
+    /// sequence and prevents the silent-leak class where a future
+    /// `?` lands between use and revoke. The mint token returned to
+    /// the client (in `mint_token_inner`) CANNOT use this helper —
+    /// the client holds it for the duration of its git operation,
+    /// and revoking would break the in-flight clone/fetch/push.
+    /// Documented asymmetry.
+    async fn with_metadata_token<T>(
+        &self,
+        req_id: &ReqId,
+        work: impl AsyncFnOnce(&str) -> Result<T, GithubError>,
+    ) -> Result<T, GithubError> {
+        let token = self.mint_metadata_token(req_id).await?;
+        let result = work(&token).await;
+        self.revoke_installation_token(req_id, &token).await;
+        result
     }
 
     /// Fire-and-forget `DELETE /installation/token` to revoke the
@@ -676,7 +680,7 @@ impl GitHubProvider {
                 req_id,
                 "revoke_install_token",
                 self.request_timeout,
-                |out| self.revoke_token_inner(out, install_token),
+                async |out| self.revoke_token_inner(out, install_token).await,
             )
             .await;
     }
@@ -697,24 +701,25 @@ impl GitHubProvider {
                 self.request_timeout,
             )
             .await;
-        let status = call.status;
-        let retry_after = call.retry_after;
-        call.map(|_| match status {
+        call.map_with_meta(|_, m| match m.status {
             // 204 No Content = revoked.
             204 => Ok(()),
             s => Err(GithubError::from_common_status(
                 s,
                 &Bytes::new(),
-                retry_after,
+                m.retry_after,
             )),
         })
     }
 
     async fn mint_metadata_token(&self, req_id: &ReqId) -> Result<String, GithubError> {
-        let ((token, _expires), _out, _gh) = self
-            .with_breadcrumbs(req_id, "mint_metadata_token", self.request_timeout, |out| {
-                self.mint_metadata_token_inner(out)
-            })
+        let (token, _expires) = self
+            .with_breadcrumbs(
+                req_id,
+                "mint_metadata_token",
+                self.request_timeout,
+                async |out| self.mint_metadata_token_inner(out).await,
+            )
             .await?;
         Ok(token)
     }
@@ -725,17 +730,10 @@ impl GitHubProvider {
         repo_id: RepoId,
         path: &str,
     ) -> Result<MintToken, GithubError> {
-        let ((token, expires_at), out_req_id, gh_req_id) = self
-            .with_breadcrumbs(req_id, "mint_token", self.request_timeout, |out| {
-                self.mint_token_inner(out, repo_id, path)
-            })
-            .await?;
-        Ok(MintToken {
-            token,
-            expires_at,
-            out_req_id,
-            gh_req_id,
+        self.with_breadcrumbs(req_id, "mint_token", self.request_timeout, async |out| {
+            self.mint_token_inner(out, repo_id, path).await
         })
+        .await
     }
 
     /// `GET /app` to verify reachability + key/App pairing.
@@ -744,10 +742,10 @@ impl GitHubProvider {
     /// the body, so it can't use the body-eating `http_call`
     /// helper. The async block lets `?` propagate inside the
     /// future while the surrounding scope captures status +
-    /// gh_req_id for the partial-failure `ProviderCall`.
+    /// provider_req_id for the partial-failure `ProviderCall`.
     async fn selfcheck_inner(&self, out_req_id: OutReqId) -> ProviderCall<SelfcheckData> {
         let mut status: u16 = 0;
-        let mut gh_req_id: Option<ProviderReqId> = None;
+        let mut provider_req_id: Option<ProviderReqId> = None;
         let result: Result<SelfcheckData, GithubError> = async {
             let jwt = self.sign_jwt_now().await?;
             let url = format!("{}/app", self.api_base);
@@ -762,19 +760,9 @@ impl GitHubProvider {
                 )
                 .await?;
             status = resp.status().as_u16();
-            gh_req_id = Self::read_gh_req_id(&resp);
+            provider_req_id = Self::read_provider_req_id(&resp);
             let retry_after = Self::read_retry_after(&resp);
-            // HTTP `Date` header (IMF-fixdate per RFC 7231 § 7.1.1.1)
-            // is accepted by `time`'s Rfc2822 parser (`GMT` → zero
-            // offset). Silently 0 if the header is missing or
-            // unparseable; clock skew is informational.
-            let clock_skew_sec = resp
-                .headers()
-                .get("date")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| OffsetDateTime::parse(s, &Rfc2822).ok())
-                .map(|t| t.unix_timestamp() - OffsetDateTime::now_utc().unix_timestamp())
-                .unwrap_or(0);
+            let clock_skew_sec = Self::read_clock_skew(&resp);
             let body = resp.bytes().await?;
             if status != 200 {
                 return Err(GithubError::from_common_status(status, &body, retry_after));
@@ -800,13 +788,13 @@ impl GitHubProvider {
                 api_base: self.api_base.clone(),
                 clock_skew_sec,
                 out_req_id: out_req_id.clone(),
-                gh_req_id: gh_req_id.clone(),
+                provider_req_id: provider_req_id.clone(),
             })
         }
         .await;
         ProviderCall {
             status,
-            gh_req_id,
+            provider_req_id,
             // selfcheck has already folded any 429 retry_after into
             // the error variant; the breadcrumb log doesn't surface
             // it, so the outer struct field can stay None here.
@@ -841,14 +829,12 @@ impl GitHubProvider {
                 self.request_timeout,
             )
             .await;
-        let status = call.status;
-        let retry_after = call.retry_after;
-        call.map(|body| match status {
+        call.map_with_meta(|body, m| match m.status {
             200 => Self::parse_repo_response(&body),
             404 => Err(GithubError::RepoNotFound {
                 path: format!("{owner}/{repo}"),
             }),
-            s => Err(GithubError::from_common_status(s, &body, retry_after)),
+            s => Err(GithubError::from_common_status(s, &body, m.retry_after)),
         })
     }
 
@@ -883,11 +869,9 @@ impl GitHubProvider {
                 self.request_timeout,
             )
             .await;
-        let status = call.status;
-        let retry_after = call.retry_after;
-        call.map(|bytes| match status {
+        call.map_with_meta(|bytes, m| match m.status {
             201 => Self::parse_mint_response(&bytes),
-            s => Err(GithubError::from_common_status(s, &bytes, retry_after)),
+            s => Err(GithubError::from_common_status(s, &bytes, m.retry_after)),
         })
     }
 
@@ -896,7 +880,7 @@ impl GitHubProvider {
         out_req_id: OutReqId,
         repo_id: RepoId,
         path: &str,
-    ) -> ProviderCall<(String, SystemTime)> {
+    ) -> ProviderCall<MintToken> {
         let jwt = match self.sign_jwt_now().await {
             Ok(j) => j,
             Err(e) => return ProviderCall::pre_send(e),
@@ -915,14 +899,20 @@ impl GitHubProvider {
                 self.request_timeout,
             )
             .await;
-        let status = call.status;
-        let retry_after = call.retry_after;
-        call.map(|bytes| match status {
-            201 => Self::parse_mint_response(&bytes),
+        call.map_with_meta(|bytes, m| match m.status {
+            201 => {
+                let (token, expires_at) = Self::parse_mint_response(&bytes)?;
+                Ok(MintToken {
+                    token,
+                    expires_at,
+                    out_req_id: out_req_id.clone(),
+                    provider_req_id: m.provider_req_id.cloned(),
+                })
+            }
             404 => Err(GithubError::RepoNotFound {
                 path: path.to_string(),
             }),
-            s => Err(GithubError::from_common_status(s, &bytes, retry_after)),
+            s => Err(GithubError::from_common_status(s, &bytes, m.retry_after)),
         })
     }
 }
@@ -932,7 +922,7 @@ struct MintToken {
     token: String,
     expires_at: SystemTime,
     out_req_id: OutReqId,
-    gh_req_id: Option<ProviderReqId>,
+    provider_req_id: Option<ProviderReqId>,
 }
 
 // ============================================================================
@@ -950,40 +940,76 @@ enum Method {
     Delete,
 }
 
-/// One outbound HTTPS call's bookkeeping. `status` + `gh_req_id` +
+/// One outbound HTTPS call's bookkeeping. `status` + `provider_req_id` +
 /// `retry_after` are carried separately so the
 /// `provider_call_done` breadcrumb can log them even when `result`
 /// is an error, and so the 429-specific `RateLimited` error can
 /// carry the server-suggested wait time.
 struct ProviderCall<T> {
     status: u16,
-    gh_req_id: Option<ProviderReqId>,
+    provider_req_id: Option<ProviderReqId>,
     retry_after: Option<Duration>,
     result: Result<T, GithubError>,
+}
+
+/// Borrowed view of a `ProviderCall`'s metadata passed into the
+/// `map_with_meta` closure. Exists so `map_with_meta` callers can
+/// build endpoint-specific errors (which need `status` + `retry_after`)
+/// or success values that embed the upstream correlation id
+/// (`provider_req_id`) without pre-destructuring the `ProviderCall` into
+/// local variables — the smell `let status = call.status; let
+/// retry_after = call.retry_after;` repeated at every previous use of
+/// `map`.
+struct CallMeta<'a> {
+    status: u16,
+    retry_after: Option<Duration>,
+    provider_req_id: Option<&'a ProviderReqId>,
 }
 
 impl<T> ProviderCall<T> {
     /// Failure with no HTTP exchange (signing failed, builder
     /// rejected a header, etc.). The breadcrumb logs `status=0`
-    /// and `gh_req_id=""`.
+    /// and `provider_req_id=""`.
     fn pre_send(err: GithubError) -> Self {
         Self {
             status: 0,
-            gh_req_id: None,
+            provider_req_id: None,
             retry_after: None,
             result: Err(err),
         }
     }
 
-    /// Carry `status` + `gh_req_id` + `retry_after` forward while
-    /// transforming the success payload. Used to layer body parsing
-    /// on top of a raw `ProviderCall<Bytes>` from `http_call`.
-    fn map<U>(self, f: impl FnOnce(T) -> Result<U, GithubError>) -> ProviderCall<U> {
+    /// Carry `status` + `provider_req_id` + `retry_after` forward while
+    /// transforming the success payload. The closure receives a
+    /// [`CallMeta`] borrow of the metadata so it can both branch on
+    /// `status` and embed `provider_req_id` into a richer success type,
+    /// without the caller having to pre-destructure the
+    /// `ProviderCall`.
+    fn map_with_meta<U>(
+        self,
+        f: impl FnOnce(T, CallMeta<'_>) -> Result<U, GithubError>,
+    ) -> ProviderCall<U> {
+        let ProviderCall {
+            status,
+            provider_req_id,
+            retry_after,
+            result,
+        } = self;
+        // Inner scope so the borrow of `provider_req_id` ends before we move
+        // it into the output struct.
+        let result = {
+            let meta = CallMeta {
+                status,
+                retry_after,
+                provider_req_id: provider_req_id.as_ref(),
+            };
+            result.and_then(|t| f(t, meta))
+        };
         ProviderCall {
-            status: self.status,
-            gh_req_id: self.gh_req_id,
-            retry_after: self.retry_after,
-            result: self.result.and_then(f),
+            status,
+            provider_req_id,
+            retry_after,
+            result,
         }
     }
 }
@@ -1149,7 +1175,7 @@ impl GitHubProvider {
     /// `provider_req_id` log/wire field; field shape is shared with
     /// other providers (each surfaces their own upstream correlation
     /// id under the same field name).
-    fn read_gh_req_id(resp: &cyper::Response) -> Option<ProviderReqId> {
+    fn read_provider_req_id(resp: &cyper::Response) -> Option<ProviderReqId> {
         resp.headers()
             .get(GH_REQUEST_ID_HEADER)
             .and_then(|v| v.to_str().ok())
@@ -1161,6 +1187,19 @@ impl GitHubProvider {
     /// HTTP-date; we parse the integer form (which GitHub uses) and
     /// ignore the date form. Returns `None` on absent or malformed
     /// values — caller falls back to "wait at your own pace."
+    /// HTTP `Date` header (IMF-fixdate per RFC 7231 § 7.1.1.1) is
+    /// accepted by `time`'s Rfc2822 parser (`GMT` → zero offset).
+    /// Returns 0 if the header is missing or unparseable; clock skew
+    /// is informational, not load-bearing.
+    fn read_clock_skew(resp: &cyper::Response) -> i64 {
+        resp.headers()
+            .get("date")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| OffsetDateTime::parse(s, &Rfc2822).ok())
+            .map(|t| t.unix_timestamp() - OffsetDateTime::now_utc().unix_timestamp())
+            .unwrap_or(0)
+    }
+
     fn read_retry_after(resp: &cyper::Response) -> Option<Duration> {
         resp.headers()
             .get("retry-after")
@@ -1307,7 +1346,7 @@ impl Provider for GitHubProvider {
         Ok(AbstractMintOutcome {
             response: data.response,
             out_req_id: data.out_req_id,
-            provider_req_id: data.gh_req_id,
+            provider_req_id: data.provider_req_id,
         })
     }
 
@@ -1315,7 +1354,7 @@ impl Provider for GitHubProvider {
         let data = GitHubProvider::selfcheck(self, req_id).await?;
         Ok(AbstractSelfcheckOutcome {
             out_req_id: data.out_req_id,
-            provider_req_id: data.gh_req_id,
+            provider_req_id: data.provider_req_id,
             clock_skew_sec: data.clock_skew_sec,
             details: json!({
                 "client_id": data.client_id,

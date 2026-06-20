@@ -220,7 +220,7 @@ Pinned in `Cargo.toml`:
   use signal-hook-registry directly for permanent signal handlers;
   see `src/signals.rs`.)
 - `derive_more` with `default-features = false, features = ["as_ref",
-  "display", "from"]` (proc-macro derives for newtype boilerplate
+  "display", "from", "into"]` (proc-macro derives for newtype boilerplate
   on the correlation-ID types in `src/ids.rs` and the GitHub-specific
   ID types in `src/providers/github.rs`. `Display` makes
   `tracing::info!(req_id = %req_id, …)` transparent; `From<T>` gives

@@ -22,7 +22,7 @@ cyper = { version = "0.9", default-features = false, features = [
   "rustls",
   "http2",
 ] }
-derive_more = { version = "2.1.1", default-features = false, features = ["as_ref", "display", "from"] }
+derive_more = { version = "2.1.1", default-features = false, features = ["as_ref", "display", "from", "into"] }
 futures-channel = "0.3"
 futures-util = "0.3.32"
 hex = "0.4.3"

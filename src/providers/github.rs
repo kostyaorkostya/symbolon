@@ -69,7 +69,7 @@ pub enum GithubError {
     #[error("JWT signer thread is no longer running")]
     JwtSignerDead,
     #[error("HTTP transport error")]
-    Http(#[source] cyper::Error),
+    Http(#[from] cyper::Error),
     // `source` deliberately omitted. serde_json::Error's Display can
     // include a fragment of the input ("expected … at line X column Y
     // near {bytes}"); for the mint response, that fragment can be
@@ -106,12 +106,6 @@ pub enum GithubError {
     Timeout(Duration),
     #[error("provider request cancelled (daemon shutting down)")]
     Cancelled,
-}
-
-impl From<cyper::Error> for GithubError {
-    fn from(e: cyper::Error) -> Self {
-        GithubError::Http(e)
-    }
 }
 
 impl From<WorkerDead> for GithubError {

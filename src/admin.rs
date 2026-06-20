@@ -47,8 +47,9 @@ const PROVIDER_GITHUB: &str = "github";
 // Wire types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, strum::IntoStaticStr)]
 #[serde(tag = "op", rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub(crate) enum Request {
     Status,
     List,
@@ -70,19 +71,6 @@ pub(crate) enum Request {
     Selfcheck {
         provider: String,
     },
-}
-
-impl Request {
-    fn op_name(&self) -> &'static str {
-        match self {
-            Request::Status => "status",
-            Request::List => "list",
-            Request::Enroll { .. } => "enroll",
-            Request::Revoke { .. } => "revoke",
-            Request::Mint { .. } => "mint",
-            Request::Selfcheck { .. } => "selfcheck",
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -222,7 +210,7 @@ async fn handle_admin(mut stream: UnixStream, state: Rc<SharedState>) {
             return;
         }
     };
-    info!(evt = %EventKind::AdminRequest, req_id = %req_id, op = %request.op_name());
+    info!(evt = %EventKind::AdminRequest, req_id = %req_id, op = <&str>::from(&request));
     let resp_value = match dispatch(&req_id, &request, &state).await {
         Ok(v) => v,
         Err(e) => e,
@@ -735,7 +723,7 @@ fn error_response(code: &str, msg: &str) -> serde_json::Value {
 }
 
 fn lookup_provider<'a>(state: &'a SharedState, provider: &str) -> Option<&'a (dyn Provider + 'a)> {
-    let kind = ProviderKind::try_from(provider).ok()?;
+    let kind: ProviderKind = provider.parse().ok()?;
     state
         .providers
         .iter()

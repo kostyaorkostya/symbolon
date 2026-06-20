@@ -513,10 +513,6 @@ enum RState {
 }
 
 impl RState {
-    fn name(&self) -> &'static str {
-        self.into()
-    }
-
     fn phase(&self) -> Phase {
         match self {
             RState::WantPreludeHead => Phase::PreludeHead,
@@ -591,7 +587,7 @@ impl Responder {
     /// payload on emission; calling `step()` a second time before
     /// `wrote()` / `set_response()` returns `WrongState`.
     pub fn step(&mut self) -> Result<Step, SessionError> {
-        let state_name = self.state.name();
+        let state_name: &str = (&self.state).into();
         match std::mem::replace(&mut self.state, RState::Failed) {
             RState::WantPreludeHead => {
                 self.state = RState::WantPreludeHead;
@@ -658,7 +654,7 @@ impl Responder {
 
     /// Feed bytes for the most recent `Step::ReadExact`.
     pub fn recv(&mut self, bytes: &[u8]) -> Result<(), SessionError> {
-        let state_name = self.state.name();
+        let state_name: &str = (&self.state).into();
         match std::mem::replace(&mut self.state, RState::Failed) {
             RState::WantPreludeHead => {
                 SessionError::check_recv_len(6, bytes.len())?;
@@ -726,7 +722,7 @@ impl Responder {
 
     /// Provide the PSK requested by the previous `Step::NeedPsk`.
     pub fn set_psk(&mut self, psk: [u8; 32]) -> Result<(), SessionError> {
-        let state_name = self.state.name();
+        let state_name: &str = (&self.state).into();
         match std::mem::replace(&mut self.state, RState::Failed) {
             RState::AwaitingPsk => {
                 let hs = responder(&psk).map_err(SessionError::from_frame_oversize)?;
@@ -746,7 +742,7 @@ impl Responder {
     /// Acknowledge that the bytes from the most recent `Step::Write`
     /// were flushed to the wire.
     pub fn wrote(&mut self) -> Result<(), SessionError> {
-        let state_name = self.state.name();
+        let state_name: &str = (&self.state).into();
         match std::mem::replace(&mut self.state, RState::Failed) {
             RState::WroteHsPending { hs } => {
                 // Handshake msg 2 is on the wire; transition to transport mode.
@@ -770,7 +766,7 @@ impl Responder {
 
     /// Provide the plaintext response to encrypt and send.
     pub fn set_response(&mut self, plaintext: &[u8]) -> Result<(), SessionError> {
-        let state_name = self.state.name();
+        let state_name: &str = (&self.state).into();
         match std::mem::replace(&mut self.state, RState::Failed) {
             RState::AwaitingResponse { mut ts } => {
                 let n = transport_write(&mut ts, plaintext, &mut self.scratch[..])
@@ -894,10 +890,6 @@ enum IState {
 }
 
 impl IState {
-    fn name(&self) -> &'static str {
-        self.into()
-    }
-
     fn phase(&self) -> Phase {
         match self {
             IState::WritePrelude { .. } | IState::WrotePreludePending { .. } => Phase::PreludeHead,
@@ -946,7 +938,7 @@ impl Initiator {
     }
 
     pub fn step(&mut self) -> Result<Step, SessionError> {
-        let state_name = self.state.name();
+        let state_name: &str = (&self.state).into();
         match std::mem::replace(&mut self.state, IState::Failed) {
             IState::WritePrelude {
                 hs,
@@ -1003,7 +995,7 @@ impl Initiator {
     }
 
     pub fn recv(&mut self, bytes: &[u8]) -> Result<(), SessionError> {
-        let state_name = self.state.name();
+        let state_name: &str = (&self.state).into();
         match std::mem::replace(&mut self.state, IState::Failed) {
             IState::WantHs2Len { hs, request } => {
                 SessionError::check_recv_len(2, bytes.len())?;
@@ -1061,7 +1053,7 @@ impl Initiator {
     }
 
     pub fn wrote(&mut self) -> Result<(), SessionError> {
-        let state_name = self.state.name();
+        let state_name: &str = (&self.state).into();
         match std::mem::replace(&mut self.state, IState::Failed) {
             IState::WrotePreludePending { mut hs, request } => {
                 // Compute handshake msg 1 now that the prelude is on the wire.
@@ -1092,7 +1084,7 @@ impl Initiator {
     /// Consume the session and return the decrypted plaintext response.
     /// Valid only after `step()` has returned `Step::Done`.
     pub fn take_response(mut self) -> Result<Vec<u8>, SessionError> {
-        let state_name = self.state.name();
+        let state_name: &str = (&self.state).into();
         match std::mem::replace(&mut self.state, IState::Drained) {
             IState::Done { plaintext } => Ok(plaintext),
             other => {

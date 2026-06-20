@@ -17,23 +17,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString)]
+#[strum(serialize_all = "snake_case")]
 pub enum ProviderKind {
     Github,
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("unknown provider kind {0:?}")]
-pub struct UnknownProviderKind(pub String);
-
-impl TryFrom<&str> for ProviderKind {
-    type Error = UnknownProviderKind;
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
-        match s {
-            "github" => Ok(Self::Github),
-            other => Err(UnknownProviderKind(other.to_string())),
-        }
-    }
 }
 
 /// Abstract failure modes the daemon switches on. Generalizable

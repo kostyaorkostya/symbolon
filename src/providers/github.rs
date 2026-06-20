@@ -270,7 +270,7 @@ pub struct GitHubProvider {
     client: cyper::Client,
     user_agent: String,
     clock: fn() -> SystemTime,
-    repo_ids: RepoIdCache,
+    repo_ids: ResolveStore,
     selfcheck_timeout: Duration,
     request_timeout: Duration,
     // Cloned from Service::shutdown so HTTPS calls observe shutdown
@@ -353,7 +353,7 @@ impl GitHubProvider {
             client,
             user_agent: cfg.user_agent.clone(),
             clock,
-            repo_ids: RepoIdCache::default(),
+            repo_ids: ResolveStore::default(),
             selfcheck_timeout: cfg.selfcheck_timeout,
             request_timeout: cfg.request_timeout,
             cancel,
@@ -576,19 +576,19 @@ impl GitHubProvider {
         now: SystemTime,
     ) -> Result<RepoId, GithubError> {
         loop {
-            match self.repo_ids.get_or_claim(key, now) {
-                CacheAction::Hit(id) => return Ok(id),
-                CacheAction::Wait(ev) => {
+            match self.repo_ids.claim(key, now) {
+                Claim::Hit(id) => return Ok(id),
+                Claim::Wait(ev) => {
                     ev.listen().await;
                     // Loop to re-check; the resolver may have
                     // landed a Done entry, evicted on failure, or
                     // raced ahead leaving Done expired.
                 }
-                CacheAction::Resolve(ev) => {
+                Claim::Resolve(ev) => {
                     // RAII: the guard defaults to Failed (invalidate
                     // + notify on Drop) so a cancelled/errored resolve
                     // wakes waiters automatically. `commit_done`
-                    // transitions to Done (put_done + notify).
+                    // transitions to Done (release_done + notify).
                     let guard = InFlightGuard::new(&self.repo_ids, key, ev);
                     let result = self.resolve_repo_id(req_id, owner, repo).await;
                     if let Ok(id) = &result {
@@ -983,61 +983,95 @@ impl<T> ProviderCall<T> {
 
 const CACHE_TTL: Duration = Duration::from_secs(600);
 
+/// Combined TTL cache + singleflight coordinator for repo-id
+/// resolution. One `HashMap` allocation backs both concerns:
+/// `Cached` entries serve as the memo (with `expires_at`);
+/// `InFlight` entries serve as the singleflight marker (with the
+/// `Event` waiters listen on). The two `impl` blocks below split
+/// the API along these concerns so call sites read as
+/// either-singleflight-or-cache, not as one mixed bag.
 #[derive(Default)]
-struct RepoIdCache(RefCell<HashMap<String, CacheEntry>>);
+struct ResolveStore(RefCell<HashMap<String, StoreEntry>>);
 
-enum CacheEntry {
-    Done { id: RepoId, expires_at: SystemTime },
-    // Singleflight: concurrent mints for the same key share this
-    // Event. The resolver notifies all listeners on completion;
-    // waiters re-check the cache. `Event` is the multi-listener
+enum StoreEntry {
+    Cached { id: RepoId, expires_at: SystemTime },
+    // Singleflight marker. The resolver notifies on completion;
+    // waiters re-check the store. `Event` is the multi-listener
     // primitive — `AsyncFlag::wait` would only wake one waiter.
     InFlight(Rc<Event>),
 }
 
-enum CacheAction {
+enum Claim {
+    /// A fresh `Cached` entry covered the key — caller uses this id.
     Hit(RepoId),
+    /// Another caller is already resolving this key — await this
+    /// event, then re-`claim` to read the result.
     Wait(Rc<Event>),
+    /// This caller owns the resolve. Run the work, then call
+    /// `release_done` on success or `release_failed` on error;
+    /// `InFlightGuard` enforces this via Drop.
     Resolve(Rc<Event>),
 }
 
-impl RepoIdCache {
-    /// Atomic test-and-set. Returns Hit on fresh Done entry, Wait
-    /// when another task is already resolving (with that resolver's
-    /// completion event), or Resolve when this caller should
-    /// perform the resolve (with a fresh event the caller will
-    /// notify on completion).
-    fn get_or_claim(&self, key: &str, now: SystemTime) -> CacheAction {
-        let mut cache = self.0.borrow_mut();
-        match cache.get(key) {
-            Some(CacheEntry::Done { id, expires_at }) if *expires_at > now => CacheAction::Hit(*id),
-            Some(CacheEntry::InFlight(ev)) => CacheAction::Wait(Rc::clone(ev)),
+// === Singleflight concern: claim a key, release when done/failed ===
+impl ResolveStore {
+    /// Atomic test-and-set. Returns `Hit` on a fresh `Cached`
+    /// entry, `Wait` when another task is already resolving (with
+    /// that resolver's completion event), or `Resolve` when this
+    /// caller should perform the resolve (with a fresh event the
+    /// caller's `release_*` will notify on).
+    fn claim(&self, key: &str, now: SystemTime) -> Claim {
+        let mut entries = self.0.borrow_mut();
+        match entries.get(key) {
+            Some(StoreEntry::Cached { id, expires_at }) if *expires_at > now => Claim::Hit(*id),
+            Some(StoreEntry::InFlight(ev)) => Claim::Wait(Rc::clone(ev)),
             _ => {
                 let ev = Rc::new(Event::new());
-                cache.insert(key.to_string(), CacheEntry::InFlight(Rc::clone(&ev)));
-                CacheAction::Resolve(ev)
+                entries.insert(key.to_string(), StoreEntry::InFlight(Rc::clone(&ev)));
+                Claim::Resolve(ev)
             }
         }
     }
 
-    fn put_done(&self, key: &str, id: RepoId, expires_at: SystemTime) {
+    /// Release a successful singleflight claim: replace the
+    /// `InFlight` marker with a fresh `Cached` entry and wake all
+    /// waiters so they re-`claim` and get the new `Hit`.
+    fn release_done(&self, key: &str, id: RepoId, expires_at: SystemTime, event: &Event) {
         self.0
             .borrow_mut()
-            .insert(key.to_string(), CacheEntry::Done { id, expires_at });
+            .insert(key.to_string(), StoreEntry::Cached { id, expires_at });
+        event.notify(usize::MAX);
     }
 
+    /// Release a failed singleflight claim: drop the entry and wake
+    /// waiters so they re-`claim`, see no entry, and themselves get
+    /// `Resolve` (one of them will re-run the work).
+    fn release_failed(&self, key: &str, event: &Event) {
+        self.0.borrow_mut().remove(key);
+        event.notify(usize::MAX);
+    }
+}
+
+// === Cache concern: invalidate a cached entry from outside the resolve flow ===
+impl ResolveStore {
+    /// Drop a `Cached` entry without touching any singleflight
+    /// state. Used by `mint()` when a subsequent `mint_token` call
+    /// returns 404 — the cached repo-id is stale (delete+recreate
+    /// at the same path changes the underlying numeric id), so the
+    /// next mint should re-resolve.
     fn invalidate(&self, key: &str) {
         self.0.borrow_mut().remove(key);
     }
 }
 
-/// Holds the InFlight claim for the resolver task. The guard's
-/// `Resolution` defaults to `Failed`, so a dropped or errored
-/// resolve invalidates the cache entry and notifies waiters
-/// automatically. `commit_done` transitions to `Done`, which
-/// drops with `put_done` + notify instead.
+/// RAII shell around a `Claim::Resolve` outcome. Drops default to
+/// `release_failed`; an explicit `commit_done` consumes the guard
+/// and transitions to `release_done`. Either way, the matching
+/// release happens automatically — a panic, `?`-propagation, or
+/// async cancellation between claim and outcome cannot leak the
+/// in-flight marker.
 struct InFlightGuard<'a> {
-    cache: &'a RepoIdCache,
+    store: &'a ResolveStore,
     key: String,
     event: Rc<Event>,
     resolution: Resolution,
@@ -1049,9 +1083,9 @@ enum Resolution {
 }
 
 impl<'a> InFlightGuard<'a> {
-    fn new(cache: &'a RepoIdCache, key: &str, event: Rc<Event>) -> Self {
+    fn new(store: &'a ResolveStore, key: &str, event: Rc<Event>) -> Self {
         Self {
-            cache,
+            store,
             key: key.to_string(),
             event,
             resolution: Resolution::Failed,
@@ -1059,9 +1093,7 @@ impl<'a> InFlightGuard<'a> {
     }
 
     /// Mark the resolve as successful. Consumes the guard so
-    /// double-commit is impossible. The `Drop` that immediately
-    /// follows (end of scope) sees `Resolution::Done` and runs
-    /// `put_done(key, id, expires_at)` + notify on the cache.
+    /// double-commit is impossible.
     fn commit_done(mut self, id: RepoId, expires_at: SystemTime) {
         self.resolution = Resolution::Done(id, expires_at);
     }
@@ -1070,10 +1102,9 @@ impl<'a> InFlightGuard<'a> {
 impl Drop for InFlightGuard<'_> {
     fn drop(&mut self) {
         match self.resolution {
-            Resolution::Done(id, exp) => self.cache.put_done(&self.key, id, exp),
-            Resolution::Failed => self.cache.invalidate(&self.key),
+            Resolution::Done(id, exp) => self.store.release_done(&self.key, id, exp, &self.event),
+            Resolution::Failed => self.store.release_failed(&self.key, &self.event),
         }
-        self.event.notify(usize::MAX);
     }
 }
 
@@ -1502,75 +1533,94 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test_app_key.pem")
     }
 
-    fn assert_hit(action: CacheAction, expected: u64) {
+    fn assert_hit(action: Claim, expected: u64) {
         match action {
-            CacheAction::Hit(id) => assert_eq!(id, RepoId::from(expected)),
-            CacheAction::Wait(_) => panic!("expected Hit, got Wait"),
-            CacheAction::Resolve(_) => panic!("expected Hit, got Resolve"),
+            Claim::Hit(id) => assert_eq!(id, RepoId::from(expected)),
+            Claim::Wait(_) => panic!("expected Hit, got Wait"),
+            Claim::Resolve(_) => panic!("expected Hit, got Resolve"),
         }
     }
 
-    fn assert_resolve(action: CacheAction) {
+    fn assert_resolve(action: Claim) {
         match action {
-            CacheAction::Resolve(_) => {}
-            CacheAction::Hit(_) => panic!("expected Resolve, got Hit"),
-            CacheAction::Wait(_) => panic!("expected Resolve, got Wait"),
+            Claim::Resolve(_) => {}
+            Claim::Hit(_) => panic!("expected Resolve, got Hit"),
+            Claim::Wait(_) => panic!("expected Resolve, got Wait"),
         }
+    }
+
+    /// Throwaway notifier for tests that pre-populate `Cached`
+    /// entries without going through the real singleflight claim
+    /// flow. No waiters are listening, so `notify` is a no-op.
+    fn fake_event() -> Event {
+        Event::new()
     }
 
     #[test]
     fn cache_done_hit_within_ttl() {
-        let cache = RepoIdCache::default();
+        let cache = ResolveStore::default();
         let now = t(1_000_000);
-        cache.put_done("foo/bar", RepoId::from(42), now + Duration::from_secs(600));
-        assert_hit(cache.get_or_claim("foo/bar", now), 42);
-        assert_hit(
-            cache.get_or_claim("foo/bar", now + Duration::from_secs(599)),
-            42,
+        cache.release_done(
+            "foo/bar",
+            RepoId::from(42),
+            now + Duration::from_secs(600),
+            &fake_event(),
         );
+        assert_hit(cache.claim("foo/bar", now), 42);
+        assert_hit(cache.claim("foo/bar", now + Duration::from_secs(599)), 42);
     }
 
     #[test]
     fn cache_done_miss_when_expired() {
-        let cache = RepoIdCache::default();
+        let cache = ResolveStore::default();
         let now = t(1_000_000);
-        cache.put_done("foo/bar", RepoId::from(42), now + Duration::from_secs(600));
+        cache.release_done(
+            "foo/bar",
+            RepoId::from(42),
+            now + Duration::from_secs(600),
+            &fake_event(),
+        );
         // Expired entry yields Resolve (the new caller takes
         // ownership of refreshing it).
-        assert_resolve(cache.get_or_claim("foo/bar", now + Duration::from_secs(601)));
+        assert_resolve(cache.claim("foo/bar", now + Duration::from_secs(601)));
     }
 
     #[test]
     fn cache_invalidate_removes_entry() {
-        let cache = RepoIdCache::default();
+        let cache = ResolveStore::default();
         let now = t(1_000_000);
-        cache.put_done("foo/bar", RepoId::from(42), now + Duration::from_secs(600));
+        cache.release_done(
+            "foo/bar",
+            RepoId::from(42),
+            now + Duration::from_secs(600),
+            &fake_event(),
+        );
         cache.invalidate("foo/bar");
-        assert_resolve(cache.get_or_claim("foo/bar", now));
+        assert_resolve(cache.claim("foo/bar", now));
     }
 
     #[test]
     fn cache_singleflight_second_caller_waits() {
-        let cache = RepoIdCache::default();
+        let cache = ResolveStore::default();
         let now = t(1_000_000);
         // First caller claims an in-flight slot.
-        assert_resolve(cache.get_or_claim("foo/bar", now));
+        assert_resolve(cache.claim("foo/bar", now));
         // Second caller for same key gets a Wait, sharing the
         // first caller's event. Don't call notify (the test only
         // verifies the state-machine transition).
-        match cache.get_or_claim("foo/bar", now) {
-            CacheAction::Wait(_) => {}
-            CacheAction::Hit(_) => panic!("expected Wait, got Hit"),
-            CacheAction::Resolve(_) => panic!("expected Wait, got Resolve"),
+        match cache.claim("foo/bar", now) {
+            Claim::Wait(_) => {}
+            Claim::Hit(_) => panic!("expected Wait, got Hit"),
+            Claim::Resolve(_) => panic!("expected Wait, got Resolve"),
         }
     }
 
     #[test]
     fn inflight_guard_drop_invalidates_and_notifies() {
-        let cache = RepoIdCache::default();
+        let cache = ResolveStore::default();
         let now = t(1_000_000);
-        let ev = match cache.get_or_claim("foo/bar", now) {
-            CacheAction::Resolve(ev) => ev,
+        let ev = match cache.claim("foo/bar", now) {
+            Claim::Resolve(ev) => ev,
             _ => panic!("expected initial Resolve"),
         };
         // Simulate the resolver future being dropped mid-flight: the
@@ -1579,25 +1629,25 @@ mod tests {
             let _guard = InFlightGuard::new(&cache, "foo/bar", ev);
         }
         // Cache must be empty and a new caller must get Resolve.
-        assert_resolve(cache.get_or_claim("foo/bar", now));
+        assert_resolve(cache.claim("foo/bar", now));
     }
 
     #[test]
     fn inflight_guard_commit_done_puts_entry() {
-        let cache = RepoIdCache::default();
+        let cache = ResolveStore::default();
         let now = t(1_000_000);
-        let ev = match cache.get_or_claim("foo/bar", now) {
-            CacheAction::Resolve(ev) => ev,
+        let ev = match cache.claim("foo/bar", now) {
+            Claim::Resolve(ev) => ev,
             _ => panic!("expected initial Resolve"),
         };
         {
             let guard = InFlightGuard::new(&cache, "foo/bar", ev);
             // Resolve succeeded; commit_done transitions the guard to
-            // `Done`. On drop, the cache receives put_done(...) and
+            // `Done`. On drop, the cache receives release_done(...) and
             // waiters are notified.
             guard.commit_done(RepoId::from(42), now + Duration::from_secs(600));
         }
         // Subsequent callers Hit the committed entry.
-        assert_hit(cache.get_or_claim("foo/bar", now), 42);
+        assert_hit(cache.claim("foo/bar", now), 42);
     }
 }

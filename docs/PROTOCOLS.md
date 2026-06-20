@@ -216,16 +216,42 @@ encrypted and framed the same way before being written back.
 **Request:**
 
 ```
+capability[]=authtype           # optional, sent by git 2.46+
 protocol=https
 host=github.com
 path=octocat/Spoon-Knife
 
 ```
 
-(`key=value` lines terminated by an empty line.)
+(`key=value` lines terminated by an empty line. `capability[]` is
+parsed but only the `authtype` value is meaningful to us; other
+capabilities or unknown keys are silently ignored per
+`gitcredentials(7)`.)
 
-**Response** (value of `username` is provider-determined; see
-per-provider doc):
+#### Response shape — capability negotiation
+
+The daemon emits one of two response shapes depending on whether
+the client declared `capability[]=authtype` in the request.
+
+**Modern shape** (git 2.46+ after capability negotiation):
+
+```
+capability[]=authtype
+authtype=Bearer
+credential=<token>
+ephemeral=true
+password_expiry_utc=<epoch>
+
+```
+
+Git constructs `Authorization: Bearer <token>` from these fields
+(per `git/http.c::http_append_auth_header`) and sends it on every
+git-HTTP request. `ephemeral=true` tells git's credential cache
+NOT to persist the credential — load-bearing for our short-TTL
+installation tokens.
+
+**Legacy shape** (git ≤ 2.45 or any client that didn't declare
+`authtype`):
 
 ```
 username=<provider-specified-username>
@@ -233,6 +259,21 @@ password=<token>
 password_expiry_utc=<epoch>
 
 ```
+
+#### `capability` action
+
+The client helper `git-credential-symbolon` advertises its own
+capabilities when invoked as
+`git credential capability`. The output is:
+
+```
+version 0
+capability authtype
+```
+
+Per `git-credential.adoc` § CAPABILITY INPUT/OUTPUT FORMAT, this
+tells git the helper understands the `authtype` capability and
+will accept the modern response shape on subsequent `get` calls.
 
 #### Security: CR/LF rejection (mandatory)
 
@@ -395,7 +436,7 @@ extending the enum and adding a row below.
 | `shutdown` | `signal`, `inflight_drained`, `drain_ms`, `drain_complete` |
 | `accept` | `psk_identity` (from the Noise prelude), `peer` (TCP source addr, audit-only) |
 | `mint` | `provider`, `repo`, `client`, `ttl_sec`, `expires_at_unix`, `provider_ms` |
-| `mint_denied` | `provider`, `client`, `repo`, `reason`, `provider_status` |
+| `mint_denied` | `provider`, `client`, `repo`, `reason`, `provider_status`; `retry_after_sec` when `provider_status=429` and the provider's `Retry-After` header was parseable (else `0`) |
 | `provider_error` | `provider`, `endpoint`, `status`, `body_snippet` |
 | `selfcheck` | `provider`, `ok`, `clock_skew_sec` |
 | `enroll` | `provider`, `client` |

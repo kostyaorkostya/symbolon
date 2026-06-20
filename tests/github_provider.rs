@@ -228,8 +228,57 @@ async fn mint_returns_429() {
             .mint("test-req", &format!("{OWNER}/{REPO}"))
             .await
             .unwrap_err(),
-        GithubError::RateLimited
+        GithubError::RateLimited { retry_after: None }
     ));
+}
+
+#[compio::test]
+async fn mint_returns_429_with_retry_after() {
+    let server = MockServer::start().await;
+    mount_metadata_token_ok(&server).await;
+    mount_repo_ok(&server).await;
+    Mock::given(method("POST"))
+        .and(path(mint_path()))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "42"))
+        .mount(&server)
+        .await;
+
+    let provider = build_provider(server.uri()).await;
+    let err = provider
+        .mint("test-req", &format!("{OWNER}/{REPO}"))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        GithubError::RateLimited {
+            retry_after: Some(d),
+        } if d == std::time::Duration::from_secs(42),
+    ));
+}
+
+#[compio::test]
+async fn mint_calls_revoke_after_resolve() {
+    // After resolve_repo_id finishes (success path), the metadata
+    // installation token is revoked via DELETE /installation/token.
+    // wiremock's `.expect(1)` panics on drop if the count doesn't
+    // match, so this asserts the call happened exactly once.
+    let server = MockServer::start().await;
+    mount_metadata_token_ok(&server).await;
+    mount_repo_ok(&server).await;
+    mount_mint_ok(&server).await;
+    Mock::given(method("DELETE"))
+        .and(path("/installation/token"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let provider = build_provider(server.uri()).await;
+    let _ = provider
+        .mint("test-req", &format!("{OWNER}/{REPO}"))
+        .await
+        .unwrap();
+    // Verifications happen on MockServer drop.
 }
 
 #[compio::test]

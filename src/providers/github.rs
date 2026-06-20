@@ -94,7 +94,12 @@ pub enum GithubError {
     #[error("repository '{path}' not found or App lacks access")]
     RepoNotFound { path: String },
     #[error("rate limited (429)")]
-    RateLimited,
+    RateLimited {
+        /// Server-suggested wait time before retry, parsed from the
+        /// `Retry-After` HTTP header per RFC 9110 §10.2.3. `None`
+        /// when the header was absent or malformed.
+        retry_after: Option<Duration>,
+    },
     #[error("provider returned status {0}")]
     OtherStatus(u16),
     #[error("Client ID mismatch: configured {configured}, GitHub reports {reported}")]
@@ -119,7 +124,7 @@ impl GithubError {
     /// endpoint to an error. Endpoint-specific cases (200 vs 201
     /// success, 404 → `RepoNotFound`) are handled by the caller
     /// before they fall through here.
-    fn from_common_status(status: u16, body: &Bytes) -> Self {
+    fn from_common_status(status: u16, body: &Bytes, retry_after: Option<Duration>) -> Self {
         match status {
             401 => Self::Unauthorized {
                 body: Self::message_from_body(body),
@@ -127,7 +132,7 @@ impl GithubError {
             403 => Self::Forbidden {
                 body: Self::message_from_body(body),
             },
-            429 => Self::RateLimited,
+            429 => Self::RateLimited { retry_after },
             other => Self::OtherStatus(other),
         }
     }
@@ -164,7 +169,7 @@ impl From<GithubError> for ProviderError {
             GithubError::Unauthorized { body } => Self::Unauthorized { body },
             GithubError::Forbidden { body } => Self::Forbidden { body },
             GithubError::RepoNotFound { path } => Self::RepoNotFound { path },
-            GithubError::RateLimited => Self::RateLimited,
+            GithubError::RateLimited { retry_after } => Self::RateLimited { retry_after },
             GithubError::OtherStatus(s) => Self::UnexpectedStatus { status: s },
             GithubError::MalformedPath(p) => Self::MalformedPath { path: p },
             GithubError::ParseResponse { context, detail } => {
@@ -467,6 +472,7 @@ impl GitHubProvider {
         let mut req = match method {
             Method::Get => self.client.get(url),
             Method::Post => self.client.post(url),
+            Method::Delete => self.client.delete(url),
         }?
         .bearer_auth(bearer)?
         .header("accept", ACCEPT_HEADER)?
@@ -519,12 +525,14 @@ impl GitHubProvider {
         };
         let status = resp.status().as_u16();
         let gh_req_id = Self::read_gh_req_id(&resp);
+        let retry_after = Self::read_retry_after(&resp);
         let body = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
                 return ProviderCall {
                     status,
                     gh_req_id,
+                    retry_after,
                     result: Err(GithubError::from(e)),
                 };
             }
@@ -532,6 +540,7 @@ impl GitHubProvider {
         ProviderCall {
             status,
             gh_req_id,
+            retry_after,
             result: Ok(body),
         }
     }
@@ -586,12 +595,65 @@ impl GitHubProvider {
         // the actual repo lookup. Logged as two distinct
         // `provider_call` breadcrumbs.
         let install_token = self.mint_metadata_token(req_id).await?;
-        let (id, _out, _gh) = self
+        let result = self
             .with_breadcrumbs(req_id, "resolve_repo_id", self.request_timeout, |out| {
                 self.resolve_repo_id_inner(out, &install_token, owner, repo)
             })
-            .await?;
+            .await;
+        // Best-effort revoke: we're done with this metadata token, so
+        // shorten its useful life from "up to 1 hour" to "now". The
+        // mint token returned to the client (in mint_token_inner)
+        // CANNOT be revoked from our side — the client holds it for
+        // the duration of its git operation, and revoking would break
+        // the in-flight clone/fetch/push. Documented asymmetry.
+        self.revoke_installation_token(req_id, &install_token).await;
+        let (id, _out, _gh) = result?;
         Ok(id)
+    }
+
+    /// Fire-and-forget `DELETE /installation/token` to revoke the
+    /// passed installation token. Failures are logged as a
+    /// `provider_call_done` breadcrumb but do NOT propagate — the
+    /// caller has already finished with the token, the worst case
+    /// is the token sticks around for its natural 1-hour TTL.
+    async fn revoke_installation_token(&self, req_id: &str, install_token: &str) {
+        let _ = self
+            .with_breadcrumbs(
+                req_id,
+                "revoke_install_token",
+                self.request_timeout,
+                |out| self.revoke_token_inner(out, install_token),
+            )
+            .await;
+    }
+
+    async fn revoke_token_inner(
+        &self,
+        out_req_id: String,
+        install_token: &str,
+    ) -> ProviderCall<()> {
+        let url = format!("{}/installation/token", self.api_base);
+        let call = self
+            .http_call(
+                Method::Delete,
+                &url,
+                install_token,
+                None,
+                &out_req_id,
+                self.request_timeout,
+            )
+            .await;
+        let status = call.status;
+        let retry_after = call.retry_after;
+        call.map(|_| match status {
+            // 204 No Content = revoked.
+            204 => Ok(()),
+            s => Err(GithubError::from_common_status(
+                s,
+                &Bytes::new(),
+                retry_after,
+            )),
+        })
     }
 
     async fn mint_metadata_token(&self, req_id: &str) -> Result<String, GithubError> {
@@ -647,6 +709,7 @@ impl GitHubProvider {
                 .await?;
             status = resp.status().as_u16();
             gh_req_id = Self::read_gh_req_id(&resp);
+            let retry_after = Self::read_retry_after(&resp);
             // HTTP `Date` header (IMF-fixdate per RFC 7231 § 7.1.1.1)
             // is accepted by `time`'s Rfc2822 parser (`GMT` → zero
             // offset). Silently 0 if the header is missing or
@@ -660,7 +723,7 @@ impl GitHubProvider {
                 .unwrap_or(0);
             let body = resp.bytes().await?;
             if status != 200 {
-                return Err(GithubError::from_common_status(status, &body));
+                return Err(GithubError::from_common_status(status, &body, retry_after));
             }
             #[derive(Deserialize)]
             struct Resp {
@@ -690,6 +753,10 @@ impl GitHubProvider {
         ProviderCall {
             status,
             gh_req_id,
+            // selfcheck has already folded any 429 retry_after into
+            // the error variant; the breadcrumb log doesn't surface
+            // it, so the outer struct field can stay None here.
+            retry_after: None,
             result,
         }
     }
@@ -721,12 +788,13 @@ impl GitHubProvider {
             )
             .await;
         let status = call.status;
+        let retry_after = call.retry_after;
         call.map(|body| match status {
             200 => Self::parse_repo_response(&body),
             404 => Err(GithubError::RepoNotFound {
                 path: format!("{owner}/{repo}"),
             }),
-            s => Err(GithubError::from_common_status(s, &body)),
+            s => Err(GithubError::from_common_status(s, &body, retry_after)),
         })
     }
 
@@ -762,9 +830,10 @@ impl GitHubProvider {
             )
             .await;
         let status = call.status;
+        let retry_after = call.retry_after;
         call.map(|bytes| match status {
             201 => Self::parse_mint_response(&bytes),
-            s => Err(GithubError::from_common_status(s, &bytes)),
+            s => Err(GithubError::from_common_status(s, &bytes, retry_after)),
         })
     }
 
@@ -793,12 +862,13 @@ impl GitHubProvider {
             )
             .await;
         let status = call.status;
+        let retry_after = call.retry_after;
         call.map(|bytes| match status {
             201 => Self::parse_mint_response(&bytes),
             404 => Err(GithubError::RepoNotFound {
                 path: path.to_string(),
             }),
-            s => Err(GithubError::from_common_status(s, &bytes)),
+            s => Err(GithubError::from_common_status(s, &bytes, retry_after)),
         })
     }
 }
@@ -823,14 +893,18 @@ const GH_REQUEST_ID_HEADER: &str = "x-github-request-id";
 enum Method {
     Get,
     Post,
+    Delete,
 }
 
-/// One outbound HTTPS call's bookkeeping. `status` + `gh_req_id`
-/// are carried separately so the `provider_call_done` breadcrumb
-/// can log them even when `result` is an error.
+/// One outbound HTTPS call's bookkeeping. `status` + `gh_req_id` +
+/// `retry_after` are carried separately so the
+/// `provider_call_done` breadcrumb can log them even when `result`
+/// is an error, and so the 429-specific `RateLimited` error can
+/// carry the server-suggested wait time.
 struct ProviderCall<T> {
     status: u16,
     gh_req_id: Option<String>,
+    retry_after: Option<Duration>,
     result: Result<T, GithubError>,
 }
 
@@ -842,17 +916,19 @@ impl<T> ProviderCall<T> {
         Self {
             status: 0,
             gh_req_id: None,
+            retry_after: None,
             result: Err(err),
         }
     }
 
-    /// Carry `status` + `gh_req_id` forward while transforming the
-    /// success payload. Used to layer body parsing on top of a raw
-    /// `ProviderCall<Bytes>` from `http_call`.
+    /// Carry `status` + `gh_req_id` + `retry_after` forward while
+    /// transforming the success payload. Used to layer body parsing
+    /// on top of a raw `ProviderCall<Bytes>` from `http_call`.
     fn map<U>(self, f: impl FnOnce(T) -> Result<U, GithubError>) -> ProviderCall<U> {
         ProviderCall {
             status: self.status,
             gh_req_id: self.gh_req_id,
+            retry_after: self.retry_after,
             result: self.result.and_then(f),
         }
     }
@@ -1024,6 +1100,19 @@ impl GitHubProvider {
             .get(GH_REQUEST_ID_HEADER)
             .and_then(|v| v.to_str().ok())
             .map(String::from)
+    }
+
+    /// Read the `Retry-After` header per RFC 9110 §10.2.3. The
+    /// header carries either an integer number of seconds OR an
+    /// HTTP-date; we parse the integer form (which GitHub uses) and
+    /// ignore the date form. Returns `None` on absent or malformed
+    /// values — caller falls back to "wait at your own pace."
+    fn read_retry_after(resp: &cyper::Response) -> Option<Duration> {
+        resp.headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(Duration::from_secs)
     }
 
     /// `tests::build_mint_body_exact_bytes`.

@@ -23,6 +23,13 @@ pub struct Request {
     pub protocol: String,
     pub host: String,
     pub path: String,
+    /// True iff the client declared `capability[]=authtype` in the
+    /// request, indicating it understands the modern response shape
+    /// (`authtype`, `credential`, `ephemeral`). Git 2.46+ sends this
+    /// after we advertise `capability authtype` on the `capability`
+    /// action. Older clients omit the line and we fall back to the
+    /// legacy `username`/`password` shape.
+    pub client_supports_authtype: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +115,7 @@ pub fn parse(input: &[u8]) -> Result<Request, GitCredentialError> {
     let mut protocol: Option<String> = None;
     let mut host: Option<String> = None;
     let mut path: Option<String> = None;
+    let mut client_supports_authtype = false;
 
     for (i, line) in block.split(|&c| c == b'\n').enumerate() {
         let line_no = i + 1;
@@ -122,11 +130,29 @@ pub fn parse(input: &[u8]) -> Result<Request, GitCredentialError> {
             return Err(GitCredentialError::EmptyKey { line_no });
         }
 
+        // `capability[]` is the only repeating array key we inspect.
+        // Multiple lines like `capability[]=authtype\ncapability[]=state\n`
+        // are all valid; we track whether `authtype` appeared. Empty
+        // value `capability[]=` is the spec-defined "reset" for the
+        // array and clears any earlier flags (per git-credential.adoc
+        // array semantics).
+        if key_bytes == b"capability[]" {
+            let value = &line[eq_pos + 1..];
+            if value.is_empty() {
+                client_supports_authtype = false;
+            } else if value == b"authtype" {
+                client_supports_authtype = true;
+            }
+            // Other capabilities (e.g. `state`) ignored — we don't
+            // implement them.
+            continue;
+        }
+
         // Unknown keys are accepted and ignored: `gitcredentials(7)`
-        // is extensible (`wwwauth[]`, `capability[]`, etc.).
-        // Whitespace-around-`=` requests also land here as unknown
-        // keys (e.g. `host ` with a trailing space), and `url=`
-        // shorthand is rejected implicitly by the same path.
+        // is extensible (`wwwauth[]`, etc.). Whitespace-around-`=`
+        // requests also land here as unknown keys (e.g. `host ` with
+        // a trailing space), and `url=` shorthand is rejected
+        // implicitly by the same path.
         let key_static: &'static str = match key_bytes {
             b"protocol" => "protocol",
             b"host" => "host",
@@ -196,11 +222,33 @@ pub fn parse(input: &[u8]) -> Result<Request, GitCredentialError> {
         protocol,
         host,
         path,
+        client_supports_authtype,
     })
 }
 
-pub(crate) fn write_response(resp: &Response, out: &mut Vec<u8>) -> Result<(), GitCredentialError> {
-    check_response_field("username", &resp.username)?;
+/// Emit the response shape git-credential expects. When
+/// `client_supports_authtype` is true (negotiated via
+/// `capability[]=authtype` in the request), emit the modern
+/// `authtype=Bearer` + `credential=<token>` + `ephemeral=true`
+/// shape; otherwise emit the legacy `username`/`password` shape
+/// for git ≤ 2.45.
+///
+/// The modern shape:
+/// - **`authtype=Bearer` + `credential=<token>`** produces the
+///   `Authorization: Bearer <token>` header git constructs in
+///   `http.c::http_append_auth_header` — the same form GitHub's
+///   REST API documents (the git-HTTP frontend accepts it too,
+///   though that's not explicitly documented).
+/// - **`ephemeral=true`** tells downstream credential helpers
+///   (cache, store) NOT to persist the credential — load-bearing
+///   for our 1-hour-TTL installation tokens.
+/// - `username` is omitted: when `credential` is set, the
+///   git-credential spec says `username` / `password` are not used.
+pub(crate) fn write_response(
+    resp: &Response,
+    client_supports_authtype: bool,
+    out: &mut Vec<u8>,
+) -> Result<(), GitCredentialError> {
     check_response_field("password", &resp.password)?;
 
     let expiry_secs = resp
@@ -210,20 +258,41 @@ pub(crate) fn write_response(resp: &Response, out: &mut Vec<u8>) -> Result<(), G
         .as_secs();
     let expiry_str = expiry_secs.to_string();
 
-    // Single growth: "username=" + user + "\npassword=" + pass +
-    // "\npassword_expiry_utc=" + digits + "\n\n". Fixed labels sum
-    // to 41 bytes; max u64 in decimal is 20 digits.
-    out.reserve(41 + resp.username.len() + resp.password.len() + expiry_str.len() + 2);
-    out.extend_from_slice(b"username=");
-    out.extend_from_slice(resp.username.as_bytes());
-    out.push(b'\n');
-    out.extend_from_slice(b"password=");
-    out.extend_from_slice(resp.password.as_bytes());
-    out.push(b'\n');
-    out.extend_from_slice(b"password_expiry_utc=");
-    out.extend_from_slice(expiry_str.as_bytes());
-    out.push(b'\n');
-    out.push(b'\n');
+    if client_supports_authtype {
+        // Modern shape (git 2.46+ after authtype capability negotiation).
+        // The token in `resp.password` IS the bearer credential.
+        out.reserve(
+            "capability[]=authtype\nauthtype=Bearer\ncredential=\nephemeral=true\npassword_expiry_utc=\n\n".len()
+                + resp.password.len()
+                + expiry_str.len(),
+        );
+        out.extend_from_slice(b"capability[]=authtype\n");
+        out.extend_from_slice(b"authtype=Bearer\n");
+        out.extend_from_slice(b"credential=");
+        out.extend_from_slice(resp.password.as_bytes());
+        out.push(b'\n');
+        out.extend_from_slice(b"ephemeral=true\n");
+        out.extend_from_slice(b"password_expiry_utc=");
+        out.extend_from_slice(expiry_str.as_bytes());
+        out.push(b'\n');
+        out.push(b'\n');
+    } else {
+        check_response_field("username", &resp.username)?;
+        // Legacy shape (git ≤ 2.45 or any client that didn't
+        // declare authtype capability). The `username` is always
+        // `x-access-token` for GitHub installation tokens.
+        out.reserve(41 + resp.username.len() + resp.password.len() + expiry_str.len() + 2);
+        out.extend_from_slice(b"username=");
+        out.extend_from_slice(resp.username.as_bytes());
+        out.push(b'\n');
+        out.extend_from_slice(b"password=");
+        out.extend_from_slice(resp.password.as_bytes());
+        out.push(b'\n');
+        out.extend_from_slice(b"password_expiry_utc=");
+        out.extend_from_slice(expiry_str.as_bytes());
+        out.push(b'\n');
+        out.push(b'\n');
+    }
 
     Ok(())
 }
@@ -249,6 +318,32 @@ mod tests {
         assert_eq!(req.protocol, "https");
         assert_eq!(req.host, "github.com");
         assert_eq!(req.path, "octocat/Spoon-Knife");
+        assert!(!req.client_supports_authtype);
+    }
+
+    #[test]
+    fn parse_authtype_capability_sets_flag() {
+        let input = b"capability[]=authtype\nprotocol=https\nhost=github.com\npath=o/r\n\n";
+        let req = parse(input).unwrap();
+        assert!(req.client_supports_authtype);
+    }
+
+    #[test]
+    fn parse_other_capability_does_not_set_flag() {
+        // `state` is a valid capability we don't implement; declaring
+        // it must not toggle the authtype flag.
+        let input = b"capability[]=state\nprotocol=https\nhost=github.com\npath=o/r\n\n";
+        let req = parse(input).unwrap();
+        assert!(!req.client_supports_authtype);
+    }
+
+    #[test]
+    fn parse_empty_capability_resets_flag() {
+        // git-credential array semantics: empty value resets the list.
+        let input =
+            b"capability[]=authtype\ncapability[]=\nprotocol=https\nhost=github.com\npath=o/r\n\n";
+        let req = parse(input).unwrap();
+        assert!(!req.client_supports_authtype);
     }
 
     #[test]
@@ -311,7 +406,7 @@ mod tests {
             password_expiry_utc: SystemTime::UNIX_EPOCH,
         };
         let mut out = Vec::new();
-        let err = write_response(&resp, &mut out).unwrap_err();
+        let err = write_response(&resp, false, &mut out).unwrap_err();
         assert!(matches!(
             err,
             GitCredentialError::ResponseControlByte { field: "password" }
@@ -326,7 +421,7 @@ mod tests {
             password_expiry_utc: SystemTime::UNIX_EPOCH,
         };
         let mut out = Vec::new();
-        let err = write_response(&resp, &mut out).unwrap_err();
+        let err = write_response(&resp, false, &mut out).unwrap_err();
         assert!(matches!(
             err,
             GitCredentialError::ResponseControlByte { field: "username" }
@@ -477,7 +572,7 @@ mod tests {
             password_expiry_utc: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
         };
         let mut out = Vec::new();
-        write_response(&resp, &mut out).unwrap();
+        write_response(&resp, false, &mut out).unwrap();
         assert_eq!(
             out,
             b"username=x-access-token\npassword=ghs_xxxxxxxxxxx\npassword_expiry_utc=1700000000\n\n"
@@ -492,7 +587,7 @@ mod tests {
             password_expiry_utc: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
         };
         let mut out = b"junk".to_vec();
-        write_response(&resp, &mut out).unwrap();
+        write_response(&resp, false, &mut out).unwrap();
         assert_eq!(&out[..4], b"junk");
         assert_eq!(
             &out[4..],
@@ -508,7 +603,7 @@ mod tests {
             password_expiry_utc: SystemTime::UNIX_EPOCH + Duration::from_secs(42),
         };
         let mut out = Vec::new();
-        write_response(&resp, &mut out).unwrap();
+        write_response(&resp, false, &mut out).unwrap();
         let body = std::str::from_utf8(&out).unwrap();
         assert!(body.contains("password_expiry_utc=42\n"));
     }
@@ -521,8 +616,64 @@ mod tests {
             password_expiry_utc: SystemTime::UNIX_EPOCH - Duration::from_secs(1),
         };
         let mut out = Vec::new();
-        let err = write_response(&resp, &mut out).unwrap_err();
+        let err = write_response(&resp, false, &mut out).unwrap_err();
         assert!(matches!(err, GitCredentialError::EmitInvalidExpiry));
+    }
+
+    #[test]
+    fn emit_modern_shape_when_authtype_negotiated() {
+        let resp = Response {
+            username: "x-access-token".to_string(),
+            password: "ghs_xxxxxxxxxxx".to_string(),
+            password_expiry_utc: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        };
+        let mut out = Vec::new();
+        write_response(&resp, true, &mut out).unwrap();
+        assert_eq!(
+            out,
+            b"capability[]=authtype\n\
+              authtype=Bearer\n\
+              credential=ghs_xxxxxxxxxxx\n\
+              ephemeral=true\n\
+              password_expiry_utc=1700000000\n\
+              \n"
+        );
+    }
+
+    #[test]
+    fn emit_modern_shape_omits_username() {
+        // Spec: when `credential` is set, `username`/`password` are
+        // not used. The `resp.username` value (always
+        // "x-access-token" for us) must NOT leak into the wire.
+        let resp = Response {
+            username: "x-access-token".to_string(),
+            password: "ghs_tok".to_string(),
+            password_expiry_utc: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+        };
+        let mut out = Vec::new();
+        write_response(&resp, true, &mut out).unwrap();
+        let body = std::str::from_utf8(&out).unwrap();
+        assert!(!body.contains("username="));
+        assert!(!body.contains("password=")); // distinct from `password_expiry_utc`
+        assert!(body.contains("ephemeral=true\n"));
+    }
+
+    #[test]
+    fn emit_modern_rejects_cr_in_token() {
+        // The token goes through the same CR/LF/NUL guard as the
+        // legacy `password` field — a malformed token must never
+        // produce an extra wire line.
+        let resp = Response {
+            username: "x-access-token".to_string(),
+            password: "ghs_xxx\rextra=line".to_string(),
+            password_expiry_utc: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+        };
+        let mut out = Vec::new();
+        let err = write_response(&resp, true, &mut out).unwrap_err();
+        assert!(matches!(
+            err,
+            GitCredentialError::ResponseControlByte { field: "password" }
+        ));
     }
 
     #[test]

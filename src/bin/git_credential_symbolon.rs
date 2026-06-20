@@ -54,18 +54,32 @@ struct Args {
 fn main() -> ExitCode {
     let args: Args = argh::from_env();
 
-    // `store` and `erase` are git's per-action calls into a helper for caching;
-    // we never persist anything, so they're no-ops.
-    if args.action != "get" {
-        return ExitCode::SUCCESS;
-    }
-
-    match run(&args) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("git-credential-symbolon: {e}");
-            ExitCode::from(1)
+    match args.action.as_str() {
+        "get" => match run(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("git-credential-symbolon: {e}");
+                ExitCode::from(1)
+            }
+        },
+        // `capability` (git 2.46+) — advertise that we understand
+        // the `authtype` capability so git will send
+        // `capability[]=authtype` on subsequent `get` requests, which
+        // unlocks the modern `authtype=Bearer` + `credential=<token>`
+        // + `ephemeral=true` response shape. Format per
+        // git-credential.adoc § CAPABILITY INPUT/OUTPUT FORMAT.
+        "capability" => {
+            let mut out = std::io::stdout().lock();
+            if out.write_all(b"version 0\ncapability authtype\n").is_err() {
+                return ExitCode::from(1);
+            }
+            ExitCode::SUCCESS
         }
+        // `store` and `erase` are git's per-action calls into a
+        // helper for caching; we never persist anything, so they're
+        // no-ops. Any other action is also a no-op success — git
+        // ignores helpers that don't recognise an action.
+        _ => ExitCode::SUCCESS,
     }
 }
 

@@ -854,9 +854,11 @@ async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<Shar
                 };
 
                 let mut response_bytes = Vec::with_capacity(256);
-                if let Err(e) =
-                    git_credential::write_response(&outcome.response, &mut response_bytes)
-                {
+                if let Err(e) = git_credential::write_response(
+                    &outcome.response,
+                    request.client_supports_authtype,
+                    &mut response_bytes,
+                ) {
                     warn!(
                         req_id = %req_id,
                         evt = %EventKind::ProviderError,
@@ -1105,12 +1107,13 @@ fn log_mint_error(
                 error = %body,
             );
         }
-        ProviderError::RateLimited => {
+        ProviderError::RateLimited { retry_after } => {
             warn!(
                 req_id = %req_id,
                 evt = %EventKind::MintDenied,
                 reason = "provider_4xx",
                 provider_status = 429,
+                retry_after_sec = retry_after.map(|d| d.as_secs()).unwrap_or(0),
                 provider = %host,
                 client = %client_name,
                 repo = %path,

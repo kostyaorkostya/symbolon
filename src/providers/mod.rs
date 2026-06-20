@@ -45,7 +45,13 @@ pub enum ProviderError {
     RepoNotFound { path: String },
 
     #[error("rate limited")]
-    RateLimited,
+    RateLimited {
+        /// Server-suggested wait time before retry. Provider impls
+        /// fill this in from whatever upstream signal exists (e.g.
+        /// GitHub's `Retry-After` header). `None` means the upstream
+        /// didn't say.
+        retry_after: Option<Duration>,
+    },
 
     #[error("provider returned unexpected status {status}")]
     UnexpectedStatus { status: u16 },

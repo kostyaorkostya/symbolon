@@ -219,6 +219,107 @@ The CLI's `symbolon github selfcheck` reads these from
 `response["details"]` (per the provider-shape convention in
 [`PROVIDER_CONTRACT.md` § A3](../PROVIDER_CONTRACT.md#a3-provider-specific-selfcheck-details)).
 
+## Operator notes
+
+### Branch protection interaction
+
+Installation tokens are **not exempt from branch protection rules.**
+A `git push` to a protected branch with "Require pull request before
+merging" / "Require status checks" / signed-commits / etc. will be
+rejected at the receive layer even though our token holds
+`contents: write`. The error is server-side (HTTP 200 with a
+git-protocol packet line containing `! [remote rejected] ...`) and
+will surface to the operator as a normal git push failure — not as
+a broker error.
+
+Fix at the **App-installation level** (not in the broker): either
+add the App to the branch protection rule's bypass list, or use a
+deploy strategy that doesn't push directly to a protected branch
+(open a PR via the API instead). The broker mints tokens; it does
+not configure GitHub-side authorisation.
+
+### Token revocation
+
+The metadata-only installation token used during
+`resolve_repo_id` is revoked via `DELETE /installation/token`
+immediately after the repo-ID lookup completes. This shortens its
+useful life from the natural 1-hour TTL to the duration of one
+HTTP round-trip. The revoke call is best-effort: failures are
+logged as `evt=provider_call_done` breadcrumbs but do not
+propagate, because the caller has already consumed the token's
+single use.
+
+The **mint token** returned to the client is NOT revoked from the
+broker side. The client holds it for the duration of its git
+operation (clone, fetch, push); revoking it would break that
+operation in flight. Its 1-hour TTL is the only bound. A client
+that has finished can revoke its own token by calling
+`DELETE /installation/token` itself — see the
+[GitHub docs](https://docs.github.com/en/rest/apps/installations#revoke-an-installation-access-token).
+
+## Manual smoke test before public release
+
+The modern git-credential response shape (`authtype=Bearer` +
+`credential=<token>` + `ephemeral=true`) relies on git constructing
+`Authorization: Bearer <ghs_…>` for git-HTTP and GitHub's git-HTTP
+frontend accepting that header form. GitHub's docs explicitly
+document the `https://x-access-token:TOKEN@github.com/…` form;
+Bearer-for-git-HTTP is undocumented but, given the underlying
+auth backend, very likely works (the same token works for the
+REST API as Bearer). Verify empirically before tagging a public
+release:
+
+```sh
+# Prereqs:
+# - A test GitHub App with installation on a private test repo,
+#   `Contents: write` permission, your test-VM PSK enrolled.
+# - git ≥ 2.46 on the test VM.
+# - symbolon daemon running on broker host with the App
+#   configured under `[provider.github]`.
+
+# 1. Confirm git is new enough that it sends capability[]=authtype.
+git --version    # must be ≥ 2.46
+
+# 2. Drop the helper config on the client VM.
+git config --global \
+  credential.https://github.com.helper \
+  "/usr/local/bin/git-credential-symbolon \
+   --endpoint broker.lan:9418 \
+   --identity test-vm \
+   --psk-file /etc/symbolon/psk"
+
+# 3. Clone — exercises the modern auth flow.
+git clone https://github.com/<owner>/<repo>.git /tmp/sb-test
+cd /tmp/sb-test
+
+# 4. Make a trivial commit and push — exercises write auth.
+echo "x" >> README.md
+git -c user.name=test -c user.email=test@example test commit -am test
+git push
+
+# 5. Tail the broker logs and confirm:
+journalctl -u symbolon -f
+# Expected event sequence per mint:
+#   evt=provider_call endpoint=mint_metadata_token
+#   evt=provider_call_done status=201 ...
+#   evt=provider_call endpoint=resolve_repo_id
+#   evt=provider_call_done status=200 ...
+#   evt=provider_call endpoint=revoke_install_token
+#   evt=provider_call_done status=204 ...
+#   evt=provider_call endpoint=mint_token
+#   evt=provider_call_done status=201 ...
+#   evt=mint provider=github.com repo=... ttl_sec=3599 ...
+
+# 6. If clone/push fails with a 4xx from GitHub at the git-HTTP
+#    layer, revert the modern shape:
+#    - In src/git_credential.rs::write_response, force
+#      `client_supports_authtype = false`.
+#    - Add a regression note in this doc.
+```
+
+If push succeeds and the broker emits the expected event sequence,
+the modern shape is good to ship.
+
 ## Hardening recommendations
 
 The per-mint scoping above is the narrowest GitHub will issue for

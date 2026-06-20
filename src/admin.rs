@@ -545,7 +545,13 @@ fn error_response_from_provider(err: &ProviderError) -> serde_json::Value {
         ),
         ProviderError::Unauthorized { body } => ("provider_4xx", format!("unauthorized: {body}")),
         ProviderError::Forbidden { body } => ("provider_4xx", format!("forbidden: {body}")),
-        ProviderError::RateLimited => ("provider_4xx", "rate limited".to_string()),
+        ProviderError::RateLimited { retry_after } => (
+            "provider_4xx",
+            match retry_after {
+                Some(d) => format!("rate limited (retry after {}s)", d.as_secs()),
+                None => "rate limited".to_string(),
+            },
+        ),
         ProviderError::MalformedPath { path } => {
             ("bad_request", format!("malformed repository path: {path}"))
         }

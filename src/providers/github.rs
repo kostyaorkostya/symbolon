@@ -122,13 +122,37 @@ impl GithubError {
     fn from_common_status(status: u16, body: &Bytes) -> Self {
         match status {
             401 => Self::Unauthorized {
-                body: parse_github_error_body(body),
+                body: Self::message_from_body(body),
             },
             403 => Self::Forbidden {
-                body: parse_github_error_body(body),
+                body: Self::message_from_body(body),
             },
             429 => Self::RateLimited,
             other => Self::OtherStatus(other),
+        }
+    }
+
+    /// Pull a short, log-safe excerpt from a GitHub 4xx response body.
+    /// GitHub's error responses are typically
+    /// `{"message":"…","documentation_url":"…"}`; return the `message`
+    /// when present, otherwise a truncated raw prefix. **Only safe for
+    /// 4xx responses**: mint 2xx bodies carry the access token and must
+    /// never reach this function.
+    fn message_from_body(body: &[u8]) -> String {
+        #[derive(Deserialize)]
+        struct Envelope<'a> {
+            message: Option<&'a str>,
+        }
+        if let Ok(env) = serde_json::from_slice::<Envelope>(body)
+            && let Some(m) = env.message
+        {
+            return m.to_string();
+        }
+        const MAX_CHARS: usize = 200;
+        let text = std::str::from_utf8(body).unwrap_or("(non-utf8 body)");
+        match text.char_indices().nth(MAX_CHARS) {
+            Some((cut, _)) => format!("{}…", &text[..cut]),
+            None => text.to_string(),
         }
     }
 }
@@ -313,16 +337,16 @@ impl GitHubProvider {
     }
 
     pub async fn mint(&self, req_id: &str, path: &str) -> Result<MintData, GithubError> {
-        let (owner, repo) = split_owner_repo(path)?;
+        let parsed = RepoPath::parse(path)?;
         let key = format!(
             "{}/{}",
-            owner.to_ascii_lowercase(),
-            repo.to_ascii_lowercase()
+            parsed.owner().to_ascii_lowercase(),
+            parsed.repo().to_ascii_lowercase()
         );
         let now = (self.clock)();
 
         let repo_id = self
-            .resolve_with_singleflight(req_id, &key, owner, repo, now)
+            .resolve_with_singleflight(req_id, &key, parsed.owner(), parsed.repo(), now)
             .await?;
 
         let m = self
@@ -422,7 +446,7 @@ impl GitHubProvider {
     }
 
     async fn sign_jwt_now(&self) -> Result<String, GithubError> {
-        let claims = build_claims((self.clock)(), &self.client_id);
+        let claims = JwtClaims::new((self.clock)(), &self.client_id);
         self.signer.sign(claims).await
     }
 
@@ -494,7 +518,7 @@ impl GitHubProvider {
             Err(e) => return ProviderCall::pre_send(e),
         };
         let status = resp.status().as_u16();
-        let gh_req_id = read_gh_req_id(&resp);
+        let gh_req_id = Self::read_gh_req_id(&resp);
         let body = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
@@ -622,7 +646,7 @@ impl GitHubProvider {
                 )
                 .await?;
             status = resp.status().as_u16();
-            gh_req_id = read_gh_req_id(&resp);
+            gh_req_id = Self::read_gh_req_id(&resp);
             // HTTP `Date` header (IMF-fixdate per RFC 7231 § 7.1.1.1)
             // is accepted by `time`'s Rfc2822 parser (`GMT` → zero
             // offset). Silently 0 if the header is missing or
@@ -677,11 +701,14 @@ impl GitHubProvider {
         owner: &str,
         repo: &str,
     ) -> ProviderCall<u64> {
+        // `owner` / `repo` already came through `RepoPath::parse`, so
+        // construct one to reuse its URL-safe rendering.
+        let parsed = RepoPath { owner, repo };
         let url = format!(
             "{}/repos/{}/{}",
             self.api_base,
-            encode_repo_segment(owner),
-            encode_repo_segment(repo),
+            parsed.owner_url(),
+            parsed.repo_url(),
         );
         let call = self
             .http_call(
@@ -695,7 +722,7 @@ impl GitHubProvider {
             .await;
         let status = call.status;
         call.map(|body| match status {
-            200 => parse_repo_response(&body),
+            200 => Self::parse_repo_response(&body),
             404 => Err(GithubError::RepoNotFound {
                 path: format!("{owner}/{repo}"),
             }),
@@ -736,7 +763,7 @@ impl GitHubProvider {
             .await;
         let status = call.status;
         call.map(|bytes| match status {
-            201 => parse_mint_response(&bytes),
+            201 => Self::parse_mint_response(&bytes),
             s => Err(GithubError::from_common_status(s, &bytes)),
         })
     }
@@ -760,14 +787,14 @@ impl GitHubProvider {
                 Method::Post,
                 &url,
                 &jwt,
-                Some(build_mint_body(repo_id)),
+                Some(Self::build_mint_body(repo_id)),
                 &out_req_id,
                 self.request_timeout,
             )
             .await;
         let status = call.status;
         call.map(|bytes| match status {
-            201 => parse_mint_response(&bytes),
+            201 => Self::parse_mint_response(&bytes),
             404 => Err(GithubError::RepoNotFound {
                 path: path.to_string(),
             }),
@@ -829,13 +856,6 @@ impl<T> ProviderCall<T> {
             result: self.result.and_then(f),
         }
     }
-}
-
-fn read_gh_req_id(resp: &cyper::Response) -> Option<String> {
-    resp.headers()
-        .get(GH_REQUEST_ID_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(String::from)
 }
 
 // ============================================================================
@@ -952,19 +972,15 @@ struct JwtClaims {
     exp: u64,
 }
 
-fn build_claims(now: SystemTime, client_id: &str) -> JwtClaims {
-    let unix = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    JwtClaims {
-        iss: client_id.to_string(),
-        iat: unix.saturating_sub(JWT_LEEWAY_PAST),
-        exp: unix.saturating_add(JWT_LIFETIME),
+impl JwtClaims {
+    fn new(now: SystemTime, client_id: &str) -> Self {
+        let unix = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        Self {
+            iss: client_id.to_string(),
+            iat: unix.saturating_sub(JWT_LEEWAY_PAST),
+            exp: unix.saturating_add(JWT_LIFETIME),
+        }
     }
-}
-
-/// Synchronous RSA-2048 JWT signing; ~1-2 ms per call. MUST run
-/// on the `CpuWorker` thread, never the compio runtime.
-fn sign_jwt_blocking(claims: &JwtClaims, key: &JwtSigningKey) -> Result<String, GithubError> {
-    key.sign_rs256(claims).map_err(GithubError::JwtSign)
 }
 
 /// Holds a shared [`CpuWorker`] handle and the App's
@@ -980,137 +996,153 @@ struct JwtSigner {
 }
 
 impl JwtSigner {
+    /// Synchronous RSA-2048 signing runs ~1-2 ms per call on the
+    /// shared `CpuWorker` thread — never on the compio runtime.
     async fn sign(&self, claims: JwtClaims) -> Result<String, GithubError> {
         let key = Arc::clone(&self.key);
         self.worker
-            .run(move || sign_jwt_blocking(&claims, &key))
+            .run(move || key.sign_rs256(&claims).map_err(GithubError::JwtSign))
             .await?
     }
 }
 
 // ============================================================================
-// Request body builder
+// impl GitHubProvider — request body builder, response parsers
 // ============================================================================
 
-/// Wire body for `POST /app/installations/{id}/access_tokens`
-/// scoped to one repo with the narrow `git push` permission set
-/// (AGENTS.md invariants #4, #5). Pinned byte-exact by
-/// `tests::build_mint_body_exact_bytes`.
-fn build_mint_body(repo_id: u64) -> Vec<u8> {
-    format!(
-        r#"{{"repository_ids":[{repo_id}],"permissions":{{"contents":"write","metadata":"read"}}}}"#
-    )
-    .into_bytes()
-}
-
-// ============================================================================
-// Response parsers
-// ============================================================================
-
-/// Pull a short, log-safe excerpt from a GitHub 4xx response body.
-/// GitHub's error responses are typically
-/// `{"message":"…","documentation_url":"…"}`; return the `message`
-/// when present, otherwise a truncated raw prefix. **Only safe for
-/// 4xx responses**: mint 2xx bodies carry the access token and must
-/// never reach this function.
-fn parse_github_error_body(body: &[u8]) -> String {
-    #[derive(Deserialize)]
-    struct Envelope<'a> {
-        message: Option<&'a str>,
+impl GitHubProvider {
+    /// Wire body for `POST /app/installations/{id}/access_tokens`
+    /// scoped to one repo with the narrow `git push` permission set
+    /// (AGENTS.md invariants #4, #5). Pinned byte-exact by
+    /// Read the GitHub-specific `X-GitHub-Request-Id` header off a
+    /// response, if present. The string ends up on the abstract
+    /// `provider_req_id` log/wire field; field shape is shared with
+    /// other providers (each surfaces their own upstream correlation
+    /// id under the same field name).
+    fn read_gh_req_id(resp: &cyper::Response) -> Option<String> {
+        resp.headers()
+            .get(GH_REQUEST_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
     }
-    if let Ok(env) = serde_json::from_slice::<Envelope>(body)
-        && let Some(m) = env.message
-    {
-        return m.to_string();
-    }
-    const MAX_CHARS: usize = 200;
-    let text = std::str::from_utf8(body).unwrap_or("(non-utf8 body)");
-    match text.char_indices().nth(MAX_CHARS) {
-        Some((cut, _)) => format!("{}…", &text[..cut]),
-        None => text.to_string(),
-    }
-}
 
-fn parse_mint_response(bytes: &[u8]) -> Result<(String, SystemTime), GithubError> {
-    #[derive(Deserialize)]
-    struct Resp {
-        token: String,
-        expires_at: String,
+    /// `tests::build_mint_body_exact_bytes`.
+    fn build_mint_body(repo_id: u64) -> Vec<u8> {
+        format!(
+            r#"{{"repository_ids":[{repo_id}],"permissions":{{"contents":"write","metadata":"read"}}}}"#
+        )
+        .into_bytes()
     }
-    let r: Resp = serde_json::from_slice(bytes).map_err(|_| GithubError::ParseResponse {
-        context: "mint",
-        detail: "json",
-    })?;
-    let secs = OffsetDateTime::parse(&r.expires_at, &Rfc3339)
-        .ok()
-        .and_then(|dt| u64::try_from(dt.unix_timestamp()).ok())
-        .ok_or(GithubError::ParseResponse {
-            context: "mint",
-            detail: "bad expires_at",
-        })?;
-    Ok((r.token, UNIX_EPOCH + Duration::from_secs(secs)))
-}
 
-fn parse_repo_response(bytes: &[u8]) -> Result<u64, GithubError> {
-    #[derive(Deserialize)]
-    struct Resp {
-        id: u64,
-    }
-    serde_json::from_slice::<Resp>(bytes)
-        .map(|r| r.id)
-        .map_err(|_| GithubError::ParseResponse {
-            context: "repo",
-            detail: "json",
-        })
-}
-
-// ============================================================================
-// Path validation
-// ============================================================================
-
-/// A byte is valid in a GitHub owner/repo name iff it is an ASCII
-/// alphanumeric or one of `.`, `_`, `-`.
-fn is_valid_repo_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')
-}
-
-/// Split `owner/repo` and validate both halves against
-/// [`is_valid_repo_byte`]. Zero-alloc on the success path.
-fn split_owner_repo(path: &str) -> Result<(&str, &str), GithubError> {
-    let (owner, repo) = path
-        .split_once('/')
-        .ok_or_else(|| GithubError::MalformedPath(path.to_string()))?;
-    if owner.is_empty()
-        || repo.is_empty()
-        || !owner.bytes().all(is_valid_repo_byte)
-        || !repo.bytes().all(is_valid_repo_byte)
-    {
-        return Err(GithubError::MalformedPath(path.to_string()));
-    }
-    Ok((owner, repo))
-}
-
-/// Percent-encode an owner/repo segment for a URL path. The
-/// allowed set is the same one `split_owner_repo` enforces;
-/// since callers always reach here via `split_owner_repo`, the
-/// encoder is defence-in-depth — if a future regression lets a
-/// non-allowed byte through, it gets percent-encoded instead of
-/// pasted raw into the URL. Returns `Cow::Borrowed` on the
-/// validated fast path (no alloc).
-fn encode_repo_segment(s: &str) -> std::borrow::Cow<'_, str> {
-    if s.bytes().all(is_valid_repo_byte) {
-        return std::borrow::Cow::Borrowed(s);
-    }
-    use std::fmt::Write;
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if is_valid_repo_byte(b) {
-            out.push(b as char);
-        } else {
-            let _ = write!(out, "%{b:02X}");
+    fn parse_mint_response(bytes: &[u8]) -> Result<(String, SystemTime), GithubError> {
+        #[derive(Deserialize)]
+        struct Resp {
+            token: String,
+            expires_at: String,
         }
+        let r: Resp = serde_json::from_slice(bytes).map_err(|_| GithubError::ParseResponse {
+            context: "mint",
+            detail: "json",
+        })?;
+        let secs = OffsetDateTime::parse(&r.expires_at, &Rfc3339)
+            .ok()
+            .and_then(|dt| u64::try_from(dt.unix_timestamp()).ok())
+            .ok_or(GithubError::ParseResponse {
+                context: "mint",
+                detail: "bad expires_at",
+            })?;
+        Ok((r.token, UNIX_EPOCH + Duration::from_secs(secs)))
     }
-    std::borrow::Cow::Owned(out)
+
+    fn parse_repo_response(bytes: &[u8]) -> Result<u64, GithubError> {
+        #[derive(Deserialize)]
+        struct Resp {
+            id: u64,
+        }
+        serde_json::from_slice::<Resp>(bytes)
+            .map(|r| r.id)
+            .map_err(|_| GithubError::ParseResponse {
+                context: "repo",
+                detail: "json",
+            })
+    }
+}
+
+// ============================================================================
+// RepoPath: parsed and validated owner/repo from a git-credential request
+// ============================================================================
+
+/// `owner/repo` reference borrowed from a git-credential request,
+/// validated against [`Self::is_valid_byte`] so the URL builder
+/// doesn't have to re-validate. Construct via [`Self::parse`];
+/// reach the URL-safe form via [`Self::owner_url`] / [`Self::repo_url`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RepoPath<'a> {
+    owner: &'a str,
+    repo: &'a str,
+}
+
+impl<'a> RepoPath<'a> {
+    /// A byte is valid in a GitHub owner/repo name iff it is an
+    /// ASCII alphanumeric or one of `.`, `_`, `-`.
+    fn is_valid_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')
+    }
+
+    /// Split `owner/repo` and validate both halves. Zero-alloc on
+    /// the success path.
+    fn parse(path: &'a str) -> Result<Self, GithubError> {
+        let (owner, repo) = path
+            .split_once('/')
+            .ok_or_else(|| GithubError::MalformedPath(path.to_string()))?;
+        if owner.is_empty()
+            || repo.is_empty()
+            || !owner.bytes().all(Self::is_valid_byte)
+            || !repo.bytes().all(Self::is_valid_byte)
+        {
+            return Err(GithubError::MalformedPath(path.to_string()));
+        }
+        Ok(Self { owner, repo })
+    }
+
+    fn owner(&self) -> &'a str {
+        self.owner
+    }
+
+    fn repo(&self) -> &'a str {
+        self.repo
+    }
+
+    /// URL-safe rendering of `owner`. Borrowed on the validated
+    /// fast path; encoded copy otherwise. Defence-in-depth — every
+    /// `RepoPath` came through [`Self::parse`], which only admits
+    /// the allowed charset, so the encoded branch is unreachable
+    /// under normal operation. If a future regression slips a
+    /// non-allowed byte past `parse`, the URL builder percent-
+    /// encodes instead of pasting it raw.
+    fn owner_url(&self) -> std::borrow::Cow<'a, str> {
+        Self::encode_segment(self.owner)
+    }
+
+    fn repo_url(&self) -> std::borrow::Cow<'a, str> {
+        Self::encode_segment(self.repo)
+    }
+
+    fn encode_segment(s: &str) -> std::borrow::Cow<'_, str> {
+        if s.bytes().all(Self::is_valid_byte) {
+            return std::borrow::Cow::Borrowed(s);
+        }
+        use std::fmt::Write;
+        let mut out = String::with_capacity(s.len());
+        for b in s.bytes() {
+            if Self::is_valid_byte(b) {
+                out.push(b as char);
+            } else {
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+        std::borrow::Cow::Owned(out)
+    }
 }
 
 // ============================================================================
@@ -1170,7 +1202,7 @@ mod tests {
 
     #[test]
     fn build_claims_at_fixed_time() {
-        let claims = build_claims(t(1_700_000_000), "Iv1.test42");
+        let claims = JwtClaims::new(t(1_700_000_000), "Iv1.test42");
         assert_eq!(claims.iss, "Iv1.test42");
         assert_eq!(claims.iat, 1_700_000_000 - 60);
         assert_eq!(claims.exp, 1_700_000_000 + 540);
@@ -1179,8 +1211,8 @@ mod tests {
     #[test]
     fn sign_jwt_produces_three_parts() {
         let key = JwtSigningKey::from_pem(FIXTURE_PEM.as_bytes()).unwrap();
-        let claims = build_claims(t(1_700_000_000), "Iv1.test42");
-        let token = sign_jwt_blocking(&claims, &key).unwrap();
+        let claims = JwtClaims::new(t(1_700_000_000), "Iv1.test42");
+        let token = key.sign_rs256(&claims).unwrap();
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3);
     }
@@ -1189,12 +1221,12 @@ mod tests {
     /// RSASSA-PKCS1-v1_5 is deterministic; the
     /// `crate::providers::jwt_rs256` test has the same assertion
     /// for the lower-level helper, this one covers
-    /// `sign_jwt_blocking` end-to-end.
+    /// `JwtSigner::sign` end-to-end.
     #[test]
     fn sign_jwt_blocking_known_vector() {
         let key = JwtSigningKey::from_pem(FIXTURE_PEM.as_bytes()).unwrap();
-        let claims = build_claims(t(1_700_000_000), "Iv1.test42");
-        let token = sign_jwt_blocking(&claims, &key).unwrap();
+        let claims = JwtClaims::new(t(1_700_000_000), "Iv1.test42");
+        let token = key.sign_rs256(&claims).unwrap();
         assert_eq!(
             token,
             "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJJdjEudGVzdDQyIiwiaWF0IjoxNjk5OTk5OTQwLCJleHAiOjE3MDAwMDA1NDB9.yPTDonwO4souVu_3nk7Aq8ZbiAq3PBVLHRJ5J6B67JHmUxVh-yvIoXdQ8O_EAqj-H57GKRAo_b0nu6hQT_keD9-wB_ah8DC_ZqtV42S3jHACWAdEG066W1XdKUftU82QkdSM5hrpdg9OvFN6i7m0ObCJi3uJMWXYb8lY1LYJew0SWajBzLKQjw47Qmbq-AYiTgkdBoRfK5TrD64u6wd0aQCathxELkaiEacilUtU6ZH8jOQ_W5hYjjwxjTF7wbNWdx-v7M3yUSUn_01Sn9w2bTLeimsP4e81ydchLhIeJED4iF-j-QG_uBlhp0auwTPYqPaG6Zh-qhbkE0DJaV-log",
@@ -1203,7 +1235,7 @@ mod tests {
 
     #[test]
     fn build_mint_body_exact_bytes() {
-        let bytes = build_mint_body(42);
+        let bytes = GitHubProvider::build_mint_body(42);
         assert_eq!(
             bytes,
             br#"{"repository_ids":[42],"permissions":{"contents":"write","metadata":"read"}}"#
@@ -1213,7 +1245,7 @@ mod tests {
     #[test]
     fn parse_mint_response_ok() {
         let body = br#"{"token":"ghs_x","expires_at":"2026-05-31T13:00:00Z","extra":"ignored"}"#;
-        let (tok, exp) = parse_mint_response(body).unwrap();
+        let (tok, exp) = GitHubProvider::parse_mint_response(body).unwrap();
         assert_eq!(tok, "ghs_x");
         // 2026-05-31T13:00:00Z = 1780232400.
         let secs = exp.duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -1223,7 +1255,7 @@ mod tests {
     #[test]
     fn parse_mint_response_bad_expires_at() {
         let body = br#"{"token":"ghs_x","expires_at":"not-a-date"}"#;
-        let err = parse_mint_response(body).unwrap_err();
+        let err = GitHubProvider::parse_mint_response(body).unwrap_err();
         assert!(matches!(
             err,
             GithubError::ParseResponse {
@@ -1236,7 +1268,7 @@ mod tests {
     #[test]
     fn parse_mint_response_missing_token() {
         let body = br#"{"expires_at":"2026-05-31T13:00:00Z"}"#;
-        let err = parse_mint_response(body).unwrap_err();
+        let err = GitHubProvider::parse_mint_response(body).unwrap_err();
         assert!(matches!(
             err,
             GithubError::ParseResponse {
@@ -1249,7 +1281,7 @@ mod tests {
     #[test]
     fn parse_mint_response_bad_json() {
         let body = b"not json at all";
-        let err = parse_mint_response(body).unwrap_err();
+        let err = GitHubProvider::parse_mint_response(body).unwrap_err();
         assert!(matches!(
             err,
             GithubError::ParseResponse {
@@ -1268,7 +1300,7 @@ mod tests {
     fn json_parse_error_does_not_leak_response_bytes() {
         let token_like = "ghs_secretSECRETsecret1234567890";
         let body = format!(r#"{{"token":"{token_like}", broken json"#).into_bytes();
-        let err = parse_mint_response(&body).unwrap_err();
+        let err = GitHubProvider::parse_mint_response(&body).unwrap_err();
         let display = format!("{err}");
         let debug = format!("{err:?}");
         assert!(
@@ -1290,13 +1322,13 @@ mod tests {
     #[test]
     fn parse_repo_response_ok() {
         let body = br#"{"id":12345,"name":"Hello-World"}"#;
-        assert_eq!(parse_repo_response(body).unwrap(), 12345);
+        assert_eq!(GitHubProvider::parse_repo_response(body).unwrap(), 12345);
     }
 
     #[test]
     fn parse_repo_response_missing_id() {
         let body = br#"{"name":"Hello-World"}"#;
-        let err = parse_repo_response(body).unwrap_err();
+        let err = GitHubProvider::parse_repo_response(body).unwrap_err();
         assert!(matches!(
             err,
             GithubError::ParseResponse {
@@ -1307,37 +1339,36 @@ mod tests {
     }
 
     #[test]
-    fn split_owner_repo_ok() {
-        assert_eq!(
-            split_owner_repo("octocat/Hello-World").unwrap(),
-            ("octocat", "Hello-World")
-        );
+    fn repo_path_parse_ok() {
+        let p = RepoPath::parse("octocat/Hello-World").unwrap();
+        assert_eq!(p.owner(), "octocat");
+        assert_eq!(p.repo(), "Hello-World");
     }
 
     #[test]
-    fn split_owner_repo_rejects_empty_half() {
+    fn repo_path_parse_rejects_empty_half() {
         assert!(matches!(
-            split_owner_repo("/foo").unwrap_err(),
+            RepoPath::parse("/foo").unwrap_err(),
             GithubError::MalformedPath(_)
         ));
         assert!(matches!(
-            split_owner_repo("foo/").unwrap_err(),
-            GithubError::MalformedPath(_)
-        ));
-    }
-
-    #[test]
-    fn split_owner_repo_rejects_extra_slash() {
-        assert!(matches!(
-            split_owner_repo("a/b/c").unwrap_err(),
+            RepoPath::parse("foo/").unwrap_err(),
             GithubError::MalformedPath(_)
         ));
     }
 
     #[test]
-    fn split_owner_repo_rejects_non_ascii() {
+    fn repo_path_parse_rejects_extra_slash() {
         assert!(matches!(
-            split_owner_repo("föö/bar").unwrap_err(),
+            RepoPath::parse("a/b/c").unwrap_err(),
+            GithubError::MalformedPath(_)
+        ));
+    }
+
+    #[test]
+    fn repo_path_parse_rejects_non_ascii() {
+        assert!(matches!(
+            RepoPath::parse("föö/bar").unwrap_err(),
             GithubError::MalformedPath(_)
         ));
     }

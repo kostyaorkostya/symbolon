@@ -31,7 +31,7 @@ use tracing::info;
 
 use crate::daemon::{ResolvedClient, SharedState};
 use crate::events::EventKind;
-use crate::providers::{Provider, ProviderError, ProviderKind};
+use crate::providers::ProviderError;
 
 const CLIENTS_FILE_MODE: u32 = 0o640;
 const PSK_FILE_MODE: u32 = 0o600;
@@ -331,7 +331,7 @@ async fn handle_enroll(
             &format!("provider '{provider}' not configured"),
         ));
     }
-    if !is_valid_client_name(client) {
+    if !crate::transport::Identity::is_valid(client) {
         return Err(error_response(
             "bad_request",
             "client name must be non-empty ASCII without ':' or whitespace",
@@ -481,7 +481,7 @@ async fn handle_mint(
     client: &str,
     path: &str,
 ) -> Result<serde_json::Value, serde_json::Value> {
-    let provider_obj = lookup_provider(state, provider).ok_or_else(|| {
+    let provider_obj = state.lookup_provider(provider).ok_or_else(|| {
         error_response(
             "unknown_provider",
             &format!("provider '{provider}' not configured"),
@@ -519,7 +519,7 @@ async fn handle_selfcheck(
     state: &Rc<SharedState>,
     provider: &str,
 ) -> Result<serde_json::Value, serde_json::Value> {
-    let provider_obj = lookup_provider(state, provider).ok_or_else(|| {
+    let provider_obj = state.lookup_provider(provider).ok_or_else(|| {
         error_response(
             "unknown_provider",
             &format!("provider '{provider}' not configured"),
@@ -594,122 +594,124 @@ pub async fn cli_dispatch(socket_path: &Path, command: CliCommand) -> Result<i32
         return Ok(1);
     }
 
-    print_success(&command, &value);
+    command.print_success(&value);
     Ok(0)
 }
 
-fn print_success(command: &CliCommand, response: &serde_json::Value) {
-    match command {
-        CliCommand::Status => {
-            let uptime_sec = response
-                .get("uptime_sec")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let providers = response
-                .get("providers")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                })
-                .unwrap_or_default();
-            let client_count = response
-                .get("client_count")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            println!("Uptime: {uptime_sec}s");
-            println!("Providers: {providers}");
-            println!("Clients: {client_count}");
-        }
-        CliCommand::List => {
-            let empty = vec![];
-            let entries = response
-                .get("clients")
-                .and_then(|v| v.as_array())
-                .unwrap_or(&empty);
-            if entries.is_empty() {
-                println!("(no enrolled clients)");
-                return;
-            }
-            for c in entries {
-                let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                let provs = c
+impl CliCommand {
+    fn print_success(&self, response: &serde_json::Value) {
+        match self {
+            CliCommand::Status => {
+                let uptime_sec = response
+                    .get("uptime_sec")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let providers = response
                     .get("providers")
                     .and_then(|v| v.as_array())
                     .map(|arr| {
                         arr.iter()
                             .filter_map(|v| v.as_str())
                             .collect::<Vec<_>>()
-                            .join(",")
+                            .join(", ")
                     })
                     .unwrap_or_default();
-                let enrolled = c.get("enrolled_at").and_then(|v| v.as_str()).unwrap_or("?");
-                println!("{name}\t{provs}\t{enrolled}");
+                let client_count = response
+                    .get("client_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                println!("Uptime: {uptime_sec}s");
+                println!("Providers: {providers}");
+                println!("Clients: {client_count}");
             }
-        }
-        CliCommand::GithubEnroll { client, .. } => {
-            let psk_hex = response
-                .get("psk_hex")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            println!("Enrolled '{client}' for github.com.");
-            println!();
-            println!("# On the client VM, install the helper binary alongside git:");
-            println!("#   /usr/local/bin/git-credential-symbolon");
-            println!();
-            println!("# Write the PSK to /etc/symbolon/psk (mode 0600):");
-            println!("{psk_hex}");
-            println!();
-            println!("# Configure git to use the helper for github.com:");
-            println!("git config --global credential.https://github.com.helper \\");
-            println!(
-                "  \"/usr/local/bin/git-credential-symbolon \\
+            CliCommand::List => {
+                let empty = vec![];
+                let entries = response
+                    .get("clients")
+                    .and_then(|v| v.as_array())
+                    .unwrap_or(&empty);
+                if entries.is_empty() {
+                    println!("(no enrolled clients)");
+                    return;
+                }
+                for c in entries {
+                    let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                    let provs = c
+                        .get("providers")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        })
+                        .unwrap_or_default();
+                    let enrolled = c.get("enrolled_at").and_then(|v| v.as_str()).unwrap_or("?");
+                    println!("{name}\t{provs}\t{enrolled}");
+                }
+            }
+            CliCommand::GithubEnroll { client, .. } => {
+                let psk_hex = response
+                    .get("psk_hex")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                println!("Enrolled '{client}' for github.com.");
+                println!();
+                println!("# On the client VM, install the helper binary alongside git:");
+                println!("#   /usr/local/bin/git-credential-symbolon");
+                println!();
+                println!("# Write the PSK to /etc/symbolon/psk (mode 0600):");
+                println!("{psk_hex}");
+                println!();
+                println!("# Configure git to use the helper for github.com:");
+                println!("git config --global credential.https://github.com.helper \\");
+                println!(
+                    "  \"/usr/local/bin/git-credential-symbolon \\
    --endpoint <broker-host>:9418 \\
    --identity {client} \\
    --psk-file /etc/symbolon/psk\""
-            );
-        }
-        CliCommand::GithubRevoke { client } => {
-            println!("Revoked '{client}' from github.com.");
-        }
-        CliCommand::GithubMint { .. } => {
-            let username = response
-                .get("username")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let password = response
-                .get("password")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let exp = response
-                .get("expires_at_unix")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            println!("username={username}");
-            println!("password={password}");
-            println!("expires_at_unix={exp}");
-        }
-        CliCommand::GithubSelfcheck => {
-            // Provider-specific fields nest under `details` per
-            // PROVIDER_CONTRACT.md § A3 — only the abstract fields
-            // (`clock_skew_sec`, `provider_req_id`, `out_req_id`)
-            // live at the top level.
-            let details = response.get("details");
-            let client_id = details
-                .and_then(|d| d.get("client_id"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("?");
-            let api = details
-                .and_then(|d| d.get("api_base"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("?");
-            let skew = response
-                .get("clock_skew_sec")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            println!("OK: App {client_id} reachable at {api}, clock skew {skew}s");
+                );
+            }
+            CliCommand::GithubRevoke { client } => {
+                println!("Revoked '{client}' from github.com.");
+            }
+            CliCommand::GithubMint { .. } => {
+                let username = response
+                    .get("username")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let password = response
+                    .get("password")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let exp = response
+                    .get("expires_at_unix")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                println!("username={username}");
+                println!("password={password}");
+                println!("expires_at_unix={exp}");
+            }
+            CliCommand::GithubSelfcheck => {
+                // Provider-specific fields nest under `details` per
+                // PROVIDER_CONTRACT.md § A3 — only the abstract fields
+                // (`clock_skew_sec`, `provider_req_id`, `out_req_id`)
+                // live at the top level.
+                let details = response.get("details");
+                let client_id = details
+                    .and_then(|d| d.get("client_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let api = details
+                    .and_then(|d| d.get("api_base"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let skew = response
+                    .get("clock_skew_sec")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                println!("OK: App {client_id} reachable at {api}, clock skew {skew}s");
+            }
         }
     }
 }
@@ -720,25 +722,6 @@ fn print_success(command: &CliCommand, response: &serde_json::Value) {
 
 fn error_response(code: &str, msg: &str) -> serde_json::Value {
     serde_json::json!({ "ok": false, "code": code, "error": msg })
-}
-
-fn lookup_provider<'a>(state: &'a SharedState, provider: &str) -> Option<&'a (dyn Provider + 'a)> {
-    let kind: ProviderKind = provider.parse().ok()?;
-    state
-        .providers
-        .iter()
-        .find(|p| p.kind() == kind)
-        .map(|b| b.as_ref())
-}
-
-fn is_valid_client_name(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    !bytes.is_empty()
-        && bytes.len() <= crate::transport::MAX_IDENTITY_LEN
-        && bytes
-            .iter()
-            .copied()
-            .all(crate::transport::is_identity_byte)
 }
 
 async fn generate_psk_key() -> std::io::Result<[u8; 32]> {
@@ -952,19 +935,19 @@ mod tests {
 
     #[test]
     fn is_valid_client_name_accepts_typical_names() {
-        assert!(is_valid_client_name("dev-vm-1"));
-        assert!(is_valid_client_name("client.42"));
-        assert!(is_valid_client_name("a_b_c"));
+        assert!(crate::transport::Identity::is_valid("dev-vm-1"));
+        assert!(crate::transport::Identity::is_valid("client.42"));
+        assert!(crate::transport::Identity::is_valid("a_b_c"));
     }
 
     #[test]
     fn is_valid_client_name_rejects_bad() {
-        assert!(!is_valid_client_name(""));
-        assert!(!is_valid_client_name("with space"));
-        assert!(!is_valid_client_name("has:colon"));
-        assert!(!is_valid_client_name("has\nlf"));
-        assert!(!is_valid_client_name("has\rcr"));
-        assert!(!is_valid_client_name("över-äscii"));
+        assert!(!crate::transport::Identity::is_valid(""));
+        assert!(!crate::transport::Identity::is_valid("with space"));
+        assert!(!crate::transport::Identity::is_valid("has:colon"));
+        assert!(!crate::transport::Identity::is_valid("has\nlf"));
+        assert!(!crate::transport::Identity::is_valid("has\rcr"));
+        assert!(!crate::transport::Identity::is_valid("över-äscii"));
     }
 
     #[compio::test]

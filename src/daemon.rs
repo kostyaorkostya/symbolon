@@ -197,7 +197,7 @@ impl Service {
         shutdown: CancelToken,
     ) -> Result<Self, DaemonError> {
         let clients_file = crate::loader::load_clients_file(&cfg.clients.file).await?;
-        let clients_table = build_clients_table(clients_file)?;
+        let clients_table = HashMap::try_from(clients_file)?;
 
         // Pre-sandbox: load the PSK store. Tolerate ENOENT — a fresh
         // deployment starts with an empty roster and grows via `enroll`.
@@ -436,6 +436,20 @@ pub async fn run(cfg: &Config, config_path: &Path) -> Result<RunStats, DaemonErr
 }
 
 impl SharedState {
+    /// Look up the configured provider whose wire-protocol kind
+    /// matches `name` (e.g. `"github"` → `ProviderKind::Github`).
+    /// Used by the admin path to route `mint` / `selfcheck` requests
+    /// to the right provider instance. Wire-side dispatch (the
+    /// git-credential `host=` match) lives in `handle_connection`
+    /// and uses `provider.host()` instead.
+    pub fn lookup_provider(&self, name: &str) -> Option<&(dyn crate::providers::Provider + '_)> {
+        let kind: crate::providers::ProviderKind = name.parse().ok()?;
+        self.providers
+            .iter()
+            .find(|p| p.kind() == kind)
+            .map(|b| b.as_ref())
+    }
+
     /// Reload `clients.json` and atomically swap the in-memory
     /// table. Public so the SIGHUP handler installed by `main` can
     /// drive a reload through the state handle without importing
@@ -448,7 +462,7 @@ impl SharedState {
                 return;
             }
         };
-        let new_table = match build_clients_table(file) {
+        let new_table = match HashMap::try_from(file) {
             Ok(t) => t,
             Err(e) => {
                 warn!(evt = %EventKind::ConfigReload, triggered_by = "sighup", ok = false, error = %crate::logging::ErrorChain(&e));
@@ -650,21 +664,25 @@ impl Drop for AdminBindGuard {
     }
 }
 
-fn build_clients_table(file: ClientsFile) -> Result<HashMap<String, ResolvedClient>, DaemonError> {
-    let mut table = HashMap::new();
-    for entry in file.clients {
-        let key = entry.name.clone();
-        let value = ResolvedClient {
-            name: entry.name,
-            providers: entry.providers.into_iter().collect(),
-            enrolled_at: entry.enrolled_at,
-            note: entry.note,
-        };
-        if table.insert(key.clone(), value).is_some() {
-            return Err(DaemonError::DuplicateClientName(key));
+impl TryFrom<ClientsFile> for HashMap<String, ResolvedClient> {
+    type Error = DaemonError;
+
+    fn try_from(file: ClientsFile) -> Result<Self, Self::Error> {
+        let mut table = HashMap::new();
+        for entry in file.clients {
+            let key = entry.name.clone();
+            let value = ResolvedClient {
+                name: entry.name,
+                providers: entry.providers.into_iter().collect(),
+                enrolled_at: entry.enrolled_at,
+                note: entry.note,
+            };
+            if table.insert(key.clone(), value).is_some() {
+                return Err(DaemonError::DuplicateClientName(key));
+            }
         }
+        Ok(table)
     }
-    Ok(table)
 }
 
 async fn handle_connection(mut stream: TcpStream, req_id: String, state: Rc<SharedState>) {
@@ -1193,7 +1211,7 @@ mod tests {
             version: crate::config::CLIENTS_SCHEMA_VERSION,
             clients: vec![entry("vm-1", &["github"]), entry("vm-2", &["github"])],
         };
-        let table = build_clients_table(file).unwrap();
+        let table = HashMap::try_from(file).unwrap();
         assert_eq!(table.len(), 2);
         let v1 = table.get("vm-1").unwrap();
         assert_eq!(v1.name, "vm-1");
@@ -1206,7 +1224,7 @@ mod tests {
             version: crate::config::CLIENTS_SCHEMA_VERSION,
             clients: vec![entry("vm-1", &["github"]), entry("vm-1", &["github"])],
         };
-        let err = build_clients_table(file).unwrap_err();
+        let err = HashMap::try_from(file).unwrap_err();
         assert!(matches!(err, DaemonError::DuplicateClientName(n) if n == "vm-1"));
     }
 
@@ -1216,7 +1234,7 @@ mod tests {
             version: crate::config::CLIENTS_SCHEMA_VERSION,
             clients: vec![],
         };
-        assert_eq!(build_clients_table(file).unwrap().len(), 0);
+        assert_eq!(HashMap::try_from(file).unwrap().len(), 0);
     }
 
     // The previous `empty_state()` helper is gone; the one remaining

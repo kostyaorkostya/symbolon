@@ -105,6 +105,17 @@ impl<'a> Identity<'a> {
     pub fn as_str(&self) -> &'a str {
         self.0
     }
+
+    /// True iff `s` would parse as a valid identity body: non-empty,
+    /// at most [`MAX_IDENTITY_LEN`] bytes, all bytes in
+    /// `[A-Za-z0-9._-]`. Single source of truth for the validation
+    /// rule shared with the admin enroll path and `psk_store`.
+    pub fn is_valid(s: &str) -> bool {
+        let bytes = s.as_bytes();
+        !bytes.is_empty()
+            && bytes.len() <= MAX_IDENTITY_LEN
+            && bytes.iter().copied().all(is_identity_byte)
+    }
 }
 
 impl std::fmt::Display for Identity<'_> {
@@ -450,6 +461,7 @@ impl SessionError {
 // --- Responder -----------------------------------------------------------
 
 #[derive(strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 enum RState {
     /// Terminal failure state. `step` and friends return WrongState.
     Failed,
@@ -828,6 +840,7 @@ impl SessionError {
 // --- Initiator -----------------------------------------------------------
 
 #[derive(strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 enum IState {
     Failed,
     /// Emit the prelude bytes.

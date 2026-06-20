@@ -47,6 +47,7 @@ snow = { version = "0.10", default-features = false, features = [
   "use-getrandom",
   "std",
 ] }
+strum = { version = "0.28.0", features = ["derive"] }
 synchrony = { version = "0.1.8", features = ["async_flag", "event"] }
 thin-cell = "0.2.1"
 thiserror = "2.0.18"

@@ -22,6 +22,20 @@ pub enum ProviderKind {
     Github,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("unknown provider kind {0:?}")]
+pub struct UnknownProviderKind(pub String);
+
+impl TryFrom<&str> for ProviderKind {
+    type Error = UnknownProviderKind;
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        match s {
+            "github" => Ok(Self::Github),
+            other => Err(UnknownProviderKind(other.to_string())),
+        }
+    }
+}
+
 /// Abstract failure modes the daemon switches on. Generalizable
 /// variants come from observed behaviour across GitHub, GitLab,
 /// Gitea, Forgejo, Bitbucket. GitHub-private failures (PEM load,

@@ -9,9 +9,10 @@
 //! pipeline that filters on `evt`; treat it as a schema migration,
 //! not a refactor.
 
-use std::fmt;
+use strum::{Display, IntoStaticStr};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoStaticStr, Display)]
+#[strum(serialize_all = "snake_case")]
 pub enum EventKind {
     Accept,
     AdminDenied,
@@ -44,43 +45,11 @@ pub enum EventKind {
 }
 
 impl EventKind {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            EventKind::Accept => "accept",
-            EventKind::AdminDenied => "admin_denied",
-            EventKind::AdminPeercredFailed => "admin_peercred_failed",
-            EventKind::AdminRequest => "admin_request",
-            EventKind::CacheInvalidated => "cache_invalidated",
-            EventKind::ConfigReload => "config_reload",
-            EventKind::DrainIncomplete => "drain_incomplete",
-            EventKind::Enroll => "enroll",
-            EventKind::HandshakeFailed => "handshake_failed",
-            EventKind::Mint => "mint",
-            EventKind::MintDenied => "mint_denied",
-            EventKind::Mlock => "mlock",
-            EventKind::MlockRequiredFailed => "mlock_required_failed",
-            EventKind::PreludeInvalid => "prelude_invalid",
-            EventKind::Prepare => "prepare",
-            EventKind::ProviderCall => "provider_call",
-            EventKind::ProviderCallDone => "provider_call_done",
-            EventKind::ProviderError => "provider_error",
-            EventKind::Ready => "ready",
-            EventKind::ReadyPidfileWriteFailed => "ready_pidfile_write_failed",
-            EventKind::Revoke => "revoke",
-            EventKind::RunFailed => "run_failed",
-            EventKind::SandboxApplied => "sandbox_applied",
-            EventKind::SandboxPathSkipped => "sandbox_path_skipped",
-            EventKind::Selfcheck => "selfcheck",
-            EventKind::Shutdown => "shutdown",
-            EventKind::SignalRegistrationFailed => "signal_registration_failed",
-            EventKind::Startup => "startup",
-        }
-    }
-}
-
-impl fmt::Display for EventKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+    /// Static snake_case form. Derived via `strum::IntoStaticStr` —
+    /// adding a new variant automatically extends this without
+    /// requiring an edit to a hand-written match table.
+    pub fn as_str(self) -> &'static str {
+        self.into()
     }
 }
 

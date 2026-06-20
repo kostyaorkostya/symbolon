@@ -417,27 +417,39 @@ impl From<PreludeError> for SessionError {
     }
 }
 
-fn map_frame_oversize(e: TransportError) -> SessionError {
-    match e {
-        TransportError::OversizedFrame { got } => SessionError::FrameTooBig { got },
-        TransportError::BadPskLen { got } => SessionError::BadPskLen { got },
-        TransportError::Handshake(s) => SessionError::HandshakeRead(s),
-        TransportError::Transition(s) => SessionError::IntoTransport(s),
-        TransportError::Transport(s) => SessionError::TransportRead(s),
-        TransportError::Params(s) => SessionError::HandshakeRead(s),
+impl SessionError {
+    /// Default `TransportError` → `SessionError` lift used at
+    /// frame-length and handshake-construction sites. The
+    /// directional variants below override only the noise-IO arm
+    /// that they're called from; everything else falls through here.
+    fn from_frame_oversize(e: TransportError) -> Self {
+        match e {
+            TransportError::OversizedFrame { got } => Self::FrameTooBig { got },
+            TransportError::BadPskLen { got } => Self::BadPskLen { got },
+            TransportError::Handshake(s) => Self::HandshakeRead(s),
+            TransportError::Transition(s) => Self::IntoTransport(s),
+            TransportError::Transport(s) => Self::TransportRead(s),
+            TransportError::Params(s) => Self::HandshakeRead(s),
+        }
     }
 }
 
-fn expect_len(expected: usize, got: usize) -> Result<(), SessionError> {
-    if expected == got {
-        Ok(())
-    } else {
-        Err(SessionError::RecvLen { expected, got })
+impl SessionError {
+    /// Guard the state machine's `read_exact` returns: the driver
+    /// promised `expected` bytes but handed us `got`. Anything other
+    /// than equality is a driver bug, surfaced as `RecvLen`.
+    fn check_recv_len(expected: usize, got: usize) -> Result<(), Self> {
+        if expected == got {
+            Ok(())
+        } else {
+            Err(Self::RecvLen { expected, got })
+        }
     }
 }
 
 // --- Responder -----------------------------------------------------------
 
+#[derive(strum::IntoStaticStr)]
 enum RState {
     /// Terminal failure state. `step` and friends return WrongState.
     Failed,
@@ -502,24 +514,7 @@ enum RState {
 
 impl RState {
     fn name(&self) -> &'static str {
-        match self {
-            RState::Failed => "Failed",
-            RState::WantPreludeHead => "WantPreludeHead",
-            RState::WantPreludeBody { .. } => "WantPreludeBody",
-            RState::NeedPsk { .. } => "NeedPsk",
-            RState::AwaitingPsk => "AwaitingPsk",
-            RState::WantHsLen { .. } => "WantHsLen",
-            RState::WantHsBody { .. } => "WantHsBody",
-            RState::WriteHs { .. } => "WriteHs",
-            RState::WroteHsPending { .. } => "WroteHsPending",
-            RState::WantReqLen { .. } => "WantReqLen",
-            RState::WantReqBody { .. } => "WantReqBody",
-            RState::HaveRequest { .. } => "HaveRequest",
-            RState::AwaitingResponse { .. } => "AwaitingResponse",
-            RState::WriteResp { .. } => "WriteResp",
-            RState::WroteRespPending => "WroteRespPending",
-            RState::Done => "Done",
-        }
+        self.into()
     }
 
     fn phase(&self) -> Phase {
@@ -666,7 +661,7 @@ impl Responder {
         let state_name = self.state.name();
         match std::mem::replace(&mut self.state, RState::Failed) {
             RState::WantPreludeHead => {
-                expect_len(6, bytes.len())?;
+                SessionError::check_recv_len(6, bytes.len())?;
                 let head: [u8; 6] = bytes.try_into().expect("len 6");
                 // Validate magic+version+id_len BEFORE asking for the
                 // body. A hostile peer can't make us pull `id_len` more
@@ -677,39 +672,42 @@ impl Responder {
             }
             RState::WantPreludeBody { head } => {
                 let id_len = head[5] as usize;
-                expect_len(id_len, bytes.len())?;
+                SessionError::check_recv_len(id_len, bytes.len())?;
                 let identity = parse_prelude_body(bytes)?.as_str().to_string();
                 self.state = RState::NeedPsk { identity };
                 Ok(())
             }
             RState::WantHsLen { hs } => {
-                expect_len(2, bytes.len())?;
+                SessionError::check_recv_len(2, bytes.len())?;
                 let len_buf: [u8; 2] = bytes.try_into().expect("len 2");
-                let body_len = read_frame_length(&len_buf).map_err(map_frame_oversize)?;
+                let body_len =
+                    read_frame_length(&len_buf).map_err(SessionError::from_frame_oversize)?;
                 self.state = RState::WantHsBody { hs, body_len };
                 Ok(())
             }
             RState::WantHsBody { mut hs, body_len } => {
-                expect_len(body_len, bytes.len())?;
-                handshake_read(&mut hs, bytes, &mut self.scratch[..]).map_err(map_hs_read)?;
+                SessionError::check_recv_len(body_len, bytes.len())?;
+                handshake_read(&mut hs, bytes, &mut self.scratch[..])
+                    .map_err(SessionError::from_hs_read)?;
                 // Produce handshake msg 2 immediately so the driver can emit it.
-                let n =
-                    handshake_write(&mut hs, &[], &mut self.scratch[..]).map_err(map_hs_write)?;
-                let out = frame(&self.scratch[..n]).map_err(map_frame_oversize)?;
+                let n = handshake_write(&mut hs, &[], &mut self.scratch[..])
+                    .map_err(SessionError::from_hs_write)?;
+                let out = frame(&self.scratch[..n]).map_err(SessionError::from_frame_oversize)?;
                 self.state = RState::WriteHs { hs, out };
                 Ok(())
             }
             RState::WantReqLen { ts } => {
-                expect_len(2, bytes.len())?;
+                SessionError::check_recv_len(2, bytes.len())?;
                 let len_buf: [u8; 2] = bytes.try_into().expect("len 2");
-                let body_len = read_frame_length(&len_buf).map_err(map_frame_oversize)?;
+                let body_len =
+                    read_frame_length(&len_buf).map_err(SessionError::from_frame_oversize)?;
                 self.state = RState::WantReqBody { ts, body_len };
                 Ok(())
             }
             RState::WantReqBody { mut ts, body_len } => {
-                expect_len(body_len, bytes.len())?;
-                let n =
-                    transport_read(&mut ts, bytes, &mut self.scratch[..]).map_err(map_tx_read)?;
+                SessionError::check_recv_len(body_len, bytes.len())?;
+                let n = transport_read(&mut ts, bytes, &mut self.scratch[..])
+                    .map_err(SessionError::from_tx_read)?;
                 self.state = RState::HaveRequest {
                     ts,
                     plaintext: self.scratch[..n].to_vec(),
@@ -731,7 +729,7 @@ impl Responder {
         let state_name = self.state.name();
         match std::mem::replace(&mut self.state, RState::Failed) {
             RState::AwaitingPsk => {
-                let hs = responder(&psk).map_err(map_frame_oversize)?;
+                let hs = responder(&psk).map_err(SessionError::from_frame_oversize)?;
                 self.state = RState::WantHsLen { hs };
                 Ok(())
             }
@@ -752,7 +750,7 @@ impl Responder {
         match std::mem::replace(&mut self.state, RState::Failed) {
             RState::WroteHsPending { hs } => {
                 // Handshake msg 2 is on the wire; transition to transport mode.
-                let ts = into_transport(hs).map_err(map_frame_oversize)?;
+                let ts = into_transport(hs).map_err(SessionError::from_frame_oversize)?;
                 self.state = RState::WantReqLen { ts };
                 Ok(())
             }
@@ -776,8 +774,8 @@ impl Responder {
         match std::mem::replace(&mut self.state, RState::Failed) {
             RState::AwaitingResponse { mut ts } => {
                 let n = transport_write(&mut ts, plaintext, &mut self.scratch[..])
-                    .map_err(map_tx_write)?;
-                let out = frame(&self.scratch[..n]).map_err(map_frame_oversize)?;
+                    .map_err(SessionError::from_tx_write)?;
+                let out = frame(&self.scratch[..n]).map_err(SessionError::from_frame_oversize)?;
                 self.state = RState::WriteResp { out };
                 Ok(())
             }
@@ -792,36 +790,48 @@ impl Responder {
     }
 }
 
-fn map_hs_read(e: TransportError) -> SessionError {
-    match e {
-        TransportError::Handshake(s) => SessionError::HandshakeRead(s),
-        other => map_frame_oversize(other),
+impl SessionError {
+    /// Handshake-READ site: the `Handshake(s)` arm becomes
+    /// `HandshakeRead(s)`; other variants fall through to
+    /// `from_frame_oversize`.
+    fn from_hs_read(e: TransportError) -> Self {
+        match e {
+            TransportError::Handshake(s) => Self::HandshakeRead(s),
+            other => Self::from_frame_oversize(other),
+        }
     }
-}
 
-fn map_hs_write(e: TransportError) -> SessionError {
-    match e {
-        TransportError::Handshake(s) => SessionError::HandshakeWrite(s),
-        other => map_frame_oversize(other),
+    /// Handshake-WRITE site: `Handshake(s)` is the call's own
+    /// failure, so it carries the write-direction tag.
+    fn from_hs_write(e: TransportError) -> Self {
+        match e {
+            TransportError::Handshake(s) => Self::HandshakeWrite(s),
+            other => Self::from_frame_oversize(other),
+        }
     }
-}
 
-fn map_tx_read(e: TransportError) -> SessionError {
-    match e {
-        TransportError::Transport(s) => SessionError::TransportRead(s),
-        other => map_frame_oversize(other),
+    /// Transport-READ site (post-handshake): the `Transport(s)`
+    /// arm tags decrypt failures with their direction.
+    fn from_tx_read(e: TransportError) -> Self {
+        match e {
+            TransportError::Transport(s) => Self::TransportRead(s),
+            other => Self::from_frame_oversize(other),
+        }
     }
-}
 
-fn map_tx_write(e: TransportError) -> SessionError {
-    match e {
-        TransportError::Transport(s) => SessionError::TransportWrite(s),
-        other => map_frame_oversize(other),
+    /// Transport-WRITE site (post-handshake): encrypt-direction
+    /// `Transport(s)` failures.
+    fn from_tx_write(e: TransportError) -> Self {
+        match e {
+            TransportError::Transport(s) => Self::TransportWrite(s),
+            other => Self::from_frame_oversize(other),
+        }
     }
 }
 
 // --- Initiator -----------------------------------------------------------
 
+#[derive(strum::IntoStaticStr)]
 enum IState {
     Failed,
     /// Emit the prelude bytes.
@@ -885,21 +895,7 @@ enum IState {
 
 impl IState {
     fn name(&self) -> &'static str {
-        match self {
-            IState::Failed => "Failed",
-            IState::WritePrelude { .. } => "WritePrelude",
-            IState::WrotePreludePending { .. } => "WrotePreludePending",
-            IState::WriteHs1 { .. } => "WriteHs1",
-            IState::WroteHs1Pending { .. } => "WroteHs1Pending",
-            IState::WantHs2Len { .. } => "WantHs2Len",
-            IState::WantHs2Body { .. } => "WantHs2Body",
-            IState::WriteReq { .. } => "WriteReq",
-            IState::WroteReqPending { .. } => "WroteReqPending",
-            IState::WantRespLen { .. } => "WantRespLen",
-            IState::WantRespBody { .. } => "WantRespBody",
-            IState::Done { .. } => "Done",
-            IState::Drained => "Drained",
-        }
+        self.into()
     }
 
     fn phase(&self) -> Phase {
@@ -934,7 +930,7 @@ pub struct Initiator {
 impl Initiator {
     pub fn new(identity: &str, psk: [u8; 32], request: Vec<u8>) -> Result<Self, SessionError> {
         let prelude = encode_prelude(identity)?;
-        let hs = initiator(&psk).map_err(map_frame_oversize)?;
+        let hs = initiator(&psk).map_err(SessionError::from_frame_oversize)?;
         Ok(Self {
             state: IState::WritePrelude {
                 hs,
@@ -1010,9 +1006,10 @@ impl Initiator {
         let state_name = self.state.name();
         match std::mem::replace(&mut self.state, IState::Failed) {
             IState::WantHs2Len { hs, request } => {
-                expect_len(2, bytes.len())?;
+                SessionError::check_recv_len(2, bytes.len())?;
                 let len_buf: [u8; 2] = bytes.try_into().expect("len 2");
-                let body_len = read_frame_length(&len_buf).map_err(map_frame_oversize)?;
+                let body_len =
+                    read_frame_length(&len_buf).map_err(SessionError::from_frame_oversize)?;
                 self.state = IState::WantHs2Body {
                     hs,
                     body_len,
@@ -1025,27 +1022,29 @@ impl Initiator {
                 body_len,
                 request,
             } => {
-                expect_len(body_len, bytes.len())?;
-                handshake_read(&mut hs, bytes, &mut self.scratch[..]).map_err(map_hs_read)?;
-                let mut ts = into_transport(hs).map_err(map_frame_oversize)?;
+                SessionError::check_recv_len(body_len, bytes.len())?;
+                handshake_read(&mut hs, bytes, &mut self.scratch[..])
+                    .map_err(SessionError::from_hs_read)?;
+                let mut ts = into_transport(hs).map_err(SessionError::from_frame_oversize)?;
                 // Encrypt + frame the request now that we're in transport mode.
                 let n = transport_write(&mut ts, &request, &mut self.scratch[..])
-                    .map_err(map_tx_write)?;
-                let out = frame(&self.scratch[..n]).map_err(map_frame_oversize)?;
+                    .map_err(SessionError::from_tx_write)?;
+                let out = frame(&self.scratch[..n]).map_err(SessionError::from_frame_oversize)?;
                 self.state = IState::WriteReq { ts, out };
                 Ok(())
             }
             IState::WantRespLen { ts } => {
-                expect_len(2, bytes.len())?;
+                SessionError::check_recv_len(2, bytes.len())?;
                 let len_buf: [u8; 2] = bytes.try_into().expect("len 2");
-                let body_len = read_frame_length(&len_buf).map_err(map_frame_oversize)?;
+                let body_len =
+                    read_frame_length(&len_buf).map_err(SessionError::from_frame_oversize)?;
                 self.state = IState::WantRespBody { ts, body_len };
                 Ok(())
             }
             IState::WantRespBody { mut ts, body_len } => {
-                expect_len(body_len, bytes.len())?;
-                let n =
-                    transport_read(&mut ts, bytes, &mut self.scratch[..]).map_err(map_tx_read)?;
+                SessionError::check_recv_len(body_len, bytes.len())?;
+                let n = transport_read(&mut ts, bytes, &mut self.scratch[..])
+                    .map_err(SessionError::from_tx_read)?;
                 self.state = IState::Done {
                     plaintext: self.scratch[..n].to_vec(),
                 };
@@ -1066,9 +1065,9 @@ impl Initiator {
         match std::mem::replace(&mut self.state, IState::Failed) {
             IState::WrotePreludePending { mut hs, request } => {
                 // Compute handshake msg 1 now that the prelude is on the wire.
-                let n =
-                    handshake_write(&mut hs, &[], &mut self.scratch[..]).map_err(map_hs_write)?;
-                let msg1 = frame(&self.scratch[..n]).map_err(map_frame_oversize)?;
+                let n = handshake_write(&mut hs, &[], &mut self.scratch[..])
+                    .map_err(SessionError::from_hs_write)?;
+                let msg1 = frame(&self.scratch[..n]).map_err(SessionError::from_frame_oversize)?;
                 self.state = IState::WriteHs1 { hs, msg1, request };
                 Ok(())
             }

@@ -735,13 +735,7 @@ fn error_response(code: &str, msg: &str) -> serde_json::Value {
 }
 
 fn lookup_provider<'a>(state: &'a SharedState, provider: &str) -> Option<&'a (dyn Provider + 'a)> {
-    // The admin wire protocol carries the provider *type*
-    // (`PROVIDER_GITHUB` etc.). Translate to a `ProviderKind`, then
-    // pick the configured instance.
-    let kind = match provider {
-        PROVIDER_GITHUB => ProviderKind::Github,
-        _ => return None,
-    };
+    let kind = ProviderKind::try_from(provider).ok()?;
     state
         .providers
         .iter()

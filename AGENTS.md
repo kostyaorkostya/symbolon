@@ -278,6 +278,22 @@ Pinned in `Cargo.toml`:
   blake3 / p256 / pqcrypto since our pattern uses only
   ChaCha20-Poly1305 + BLAKE2s + X25519.)
 - `serde`, `serde_json`, `toml` (config + provider responses)
+- `strum` with `features = ["derive"]` (proc-macro derives that
+  generate `Into<&'static str>` and `Display` from enum variant
+  names, eliminating hand-written variant→string match tables on
+  `EventKind` in `src/events.rs` and on the `RState` / `IState`
+  state machines in `src/transport.rs`. The PROTOCOLS.md logging
+  schema names every `evt` exactly once in the wire vocabulary,
+  and the snake-case rendering (`#[strum(serialize_all =
+  "snake_case")]`) keeps the enum variant `EventKind::MintDenied`
+  in lockstep with the wire string `"mint_denied"` — adding a
+  new variant cannot drift away from the schema by accident.
+  The state-machine `name()` methods use the PascalCase form
+  (`WantHsBody` etc.) for `WrongState` error context only; no
+  external consumer depends on them. Pure compile-time;
+  `syn`/`quote`/`proc-macro2` are already in the build graph via
+  serde-derive and thiserror, so the marginal cost is one small
+  proc-macro crate.)
 - `time` with `default-features = false, features = ["parsing",
   "formatting"]` (RFC3339 → `SystemTime` for GitHub's `expires_at`,
   RFC2822 for the HTTP `Date` header in selfcheck, and RFC3339

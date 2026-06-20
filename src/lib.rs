@@ -40,6 +40,7 @@ pub(crate) mod psk_store;
 pub(crate) mod ready;
 pub(crate) mod sandbox;
 pub(crate) mod signals;
+pub(crate) mod singleflight_cache;
 #[doc(hidden)]
 pub mod transport;
 

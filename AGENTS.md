@@ -483,9 +483,10 @@ src/
   logging.rs           # tracing-subscriber JSON setup (stdout/stderr split)
   mlock.rs             # mlockall(MCL_CURRENT|MCL_FUTURE) wrapper
   sandbox.rs           # landlock (FS + TCP + UDS scope + signal scope)
+  singleflight_cache.rs# generic TTL cache + singleflight coordinator
   providers/
     mod.rs             # `Provider` trait + abstract `ProviderError` / outcomes
-    github.rs          # GitHub: JWT, repo-ID singleflight cache, mint
+    github.rs          # GitHub: JWT, repo-ID resolution + mint
     jwt_rs256.rs       # minimal RS256 JWS signer (rsa + sha2)
 tests/
   admin.rs             # admin UDS protocol against a spawned daemon

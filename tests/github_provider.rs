@@ -9,7 +9,7 @@ mod common;
 use std::time::UNIX_EPOCH;
 
 use serde_json::json;
-use symbolon::{GithubError, RepoId, ReqId};
+use symbolon::{GithubError, ReqId};
 use wiremock::matchers::{body_bytes, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -33,7 +33,9 @@ async fn mint_happy_path() {
 
     assert_eq!(outcome.response.username, "x-access-token");
     assert_eq!(outcome.response.password, TOKEN);
-    assert_eq!(outcome.repo_id, RepoId::from(REPO_ID));
+    // The wiremock matcher on `body_bytes(canonical_mint_body())`
+    // already proves the narrow mint POST carried REPO_ID; no need
+    // to re-assert it on the outcome.
     let secs = outcome
         .response
         .password_expiry_utc

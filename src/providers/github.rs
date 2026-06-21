@@ -246,7 +246,6 @@ pub struct SelfcheckData {
 #[derive(Debug, Clone)]
 pub struct MintData {
     pub response: git_credential::Response,
-    pub repo_id: RepoId,
     /// ULID of the outbound `mint_token` HTTPS call. Pairs with
     /// the `provider_call` / `provider_call_done` breadcrumbs.
     pub out_req_id: OutReqId,
@@ -726,14 +725,8 @@ impl GitHubProvider {
         repo: &str,
     ) -> ProviderCall<RepoId> {
         // `owner` / `repo` already came through `RepoPath::parse`, so
-        // construct one to reuse its URL-safe rendering.
-        let parsed = RepoPath { owner, repo };
-        let url = format!(
-            "{}/repos/{}/{}",
-            self.api_base,
-            parsed.owner_url(),
-            parsed.repo_url(),
-        );
+        // they're guaranteed `[A-Za-z0-9._-]+` and need no URL-escaping.
+        let url = format!("{}/repos/{owner}/{repo}", self.api_base);
         let call = self
             .http_call(
                 Method::Get,
@@ -839,7 +832,6 @@ impl GitHubProvider {
                         password: token,
                         password_expiry_utc: expires_at,
                     },
-                    repo_id,
                     out_req_id,
                     provider_req_id: m.provider_req_id.cloned(),
                 })
@@ -1067,9 +1059,8 @@ impl GitHubProvider {
 // ============================================================================
 
 /// `owner/repo` reference borrowed from a git-credential request,
-/// validated against [`Self::is_valid_byte`] so the URL builder
-/// doesn't have to re-validate. Construct via [`Self::parse`];
-/// reach the URL-safe form via [`Self::owner_url`] / [`Self::repo_url`].
+/// validated against the GitHub-allowed charset by [`Self::parse`]
+/// so downstream URL builders can paste it raw without escaping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RepoPath<'a> {
     owner: &'a str,
@@ -1077,22 +1068,20 @@ struct RepoPath<'a> {
 }
 
 impl<'a> RepoPath<'a> {
-    /// A byte is valid in a GitHub owner/repo name iff it is an
-    /// ASCII alphanumeric or one of `.`, `_`, `-`.
-    fn is_valid_byte(b: u8) -> bool {
-        b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')
-    }
-
-    /// Split `owner/repo` and validate both halves. Zero-alloc on
+    /// Split `owner/repo` and validate both halves against the
+    /// GitHub-allowed charset (`[A-Za-z0-9._-]+`). Zero-alloc on
     /// the success path.
     fn parse(path: &'a str) -> Result<Self, GithubError> {
+        fn is_valid_byte(b: u8) -> bool {
+            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')
+        }
         let (owner, repo) = path
             .split_once('/')
             .ok_or_else(|| GithubError::MalformedPath(path.to_string()))?;
         if owner.is_empty()
             || repo.is_empty()
-            || !owner.bytes().all(Self::is_valid_byte)
-            || !repo.bytes().all(Self::is_valid_byte)
+            || !owner.bytes().all(is_valid_byte)
+            || !repo.bytes().all(is_valid_byte)
         {
             return Err(GithubError::MalformedPath(path.to_string()));
         }
@@ -1105,37 +1094,6 @@ impl<'a> RepoPath<'a> {
 
     fn repo(&self) -> &'a str {
         self.repo
-    }
-
-    /// URL-safe rendering of `owner`. Borrowed on the validated
-    /// fast path; encoded copy otherwise. Defence-in-depth — every
-    /// `RepoPath` came through [`Self::parse`], which only admits
-    /// the allowed charset, so the encoded branch is unreachable
-    /// under normal operation. If a future regression slips a
-    /// non-allowed byte past `parse`, the URL builder percent-
-    /// encodes instead of pasting it raw.
-    fn owner_url(&self) -> std::borrow::Cow<'a, str> {
-        Self::encode_segment(self.owner)
-    }
-
-    fn repo_url(&self) -> std::borrow::Cow<'a, str> {
-        Self::encode_segment(self.repo)
-    }
-
-    fn encode_segment(s: &str) -> std::borrow::Cow<'_, str> {
-        if s.bytes().all(Self::is_valid_byte) {
-            return std::borrow::Cow::Borrowed(s);
-        }
-        use std::fmt::Write;
-        let mut out = String::with_capacity(s.len());
-        for b in s.bytes() {
-            if Self::is_valid_byte(b) {
-                out.push(b as char);
-            } else {
-                let _ = write!(out, "%{b:02X}");
-            }
-        }
-        std::borrow::Cow::Owned(out)
     }
 }
 

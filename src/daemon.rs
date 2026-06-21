@@ -1085,25 +1085,17 @@ fn log_mint_error(
                 provider_ms = provider_ms,
             );
         }
-        ProviderError::Unauthorized { body } => {
+        ProviderError::Unauthorized { body } | ProviderError::Forbidden { body } => {
+            let status = if matches!(&err, ProviderError::Unauthorized { .. }) {
+                401
+            } else {
+                403
+            };
             warn!(
                 req_id = %req_id,
                 evt = %EventKind::MintDenied,
                 reason = "provider_4xx",
-                provider_status = 401,
-                provider = %host,
-                client = %client_name,
-                repo = %path,
-                provider_ms = provider_ms,
-                error = %body,
-            );
-        }
-        ProviderError::Forbidden { body } => {
-            warn!(
-                req_id = %req_id,
-                evt = %EventKind::MintDenied,
-                reason = "provider_4xx",
-                provider_status = 403,
+                provider_status = status,
                 provider = %host,
                 client = %client_name,
                 repo = %path,

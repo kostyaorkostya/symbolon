@@ -33,6 +33,7 @@ use crate::daemon::{ResolvedClient, SharedState};
 use crate::events::EventKind;
 use crate::ids::ReqId;
 use crate::providers::ProviderError;
+use crate::psk_store::Psk;
 
 const CLIENTS_FILE_MODE: u32 = 0o640;
 const PSK_FILE_MODE: u32 = 0o600;
@@ -231,10 +232,8 @@ async fn dispatch(
             provider,
             client,
             note,
-        } => handle_enroll(req_id, state, provider, client, note.clone()).await,
-        Request::Revoke { provider, client } => {
-            handle_revoke(req_id, state, provider, client).await
-        }
+        } => handle_enroll(state, provider, client, note.clone()).await,
+        Request::Revoke { provider, client } => handle_revoke(state, provider, client).await,
         Request::Mint {
             provider,
             client,
@@ -285,49 +284,46 @@ fn handle_list(state: &SharedState) -> serde_json::Value {
 /// in-memory store BEFORE we attempt the on-disk writes; on any
 /// failure between then and `commit()`, Drop rolls the in-memory
 /// insert back so memory and disk stay coherent. Same pattern as
-/// `InFlightGuard` in `providers::github` — default Drop is the
-/// rollback path; `commit(self)` consumes the guard to disarm it.
+/// `InFlightGuard` in `singleflight_cache` — default Drop is the
+/// rollback path; `commit(self)` consumes the guard to transition
+/// to the no-op state read by the shared Drop.
 struct EnrollRollback<'a> {
     state: &'a SharedState,
-    client: String,
-    armed: bool,
+    /// `Some(client)` arms the rollback; `None` means commit was
+    /// called and Drop is a no-op. Carrying the client inside the
+    /// Option means there's no second boolean to keep in sync.
+    client: Option<String>,
 }
 
 impl<'a> EnrollRollback<'a> {
     fn new(state: &'a SharedState, client: &str) -> Self {
         Self {
             state,
-            client: client.to_string(),
-            armed: true,
+            client: Some(client.to_string()),
         }
     }
 
     fn commit(mut self) {
-        self.armed = false;
+        self.client = None;
     }
 }
 
 impl Drop for EnrollRollback<'_> {
     fn drop(&mut self) {
-        if self.armed {
-            self.state.psks.borrow_mut().remove(&self.client);
+        if let Some(client) = self.client.take() {
+            self.state.psks.borrow_mut().remove(&client);
         }
     }
 }
 
 async fn handle_enroll(
-    req_id: &ReqId,
     state: &SharedState,
     provider: &str,
     client: &str,
     note: Option<String>,
 ) -> Result<serde_json::Value, serde_json::Value> {
-    let _ = req_id; // logged at handle_admin entry; not threaded further today
-    if provider != PROVIDER_GITHUB {
-        return Err(error_response(
-            "unknown_provider",
-            &format!("provider '{provider}' not configured"),
-        ));
+    if state.lookup_provider(provider).is_none() {
+        return Err(unknown_provider_error(provider));
     }
     if !crate::transport::Identity::is_valid(client) {
         return Err(error_response(
@@ -369,7 +365,7 @@ async fn handle_enroll(
     state
         .psks
         .borrow_mut()
-        .insert(client.to_string(), key_bytes);
+        .insert(client.to_string(), Psk::from(key_bytes));
     let rollback = EnrollRollback::new(state, client);
     let psk_content = state.psks.borrow().render();
     atomic_write(
@@ -419,17 +415,12 @@ async fn handle_enroll(
 }
 
 async fn handle_revoke(
-    req_id: &ReqId,
     state: &SharedState,
     provider: &str,
     client: &str,
 ) -> Result<serde_json::Value, serde_json::Value> {
-    let _ = req_id; // logged at handle_admin entry; not threaded further today
-    if provider != PROVIDER_GITHUB {
-        return Err(error_response(
-            "unknown_provider",
-            &format!("provider '{provider}' not configured"),
-        ));
+    if state.lookup_provider(provider).is_none() {
+        return Err(unknown_provider_error(provider));
     }
 
     // Identity must be enrolled. Both the in-memory PSK store and the
@@ -479,12 +470,9 @@ async fn handle_mint(
     client: &str,
     path: &str,
 ) -> Result<serde_json::Value, serde_json::Value> {
-    let provider_obj = state.lookup_provider(provider).ok_or_else(|| {
-        error_response(
-            "unknown_provider",
-            &format!("provider '{provider}' not configured"),
-        )
-    })?;
+    let provider_obj = state
+        .lookup_provider(provider)
+        .ok_or_else(|| unknown_provider_error(provider))?;
     if !state.clients.borrow().contains_key(client) {
         return Err(error_response(
             "unknown_client",
@@ -517,12 +505,9 @@ async fn handle_selfcheck(
     state: &Rc<SharedState>,
     provider: &str,
 ) -> Result<serde_json::Value, serde_json::Value> {
-    let provider_obj = state.lookup_provider(provider).ok_or_else(|| {
-        error_response(
-            "unknown_provider",
-            &format!("provider '{provider}' not configured"),
-        )
-    })?;
+    let provider_obj = state
+        .lookup_provider(provider)
+        .ok_or_else(|| unknown_provider_error(provider))?;
     match provider_obj.selfcheck(req_id).await {
         Ok(outcome) => Ok(serde_json::json!({
             "ok": true,
@@ -602,31 +587,33 @@ pub async fn cli_dispatch(socket_path: &Path, command: CliCommand) -> Result<i32
     Ok(0)
 }
 
+fn s<'a>(v: &'a serde_json::Value, k: &str) -> &'a str {
+    v.get(k).and_then(|x| x.as_str()).unwrap_or("?")
+}
+
+fn u(v: &serde_json::Value, k: &str) -> u64 {
+    v.get(k).and_then(|x| x.as_u64()).unwrap_or(0)
+}
+
+fn arr_join(v: &serde_json::Value, k: &str, sep: &str) -> String {
+    v.get(k)
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str())
+                .collect::<Vec<_>>()
+                .join(sep)
+        })
+        .unwrap_or_default()
+}
+
 impl CliCommand {
     fn print_success(&self, response: &serde_json::Value) {
         match self {
             CliCommand::Status => {
-                let uptime_sec = response
-                    .get("uptime_sec")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let providers = response
-                    .get("providers")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    })
-                    .unwrap_or_default();
-                let client_count = response
-                    .get("client_count")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                println!("Uptime: {uptime_sec}s");
-                println!("Providers: {providers}");
-                println!("Clients: {client_count}");
+                println!("Uptime: {}s", u(response, "uptime_sec"));
+                println!("Providers: {}", arr_join(response, "providers", ", "));
+                println!("Clients: {}", u(response, "client_count"));
             }
             CliCommand::List => {
                 let empty = vec![];
@@ -639,26 +626,16 @@ impl CliCommand {
                     return;
                 }
                 for c in entries {
-                    let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                    let provs = c
-                        .get("providers")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str())
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        })
-                        .unwrap_or_default();
-                    let enrolled = c.get("enrolled_at").and_then(|v| v.as_str()).unwrap_or("?");
-                    println!("{name}\t{provs}\t{enrolled}");
+                    println!(
+                        "{}\t{}\t{}",
+                        s(c, "name"),
+                        arr_join(c, "providers", ","),
+                        s(c, "enrolled_at")
+                    );
                 }
             }
             CliCommand::GithubEnroll { client, .. } => {
-                let psk_hex = response
-                    .get("psk_hex")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let psk_hex = s(response, "psk_hex");
                 println!("Enrolled '{client}' for github.com.");
                 println!();
                 println!("# On the client VM, install the helper binary alongside git:");
@@ -680,41 +657,25 @@ impl CliCommand {
                 println!("Revoked '{client}' from github.com.");
             }
             CliCommand::GithubMint { .. } => {
-                let username = response
-                    .get("username")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let password = response
-                    .get("password")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let exp = response
-                    .get("expires_at_unix")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                println!("username={username}");
-                println!("password={password}");
-                println!("expires_at_unix={exp}");
+                println!("username={}", s(response, "username"));
+                println!("password={}", s(response, "password"));
+                println!("expires_at_unix={}", u(response, "expires_at_unix"));
             }
             CliCommand::GithubSelfcheck => {
                 // Provider-specific fields nest under `details` per
                 // PROVIDER_CONTRACT.md § A3 — only the abstract fields
                 // (`clock_skew_sec`, `provider_req_id`, `out_req_id`)
                 // live at the top level.
-                let details = response.get("details");
-                let client_id = details
-                    .and_then(|d| d.get("client_id"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?");
-                let api = details
-                    .and_then(|d| d.get("api_base"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?");
+                let details = response.get("details").unwrap_or(&serde_json::Value::Null);
                 let skew = response
                     .get("clock_skew_sec")
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0);
-                println!("OK: App {client_id} reachable at {api}, clock skew {skew}s");
+                println!(
+                    "OK: App {} reachable at {}, clock skew {skew}s",
+                    s(details, "client_id"),
+                    s(details, "api_base"),
+                );
             }
         }
     }
@@ -726,6 +687,13 @@ impl CliCommand {
 
 fn error_response(code: &str, msg: &str) -> serde_json::Value {
     serde_json::json!({ "ok": false, "code": code, "error": msg })
+}
+
+fn unknown_provider_error(provider: &str) -> serde_json::Value {
+    error_response(
+        "unknown_provider",
+        &format!("provider '{provider}' not configured"),
+    )
 }
 
 async fn generate_psk_key() -> std::io::Result<[u8; 32]> {
@@ -853,17 +821,8 @@ fn check_peer_uid(stream: &UnixStream, my_uid: u32) -> bool {
     }
 }
 
-// Per-iteration `Vec` allocation. For the admin protocol's tiny
-// JSON requests this is invisible; iggy's `BytesMut::with_capacity`
-// + `.clear()` (or compio's `BufferPool` + `AsyncReadManaged`) is
-// the reuse pattern if it ever matters.
 async fn read_line(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
     let mut accumulated = Vec::new();
-    // Single 1 KiB chunk buffer reused across reads via clear-and-
-    // reclaim (iggy pattern at
-    // iggy/core/server/src/tcp/connection_handler.rs:49-81).
-    // compio takes the Vec by value and returns it; we reuse the
-    // allocation on the next iteration.
     let mut chunk: Vec<u8> = Vec::with_capacity(1024);
     loop {
         if let Some(pos) = accumulated.iter().position(|&b| b == b'\n') {

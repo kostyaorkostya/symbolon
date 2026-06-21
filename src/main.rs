@@ -39,7 +39,21 @@ async fn main() -> ExitCode {
         Subcommand::Daemon(_) => run_daemon(config_path).await,
         Subcommand::Status(_) => run_cli(config_path, CliCommand::Status).await,
         Subcommand::List(_) => run_cli(config_path, CliCommand::List).await,
-        Subcommand::Github(g) => run_cli(config_path, github_to_cli(g)).await,
+        Subcommand::Github(g) => {
+            let cmd = match g.cmd {
+                GithubSub::Enroll(a) => CliCommand::GithubEnroll {
+                    client: a.client,
+                    note: a.note,
+                },
+                GithubSub::Revoke(a) => CliCommand::GithubRevoke { client: a.client },
+                GithubSub::Mint(a) => CliCommand::GithubMint {
+                    client: a.client,
+                    path: a.repo,
+                },
+                GithubSub::Selfcheck(_) => CliCommand::GithubSelfcheck,
+            };
+            run_cli(config_path, cmd).await
+        }
     }
 }
 
@@ -233,18 +247,3 @@ struct MintArgs {
 #[derive(FromArgs)]
 #[argh(subcommand, name = "selfcheck")]
 struct SelfcheckArgs {}
-
-fn github_to_cli(g: GithubArgs) -> CliCommand {
-    match g.cmd {
-        GithubSub::Enroll(a) => CliCommand::GithubEnroll {
-            client: a.client,
-            note: a.note,
-        },
-        GithubSub::Revoke(a) => CliCommand::GithubRevoke { client: a.client },
-        GithubSub::Mint(a) => CliCommand::GithubMint {
-            client: a.client,
-            path: a.repo,
-        },
-        GithubSub::Selfcheck(_) => CliCommand::GithubSelfcheck,
-    }
-}

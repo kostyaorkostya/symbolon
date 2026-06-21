@@ -3,7 +3,10 @@
 //! Lives under `tests/common/mod.rs` (NOT `tests/common.rs`) so
 //! Cargo does not compile it as its own test binary.
 
-#![allow(dead_code)] // each test file uses a subset of these helpers
+// Each test binary compiles this whole file as a sibling crate and
+// only uses a subset; `dead_code` suppresses the unused-helper noise
+// per-test-binary, not in this file's own context.
+#![allow(dead_code)]
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -44,14 +47,16 @@ pub fn unique_id() -> u64 {
 
 /// File paths for one test daemon instance. All under the system temp dir,
 /// unique per process+counter so parallel test workers don't collide.
+/// `Drop` removes all three on scope exit, so a panicking test doesn't
+/// leak temp files.
 pub struct TempPaths {
     pub admin: PathBuf,
     pub clients: PathBuf,
     pub psks: PathBuf,
 }
 
-impl TempPaths {
-    pub fn cleanup(&self) {
+impl Drop for TempPaths {
+    fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.admin);
         let _ = std::fs::remove_file(&self.clients);
         let _ = std::fs::remove_file(&self.psks);
@@ -67,13 +72,6 @@ pub fn unique_paths_full() -> TempPaths {
         clients: t.join(format!("symbolon-test-{pid}-{id}-clients.json")),
         psks: t.join(format!("symbolon-test-{pid}-{id}-psks")),
     }
-}
-
-/// Backwards-compatible shim for tests that previously took (listen, clients).
-/// Returns (clients_path, psks_path).
-pub fn unique_paths() -> (PathBuf, PathBuf) {
-    let p = unique_paths_full();
-    (p.clients, p.psks)
 }
 
 pub fn repo_path() -> String {
@@ -197,25 +195,6 @@ pub fn build_full_config(paths: &TempPaths, api_base: String, bind: SocketAddr) 
             }),
         },
     }
-}
-
-/// Older config shape (no explicit bind). Kept for tests that just need a
-/// daemon Config but won't actually exercise the listen path.
-pub fn build_config(_unused: PathBuf, clients_path: PathBuf, api_base: String) -> Config {
-    // Use a fresh paths bundle so unrelated tests don't share files.
-    let paths = TempPaths {
-        admin: std::env::temp_dir().join(format!("symbolon-cfg-{}-admin.sock", unique_id())),
-        clients: clients_path,
-        psks: std::env::temp_dir().join(format!("symbolon-cfg-{}-psks", unique_id())),
-    };
-    build_full_config(
-        &paths,
-        api_base,
-        // 127.0.0.1:0 → OS-assigned ephemeral port; the test that uses this
-        // shape (`tests/daemon.rs`) reads the assigned port via the daemon's
-        // own logs or its accept-side bookkeeping.
-        "127.0.0.1:0".parse().unwrap(),
-    )
 }
 
 /// Write a `clients.json` (schema v1) with the given enrolled identities.

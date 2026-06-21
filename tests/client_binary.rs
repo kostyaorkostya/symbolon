@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use symbolon::transport::{self, MAX_MESSAGE_SIZE, encode_prelude, frame, parse_prelude};
+use symbolon::transport::{self, frame, parse_prelude, MAX_MESSAGE_SIZE};
 
 const PSK_HEX: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const PSK_BYTES: [u8; 32] = [0xaa; 32];
@@ -165,11 +165,4 @@ fn read_framed(stream: &mut TcpStream) -> Vec<u8> {
 fn write_framed(stream: &mut TcpStream, payload: &[u8]) {
     let framed = frame(payload).expect("frame");
     stream.write_all(&framed).expect("write");
-}
-
-// Reference `encode_prelude` so cargo doesn't complain about dead imports if
-// tests are refactored later.
-#[allow(dead_code)]
-fn _ensure_encode_prelude_reachable() {
-    let _ = encode_prelude("x");
 }

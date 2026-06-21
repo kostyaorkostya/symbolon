@@ -139,11 +139,12 @@ where
 }
 
 /// RAII shell around a `Claim::Resolve` outcome. Drops default
-/// to `release_failed`; an explicit `commit_done` consumes the
-/// guard and transitions to `release_done`. Either way, the
-/// matching release happens automatically — a panic, `?`-
-/// propagation, or async cancellation between claim and outcome
-/// cannot leak the in-flight marker.
+/// to `release_failed` (`result = None`); an explicit
+/// `commit_done` consumes the guard and transitions to
+/// `release_done` (`result = Some`). Either way, the matching
+/// release happens automatically — a panic, `?`-propagation, or
+/// async cancellation between claim and outcome cannot leak the
+/// in-flight marker.
 struct InFlightGuard<'a, K, V>
 where
     K: Hash + Eq + Clone,
@@ -152,12 +153,7 @@ where
     store: &'a SingleflightCache<K, V>,
     key: K,
     event: Rc<Event>,
-    resolution: Resolution<V>,
-}
-
-enum Resolution<V> {
-    Failed,
-    Done(V),
+    result: Option<V>,
 }
 
 impl<'a, K, V> InFlightGuard<'a, K, V>
@@ -170,14 +166,14 @@ where
             store,
             key,
             event,
-            resolution: Resolution::Failed,
+            result: None,
         }
     }
 
     /// Mark the resolve as successful. Consumes the guard so
     /// double-commit is impossible.
     fn commit_done(mut self, value: V) {
-        self.resolution = Resolution::Done(value);
+        self.result = Some(value);
     }
 }
 
@@ -187,14 +183,9 @@ where
     V: Clone,
 {
     fn drop(&mut self) {
-        // `mem::replace` moves the V out of `&mut self` without
-        // cloning; `Failed` is the harmless placeholder we leave
-        // behind in a value about to be dropped anyway.
-        match std::mem::replace(&mut self.resolution, Resolution::Failed) {
-            Resolution::Done(value) => {
-                self.store.release_done(&self.key, value, &self.event);
-            }
-            Resolution::Failed => self.store.release_failed(&self.key, &self.event),
+        match self.result.take() {
+            Some(value) => self.store.release_done(&self.key, value, &self.event),
+            None => self.store.release_failed(&self.key, &self.event),
         }
     }
 }

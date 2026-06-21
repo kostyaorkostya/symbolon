@@ -31,7 +31,7 @@ use crate::ids::{OutReqId, ReqId};
 use crate::providers::github::{GitHubProvider, GithubError};
 use crate::providers::{Provider, ProviderError, ProviderReqId};
 use crate::psk_store::{PskStore, PskStoreError};
-use crate::sandbox::{self, SandboxError, SandboxPaths};
+use crate::sandbox::{self, SandboxError, SandboxPaths, SandboxStatus};
 use crate::transport::{Phase, Responder, SessionError, Step};
 
 /// Per-connection read budget enforced at the daemon's read loop.
@@ -598,7 +598,10 @@ fn apply_sandbox(cfg: &Config) -> Result<(), DaemonError> {
         },
     };
     let outcome = sandbox::apply(level, &paths)?;
-    let degraded = !matches!(outcome.status, "fully_enforced" | "off");
+    let degraded = !matches!(
+        outcome.status,
+        SandboxStatus::FullyEnforced | SandboxStatus::Off
+    );
     // tracing's event! macro requires a const level, so we can't
     // factor the level branch out further than this.
     if degraded {
@@ -606,7 +609,7 @@ fn apply_sandbox(cfg: &Config) -> Result<(), DaemonError> {
             evt = %EventKind::SandboxApplied,
             policy = ?cfg.security.sandbox,
             abi = outcome.requested_abi,
-            status = outcome.status,
+            status = %outcome.status,
             fs = outcome.fs,
             tcp = outcome.tcp,
             scope = outcome.scope,
@@ -616,7 +619,7 @@ fn apply_sandbox(cfg: &Config) -> Result<(), DaemonError> {
             evt = %EventKind::SandboxApplied,
             policy = ?cfg.security.sandbox,
             abi = outcome.requested_abi,
-            status = outcome.status,
+            status = %outcome.status,
             fs = outcome.fs,
             tcp = outcome.tcp,
             scope = outcome.scope,
@@ -761,7 +764,7 @@ async fn handle_connection(mut stream: TcpStream, req_id: ReqId, state: Rc<Share
                     peer = ?peer,
                 );
                 client_name = Some(client.name);
-                if let Err(e) = sess.set_psk(psk) {
+                if let Err(e) = sess.set_psk(psk.into_bytes()) {
                     log_session_failure(&req_id, peer, sess.phase(), client_name.as_deref(), &e);
                     return;
                 }
@@ -1163,9 +1166,9 @@ fn log_mint_error(
 // `transport::Responder`.
 
 /// Read EXACTLY `n` bytes from `stream` into a fresh `Vec`. Returns
-/// `None` on EOF or I/O error. Reuses the same chunk buffer across
-/// poll iterations — under a slow peer this is the difference
-/// between one allocation and one-per-byte.
+/// `None` on EOF or I/O error. The chunk buffer is reused across
+/// short-read iterations within this call so a slow peer drips
+/// bytes into one allocation instead of one-per-poll.
 async fn read_exact_n(stream: &mut TcpStream, n: usize) -> Option<Vec<u8>> {
     let mut out: Vec<u8> = Vec::with_capacity(n);
     let mut chunk: Vec<u8> = Vec::with_capacity(n);

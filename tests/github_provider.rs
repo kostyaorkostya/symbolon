@@ -46,7 +46,6 @@ async fn mint_happy_path() {
 
 #[compio::test]
 async fn mint_uses_cached_repo_id() {
-    use wiremock::matchers::body_bytes;
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path(repo_path()))
@@ -306,7 +305,6 @@ async fn mint_returns_500() {
 
 #[compio::test]
 async fn mint_invalidates_on_404() {
-    use wiremock::matchers::body_bytes;
     let server = MockServer::start().await;
 
     // GET fires twice across phases 1 and 3 (cache miss → fill,

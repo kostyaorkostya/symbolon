@@ -22,7 +22,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -162,26 +162,26 @@ fn drive(stream: &mut TcpStream, mut sess: Initiator) -> Result<Vec<u8>, ClientE
     }
 }
 
-fn load_psk(path: &PathBuf) -> Result<[u8; 32], ClientError> {
+fn load_psk(path: &Path) -> Result<[u8; 32], ClientError> {
     let text = std::fs::read_to_string(path).map_err(|source| ClientError::ReadPsk {
-        path: path.clone(),
+        path: path.to_path_buf(),
         source,
     })?;
     let hex_str = text.trim();
     if hex_str.len() != 64 {
         return Err(ClientError::BadPskLen {
-            path: path.clone(),
+            path: path.to_path_buf(),
             got: hex_str.len(),
         });
     }
     let mut out = [0u8; 32];
     hex::decode_to_slice(hex_str, &mut out).map_err(|e| match e {
         hex::FromHexError::InvalidHexCharacter { c, .. } => ClientError::BadPskHex {
-            path: path.clone(),
+            path: path.to_path_buf(),
             byte: c as u8,
         },
         _ => ClientError::BadPskLen {
-            path: path.clone(),
+            path: path.to_path_buf(),
             got: hex_str.len(),
         },
     })?;

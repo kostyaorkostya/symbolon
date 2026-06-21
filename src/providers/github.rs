@@ -994,9 +994,6 @@ impl JwtSigner {
 // ============================================================================
 
 impl GitHubProvider {
-    /// Wire body for `POST /app/installations/{id}/access_tokens`
-    /// scoped to one repo with the narrow `git push` permission set
-    /// (AGENTS.md invariants #4, #5). Pinned byte-exact by
     /// Read the GitHub-specific `X-GitHub-Request-Id` header off a
     /// response, if present. The string ends up on the abstract
     /// `provider_req_id` log/wire field; field shape is shared with
@@ -1014,7 +1011,6 @@ impl GitHubProvider {
     /// HTTP-date; we parse the integer form (which GitHub uses) and
     /// ignore the date form. Returns `None` on absent or malformed
     /// values — caller falls back to "wait at your own pace."
-    /// HTTP `Date` header (IMF-fixdate per RFC 7231 § 7.1.1.1) is
     fn read_retry_after(resp: &cyper::Response) -> Option<Duration> {
         resp.headers()
             .get("retry-after")

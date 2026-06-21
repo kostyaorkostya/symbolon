@@ -56,11 +56,11 @@ pub enum GitCredentialError {
     #[error("required key '{key}' missing")]
     MissingRequiredKey { key: &'static str },
     #[error("CR byte (0x0D) in value for '{key}'")]
-    CarriageReturnInValue { key: String },
+    CarriageReturnInValue { key: &'static str },
     #[error("NUL byte (0x00) in value for '{key}'")]
-    NulInValue { key: String },
+    NulInValue { key: &'static str },
     #[error("value for '{key}' is not valid UTF-8")]
-    InvalidUtf8 { key: String },
+    InvalidUtf8 { key: &'static str },
     #[error("response field '{field}' contains a forbidden control byte")]
     ResponseControlByte { field: &'static str },
     #[error("password_expiry_utc is before the UNIX epoch")]
@@ -137,10 +137,9 @@ pub fn parse(input: &[u8]) -> Result<Request, GitCredentialError> {
         // array and clears any earlier flags (per git-credential.adoc
         // array semantics).
         if key_bytes == b"capability[]" {
-            let value = &line[eq_pos + 1..];
-            if value.is_empty() {
+            if value_bytes.is_empty() {
                 client_supports_authtype = false;
-            } else if value == b"authtype" {
+            } else if value_bytes == b"authtype" {
                 client_supports_authtype = true;
             }
             // Other capabilities (e.g. `state`) ignored — we don't
@@ -153,55 +152,38 @@ pub fn parse(input: &[u8]) -> Result<Request, GitCredentialError> {
         // requests also land here as unknown keys (e.g. `host ` with
         // a trailing space), and `url=` shorthand is rejected
         // implicitly by the same path.
-        let key_static: &'static str = match key_bytes {
-            b"protocol" => "protocol",
-            b"host" => "host",
-            b"path" => "path",
+        let (key, slot) = match key_bytes {
+            b"protocol" => ("protocol", &mut protocol),
+            b"host" => ("host", &mut host),
+            b"path" => ("path", &mut path),
             _ => continue,
         };
 
         if value_bytes.len() > MAX_VALUE_BYTES {
             return Err(GitCredentialError::ValueTooLong {
-                key: key_static,
+                key,
                 max: MAX_VALUE_BYTES,
             });
         }
 
         for &b in value_bytes {
             match b {
-                0x00 => {
-                    return Err(GitCredentialError::NulInValue {
-                        key: key_static.to_string(),
-                    });
-                }
-                0x0D => {
-                    return Err(GitCredentialError::CarriageReturnInValue {
-                        key: key_static.to_string(),
-                    });
-                }
+                0x00 => return Err(GitCredentialError::NulInValue { key }),
+                0x0D => return Err(GitCredentialError::CarriageReturnInValue { key }),
                 _ => {}
             }
         }
 
         if value_bytes.is_empty() {
-            return Err(GitCredentialError::EmptyValue { key: key_static });
+            return Err(GitCredentialError::EmptyValue { key });
+        }
+        if slot.is_some() {
+            return Err(GitCredentialError::DuplicateKey { key });
         }
 
         let value = std::str::from_utf8(value_bytes)
-            .map_err(|_| GitCredentialError::InvalidUtf8 {
-                key: key_static.to_string(),
-            })?
+            .map_err(|_| GitCredentialError::InvalidUtf8 { key })?
             .to_string();
-
-        let slot = match key_static {
-            "protocol" => &mut protocol,
-            "host" => &mut host,
-            "path" => &mut path,
-            _ => unreachable!("key_static set to one of protocol/host/path by the match above"),
-        };
-        if slot.is_some() {
-            return Err(GitCredentialError::DuplicateKey { key: key_static });
-        }
         *slot = Some(value);
     }
 
@@ -261,11 +243,6 @@ pub(crate) fn write_response(
     if client_supports_authtype {
         // Modern shape (git 2.46+ after authtype capability negotiation).
         // The token in `resp.password` IS the bearer credential.
-        out.reserve(
-            "capability[]=authtype\nauthtype=Bearer\ncredential=\nephemeral=true\npassword_expiry_utc=\n\n".len()
-                + resp.password.len()
-                + expiry_str.len(),
-        );
         out.extend_from_slice(b"capability[]=authtype\n");
         out.extend_from_slice(b"authtype=Bearer\n");
         out.extend_from_slice(b"credential=");
@@ -281,7 +258,6 @@ pub(crate) fn write_response(
         // Legacy shape (git ≤ 2.45 or any client that didn't
         // declare authtype capability). The `username` is always
         // `x-access-token` for GitHub installation tokens.
-        out.reserve(41 + resp.username.len() + resp.password.len() + expiry_str.len() + 2);
         out.extend_from_slice(b"username=");
         out.extend_from_slice(resp.username.as_bytes());
         out.push(b'\n');
@@ -310,6 +286,14 @@ fn check_response_field(field: &'static str, value: &str) -> Result<(), GitCrede
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn resp(username: &str, password: &str, expiry_secs: u64) -> Response {
+        Response {
+            username: username.to_string(),
+            password: password.to_string(),
+            password_expiry_utc: SystemTime::UNIX_EPOCH + Duration::from_secs(expiry_secs),
+        }
+    }
 
     #[test]
     fn parse_minimal_request_ok() {
@@ -381,7 +365,7 @@ mod tests {
         let input = b"protocol=https\nhost=github.com\rmalicious=1\npath=p\n\n";
         let err = parse(input).unwrap_err();
         assert!(
-            matches!(err, GitCredentialError::CarriageReturnInValue { ref key } if key == "host"),
+            matches!(err, GitCredentialError::CarriageReturnInValue { key } if key == "host"),
             "unexpected: {err:?}"
         );
     }
@@ -400,13 +384,9 @@ mod tests {
 
     #[test]
     fn emit_rejects_cr_in_password() {
-        let resp = Response {
-            username: "u".to_string(),
-            password: "tok\ren".to_string(),
-            password_expiry_utc: SystemTime::UNIX_EPOCH,
-        };
+        let r = resp("u", "tok\ren", 0);
         let mut out = Vec::new();
-        let err = write_response(&resp, false, &mut out).unwrap_err();
+        let err = write_response(&r, false, &mut out).unwrap_err();
         assert!(matches!(
             err,
             GitCredentialError::ResponseControlByte { field: "password" }
@@ -415,13 +395,9 @@ mod tests {
 
     #[test]
     fn emit_rejects_lf_in_username() {
-        let resp = Response {
-            username: "u\ninject".to_string(),
-            password: "p".to_string(),
-            password_expiry_utc: SystemTime::UNIX_EPOCH,
-        };
+        let r = resp("u\ninject", "p", 0);
         let mut out = Vec::new();
-        let err = write_response(&resp, false, &mut out).unwrap_err();
+        let err = write_response(&r, false, &mut out).unwrap_err();
         assert!(matches!(
             err,
             GitCredentialError::ResponseControlByte { field: "username" }
@@ -493,7 +469,7 @@ mod tests {
         let input = b"protocol=https\nhost=github.com\npath=foo\x00bar\n\n";
         let err = parse(input).unwrap_err();
         assert!(
-            matches!(err, GitCredentialError::NulInValue { ref key } if key == "path"),
+            matches!(err, GitCredentialError::NulInValue { key } if key == "path"),
             "unexpected: {err:?}"
         );
     }
@@ -503,7 +479,7 @@ mod tests {
         let input = b"protocol=https\nhost=foo\xFFbar\npath=p\n\n";
         let err = parse(input).unwrap_err();
         assert!(
-            matches!(err, GitCredentialError::InvalidUtf8 { ref key } if key == "host"),
+            matches!(err, GitCredentialError::InvalidUtf8 { key } if key == "host"),
             "unexpected: {err:?}"
         );
     }
@@ -566,13 +542,9 @@ mod tests {
 
     #[test]
     fn emit_round_trips_minimal_response() {
-        let resp = Response {
-            username: "x-access-token".to_string(),
-            password: "ghs_xxxxxxxxxxx".to_string(),
-            password_expiry_utc: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-        };
+        let r = resp("x-access-token", "ghs_xxxxxxxxxxx", 1_700_000_000);
         let mut out = Vec::new();
-        write_response(&resp, false, &mut out).unwrap();
+        write_response(&r, false, &mut out).unwrap();
         assert_eq!(
             out,
             b"username=x-access-token\npassword=ghs_xxxxxxxxxxx\npassword_expiry_utc=1700000000\n\n"
@@ -581,13 +553,9 @@ mod tests {
 
     #[test]
     fn emit_appends_to_nonempty_buffer() {
-        let resp = Response {
-            username: "u".to_string(),
-            password: "p".to_string(),
-            password_expiry_utc: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
-        };
+        let r = resp("u", "p", 1);
         let mut out = b"junk".to_vec();
-        write_response(&resp, false, &mut out).unwrap();
+        write_response(&r, false, &mut out).unwrap();
         assert_eq!(&out[..4], b"junk");
         assert_eq!(
             &out[4..],
@@ -597,38 +565,30 @@ mod tests {
 
     #[test]
     fn emit_renders_expiry_as_unix_seconds() {
-        let resp = Response {
-            username: "u".to_string(),
-            password: "p".to_string(),
-            password_expiry_utc: SystemTime::UNIX_EPOCH + Duration::from_secs(42),
-        };
+        let r = resp("u", "p", 42);
         let mut out = Vec::new();
-        write_response(&resp, false, &mut out).unwrap();
+        write_response(&r, false, &mut out).unwrap();
         let body = std::str::from_utf8(&out).unwrap();
         assert!(body.contains("password_expiry_utc=42\n"));
     }
 
     #[test]
     fn emit_rejects_pre_epoch_expiry() {
-        let resp = Response {
+        let r = Response {
             username: "u".to_string(),
             password: "p".to_string(),
             password_expiry_utc: SystemTime::UNIX_EPOCH - Duration::from_secs(1),
         };
         let mut out = Vec::new();
-        let err = write_response(&resp, false, &mut out).unwrap_err();
+        let err = write_response(&r, false, &mut out).unwrap_err();
         assert!(matches!(err, GitCredentialError::EmitInvalidExpiry));
     }
 
     #[test]
     fn emit_modern_shape_when_authtype_negotiated() {
-        let resp = Response {
-            username: "x-access-token".to_string(),
-            password: "ghs_xxxxxxxxxxx".to_string(),
-            password_expiry_utc: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-        };
+        let r = resp("x-access-token", "ghs_xxxxxxxxxxx", 1_700_000_000);
         let mut out = Vec::new();
-        write_response(&resp, true, &mut out).unwrap();
+        write_response(&r, true, &mut out).unwrap();
         assert_eq!(
             out,
             b"capability[]=authtype\n\
@@ -645,13 +605,9 @@ mod tests {
         // Spec: when `credential` is set, `username`/`password` are
         // not used. The `resp.username` value (always
         // "x-access-token" for us) must NOT leak into the wire.
-        let resp = Response {
-            username: "x-access-token".to_string(),
-            password: "ghs_tok".to_string(),
-            password_expiry_utc: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
-        };
+        let r = resp("x-access-token", "ghs_tok", 1);
         let mut out = Vec::new();
-        write_response(&resp, true, &mut out).unwrap();
+        write_response(&r, true, &mut out).unwrap();
         let body = std::str::from_utf8(&out).unwrap();
         assert!(!body.contains("username="));
         assert!(!body.contains("password=")); // distinct from `password_expiry_utc`
@@ -663,13 +619,9 @@ mod tests {
         // The token goes through the same CR/LF/NUL guard as the
         // legacy `password` field — a malformed token must never
         // produce an extra wire line.
-        let resp = Response {
-            username: "x-access-token".to_string(),
-            password: "ghs_xxx\rextra=line".to_string(),
-            password_expiry_utc: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
-        };
+        let r = resp("x-access-token", "ghs_xxx\rextra=line", 1);
         let mut out = Vec::new();
-        let err = write_response(&resp, true, &mut out).unwrap_err();
+        let err = write_response(&r, true, &mut out).unwrap_err();
         assert!(matches!(
             err,
             GitCredentialError::ResponseControlByte { field: "password" }

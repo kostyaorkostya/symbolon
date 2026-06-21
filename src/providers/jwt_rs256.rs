@@ -2,13 +2,13 @@
 //! `alg = "RS256"`. The only JOSE algorithm the GitHub provider
 //! uses. Header format is fixed at `{"typ":"JWT","alg":"RS256"}`.
 
-use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use rsa::RsaPrivateKey;
+use base64::Engine;
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs1v15::SigningKey;
 use rsa::pkcs8::DecodePrivateKey;
 use rsa::signature::{SignatureEncoding, Signer};
+use rsa::RsaPrivateKey;
 use serde::Serialize;
 use sha2::Sha256;
 
@@ -36,9 +36,7 @@ const HEADER_RS256: Header = Header {
 /// Pre-built RS256 signing key. Construction parses the PEM and
 /// precomputes the inner state; subsequent `sign` calls are
 /// allocation-light (the RSA bignum work dominates).
-pub struct JwtSigningKey {
-    inner: SigningKey<Sha256>,
-}
+pub struct JwtSigningKey(SigningKey<Sha256>);
 
 impl JwtSigningKey {
     /// Load an RSA private key from PEM. Tries PKCS#8 first
@@ -50,9 +48,7 @@ impl JwtSigningKey {
         let pkey = RsaPrivateKey::from_pkcs8_pem(pem)
             .or_else(|_| RsaPrivateKey::from_pkcs1_pem(pem))
             .map_err(|_| JwtError::PemParse)?;
-        Ok(Self {
-            inner: SigningKey::<Sha256>::new(pkey),
-        })
+        Ok(Self(SigningKey::<Sha256>::new(pkey)))
     }
 
     /// Produce a compact JWS:
@@ -75,11 +71,9 @@ impl JwtSigningKey {
         signing_input.push(b'.');
         signing_input.extend_from_slice(payload_b64.as_bytes());
 
-        let signature = self.inner.sign(&signing_input);
+        let signature = self.0.sign(&signing_input);
         let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
-        // SAFETY-free: header_b64 / payload_b64 / sig_b64 are all
-        // url-safe base64, i.e. ASCII.
         let mut token = String::from_utf8(signing_input).expect("base64 is ASCII");
         token.push('.');
         token.push_str(&sig_b64);

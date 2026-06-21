@@ -21,9 +21,8 @@ use std::io;
 use std::path::PathBuf;
 
 use landlock::{
-    ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath,
-    PathFd, PathFdError, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetError, RulesetStatus,
-    Scope,
+    Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath, PathFd,
+    PathFdError, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetError, RulesetStatus, Scope, ABI,
 };
 
 use crate::config::SandboxMode;
@@ -56,13 +55,22 @@ pub(crate) struct SandboxOutcome {
     /// Landlock ABI we built the ruleset against (always 6 unless
     /// `Off`).
     pub requested_abi: u8,
-    /// Whether `restrict_self` reports the ruleset as
-    /// `FullyEnforced`, `PartiallyEnforced`, `NotEnforced`, or `off`
-    /// when sandboxing was skipped.
-    pub status: &'static str,
+    pub status: SandboxStatus,
     pub fs: bool,
     pub tcp: bool,
     pub scope: bool,
+}
+
+/// What `restrict_self` actually achieved, plus the `Off` case where
+/// sandboxing was skipped entirely. `Display` emits the snake_case
+/// form for the `sandbox_applied` log event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::Display)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum SandboxStatus {
+    Off,
+    FullyEnforced,
+    PartiallyEnforced,
+    NotEnforced,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -90,27 +98,18 @@ pub(crate) fn apply(
     level: SandboxMode,
     paths: &SandboxPaths,
 ) -> Result<SandboxOutcome, SandboxError> {
-    if level == SandboxMode::Off {
-        return Ok(SandboxOutcome {
-            requested_abi: 0,
-            status: "off",
-            fs: false,
-            tcp: false,
-            scope: false,
-        });
-    }
-
-    apply_landlock(level, paths)
-}
-
-fn apply_landlock(
-    level: SandboxMode,
-    paths: &SandboxPaths,
-) -> Result<SandboxOutcome, SandboxError> {
     let compat = match level {
+        SandboxMode::Off => {
+            return Ok(SandboxOutcome {
+                requested_abi: 0,
+                status: SandboxStatus::Off,
+                fs: false,
+                tcp: false,
+                scope: false,
+            });
+        }
         SandboxMode::Required => CompatLevel::HardRequirement,
         SandboxMode::BestEffort => CompatLevel::BestEffort,
-        SandboxMode::Off => unreachable!("Off short-circuited in apply"),
     };
     let abi = ABI::V6;
     let fs_bits = AccessFs::from_all(abi);
@@ -202,16 +201,16 @@ fn apply_landlock(
         .map_err(SandboxError::Ruleset)?;
 
     let status = created.restrict_self().map_err(SandboxError::Restrict)?;
-    let status_str = match status.ruleset {
-        RulesetStatus::FullyEnforced => "fully_enforced",
-        RulesetStatus::PartiallyEnforced => "partially_enforced",
-        RulesetStatus::NotEnforced => "not_enforced",
+    let status = match status.ruleset {
+        RulesetStatus::FullyEnforced => SandboxStatus::FullyEnforced,
+        RulesetStatus::PartiallyEnforced => SandboxStatus::PartiallyEnforced,
+        RulesetStatus::NotEnforced => SandboxStatus::NotEnforced,
     };
-    let fully = matches!(status.ruleset, RulesetStatus::FullyEnforced);
+    let fully = status == SandboxStatus::FullyEnforced;
 
     Ok(SandboxOutcome {
         requested_abi: 6,
-        status: status_str,
+        status,
         fs: fully,
         tcp: fully,
         scope: fully,
@@ -259,7 +258,7 @@ mod tests {
             let paths = make_paths(vec![], vec![]);
             apply(SandboxMode::Off, &paths).unwrap()
         });
-        assert_eq!(out.status, "off");
+        assert_eq!(out.status, SandboxStatus::Off);
         assert!(!out.fs && !out.tcp && !out.scope);
     }
 
@@ -316,7 +315,7 @@ mod tests {
     fn off_mode_returns_off_status() {
         let paths = make_paths(vec![], vec![]);
         let out = apply(SandboxMode::Off, &paths).unwrap();
-        assert_eq!(out.status, "off");
+        assert_eq!(out.status, SandboxStatus::Off);
     }
 
     #[test]

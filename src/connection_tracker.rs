@@ -33,7 +33,7 @@ pub(crate) struct ConnectionTracker {
 }
 
 /// RAII increment/decrement of the active-handler counter.
-/// `Token::new` increments; `Drop` decrements and notifies `empty`
+/// Construction increments; `Drop` decrements and notifies `empty`
 /// when the count returns to zero. Living inside the spawned future
 /// makes the decrement panic-safe — a handler panic still runs
 /// local `Drop`s, so `drain` is not stuck waiting for a notification
@@ -41,13 +41,6 @@ pub(crate) struct ConnectionTracker {
 struct Token {
     active: ThinCell<usize>,
     empty: Rc<Event>,
-}
-
-impl Token {
-    fn new(active: ThinCell<usize>, empty: Rc<Event>) -> Self {
-        *active.borrow() += 1;
-        Self { active, empty }
-    }
 }
 
 impl Drop for Token {
@@ -62,11 +55,6 @@ impl Drop for Token {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DrainStats {
-    /// Per-tracker drain time. Only read by tests; the daemon
-    /// reports a wider shutdown window measured by the caller,
-    /// so the production path never reads this field.
-    #[allow(dead_code)] // read by tests only — see field docstring
-    pub drain_ms: u64,
     pub inflight_drained: usize,
     pub drain_complete: bool,
 }
@@ -88,7 +76,11 @@ impl ConnectionTracker {
     where
         F: AsyncFnOnce() + 'static,
     {
-        let token = Token::new(self.active.clone(), self.empty.clone());
+        *self.active.borrow() += 1;
+        let token = Token {
+            active: self.active.clone(),
+            empty: self.empty.clone(),
+        };
         let timeout = self.per_handler_timeout;
         compio::runtime::spawn(async move {
             // Move token into the future so its Drop fires on
@@ -125,7 +117,6 @@ impl ConnectionTracker {
         };
         let final_count = *self.active.borrow();
         DrainStats {
-            drain_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
             inflight_drained: initial.saturating_sub(final_count),
             drain_complete,
         }
@@ -150,10 +141,11 @@ mod tests {
         tracker.spawn(async || {
             compio::time::sleep(Duration::from_millis(50)).await;
         });
+        let start = Instant::now();
         let stats = tracker.drain().await;
         assert_eq!(stats.inflight_drained, 1);
         assert!(stats.drain_complete);
-        assert!(stats.drain_ms >= 40);
+        assert!(start.elapsed() >= Duration::from_millis(40));
     }
 
     #[compio::test]

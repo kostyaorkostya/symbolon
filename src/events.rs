@@ -44,15 +44,6 @@ pub enum EventKind {
     Startup,
 }
 
-impl EventKind {
-    /// Static snake_case form. Derived via `strum::IntoStaticStr` —
-    /// adding a new variant automatically extends this without
-    /// requiring an edit to a hand-written match table.
-    pub fn as_str(self) -> &'static str {
-        self.into()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

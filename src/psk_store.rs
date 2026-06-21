@@ -20,9 +20,35 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::transport::{MAX_IDENTITY_LEN, is_identity_byte};
+use derive_more::From;
+
+use crate::transport::{is_identity_byte, MAX_IDENTITY_LEN};
 
 const PSK_LEN: usize = 32;
+
+/// 32-byte pre-shared key with a deliberately redacted `Debug`
+/// impl. Without the newtype, the raw `[u8; 32]` inside `PskStore`
+/// (which derives `Debug`) would print every byte whenever an
+/// operator-side log line dumped the store, even though the
+/// operator-side mitigation (mlockall + LimitCORE=0) only covers
+/// swap and coredumps — not deliberate `Debug` formatting.
+#[derive(Clone, Copy, PartialEq, Eq, From)]
+pub struct Psk([u8; PSK_LEN]);
+
+impl std::fmt::Debug for Psk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Psk(<redacted>)")
+    }
+}
+
+impl Psk {
+    pub fn as_bytes(&self) -> &[u8; PSK_LEN] {
+        &self.0
+    }
+    pub fn into_bytes(self) -> [u8; PSK_LEN] {
+        self.0
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PskStoreError {
@@ -79,7 +105,7 @@ pub enum PskStoreError {
 /// `LimitCORE=0` in the systemd unit (no coredump).
 #[derive(Debug, Default)]
 pub struct PskStore {
-    entries: HashMap<String, [u8; PSK_LEN]>,
+    entries: HashMap<String, Psk>,
 }
 
 impl PskStore {
@@ -92,7 +118,7 @@ impl PskStore {
     /// Parse a PSK file's contents into a store. Caller passes `path` only for
     /// error context.
     pub fn parse(text: &str, path: &Path) -> Result<Self, PskStoreError> {
-        let mut entries: HashMap<String, [u8; PSK_LEN]> = HashMap::new();
+        let mut entries: HashMap<String, Psk> = HashMap::new();
         for (idx, raw) in text.lines().enumerate() {
             let line_no = idx + 1;
             let line = raw.trim_end_matches(['\r', '\n']);
@@ -119,12 +145,12 @@ impl PskStore {
     }
 
     /// Look up a PSK by identity. Returns `None` if the identity is not enrolled.
-    pub fn lookup(&self, identity: &str) -> Option<&[u8; PSK_LEN]> {
+    pub fn lookup(&self, identity: &str) -> Option<&Psk> {
         self.entries.get(identity)
     }
 
     /// Insert or replace an identity's PSK.
-    pub fn insert(&mut self, identity: String, psk: [u8; PSK_LEN]) {
+    pub fn insert(&mut self, identity: String, psk: Psk) {
         self.entries.insert(identity, psk);
     }
 
@@ -148,7 +174,7 @@ impl PskStore {
             let psk = self.entries.get(k).expect("key from same map");
             out.push_str(k);
             out.push(':');
-            out.push_str(&hex::encode(psk));
+            out.push_str(&hex::encode(psk.as_bytes()));
             out.push('\n');
         }
         out
@@ -176,7 +202,7 @@ fn validate_identity(id: &str, path: &Path, line: usize) -> Result<(), PskStoreE
     Ok(())
 }
 
-fn decode_psk_hex(hex_str: &str, path: &Path, line: usize) -> Result<[u8; PSK_LEN], PskStoreError> {
+fn decode_psk_hex(hex_str: &str, path: &Path, line: usize) -> Result<Psk, PskStoreError> {
     if hex_str.len() != PSK_LEN * 2 {
         return Err(PskStoreError::BadPskHexLen {
             path: path.to_path_buf(),
@@ -199,7 +225,7 @@ fn decode_psk_hex(hex_str: &str, path: &Path, line: usize) -> Result<[u8; PSK_LE
             got: hex_str.len(),
         },
     })?;
-    Ok(out)
+    Ok(Psk::from(out))
 }
 
 #[cfg(test)]
@@ -212,16 +238,16 @@ mod tests {
         Path::new(PATH)
     }
 
-    fn psk_a() -> [u8; 32] {
-        [0xAA; 32]
+    fn psk_a() -> Psk {
+        Psk::from([0xAA; 32])
     }
 
-    fn psk_b() -> [u8; 32] {
-        [0xBB; 32]
+    fn psk_b() -> Psk {
+        Psk::from([0xBB; 32])
     }
 
-    fn hex_of(psk: [u8; 32]) -> String {
-        psk.iter().map(|b| format!("{b:02x}")).collect()
+    fn hex_of(psk: Psk) -> String {
+        psk.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
     }
 
     #[test]

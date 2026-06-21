@@ -23,7 +23,6 @@ async fn admin_status_reports_uptime_and_provider_count() {
     assert_eq!(resp["ok"], serde_json::json!(true));
     assert_eq!(resp["client_count"], 0);
     assert_eq!(resp["providers"], serde_json::json!(["github.com"]));
-    paths.cleanup();
 }
 
 #[compio::test]
@@ -36,7 +35,6 @@ async fn admin_list_initially_empty() {
     let resp = admin_request(&paths.admin, serde_json::json!({"op": "list"})).await;
     assert_eq!(resp["ok"], serde_json::json!(true));
     assert!(resp["clients"].as_array().unwrap().is_empty());
-    paths.cleanup();
 }
 
 #[compio::test]
@@ -83,7 +81,6 @@ async fn admin_enroll_persists_to_clients_json_and_psk_file() {
     let listed = admin_request(&paths.admin, serde_json::json!({"op": "list"})).await;
     assert_eq!(listed["clients"].as_array().unwrap().len(), 1);
 
-    paths.cleanup();
 }
 
 #[compio::test]
@@ -113,7 +110,6 @@ async fn admin_enroll_appends_without_clobbering_existing() {
     );
     assert!(psk_text.contains("vm-1:"), "missing new entry: {psk_text}");
 
-    paths.cleanup();
 }
 
 #[compio::test]
@@ -136,7 +132,6 @@ async fn admin_enroll_rejects_duplicate_client_name() {
     .await;
     assert_eq!(resp["ok"], serde_json::json!(false));
     assert_eq!(resp["code"], "client_already_enrolled");
-    paths.cleanup();
 }
 
 #[compio::test]
@@ -158,7 +153,6 @@ async fn admin_enroll_rejects_bad_charset() {
     .await;
     assert_eq!(resp["ok"], serde_json::json!(false));
     assert_eq!(resp["code"], "bad_request");
-    paths.cleanup();
 }
 
 #[compio::test]
@@ -200,7 +194,6 @@ async fn admin_revoke_removes_psk_entry_and_updates_clients() {
     let listed = admin_request(&paths.admin, serde_json::json!({"op": "list"})).await;
     assert!(listed["clients"].as_array().unwrap().is_empty());
 
-    paths.cleanup();
 }
 
 #[compio::test]
@@ -217,7 +210,6 @@ async fn admin_revoke_unknown_client_returns_error() {
     .await;
     assert_eq!(resp["ok"], serde_json::json!(false));
     assert_eq!(resp["code"], "unknown_client");
-    paths.cleanup();
 }
 
 #[compio::test]
@@ -243,7 +235,6 @@ async fn admin_mint_calls_provider_via_wiremock() {
     assert_eq!(resp["ok"], serde_json::json!(true));
     assert_eq!(resp["username"], "x-access-token");
     assert_eq!(resp["password"], TOKEN);
-    paths.cleanup();
 }
 
 #[compio::test]
@@ -275,5 +266,4 @@ async fn admin_selfcheck_against_wiremock() {
     // (the abstract `SelfcheckOutcome` carries only the generalizable
     // ones at the top level).
     assert_eq!(resp["details"]["client_id"], CLIENT_ID);
-    paths.cleanup();
 }

@@ -35,7 +35,6 @@ async fn daemon_happy_path() {
     );
     assert!(body.starts_with("username=x-access-token\n"));
 
-    paths.cleanup();
 }
 
 #[compio::test]
@@ -60,7 +59,6 @@ async fn daemon_rejects_unknown_identity() {
         String::from_utf8_lossy(&resp),
     );
 
-    paths.cleanup();
 }
 
 #[compio::test]
@@ -84,7 +82,6 @@ async fn daemon_rejects_wrong_psk() {
         "wrong PSK must close the connection, got: {resp:?}"
     );
 
-    paths.cleanup();
 }
 
 #[compio::test]
@@ -101,7 +98,6 @@ async fn daemon_rejects_unknown_host() {
     let resp = client_handshake_and_read_eof(addr, "vm-1", TEST_PSK, req).await;
     assert!(resp.is_empty(), "expected EOF, got: {resp:?}");
 
-    paths.cleanup();
 }
 
 #[compio::test]
@@ -119,7 +115,6 @@ async fn daemon_rejects_malformed_request() {
     let resp = client_handshake_and_read_eof(addr, "vm-1", TEST_PSK, req).await;
     assert!(resp.is_empty(), "expected EOF, got: {resp:?}");
 
-    paths.cleanup();
 }
 
 // End-to-end Clone2Leak defence: a request with an embedded CR byte
@@ -142,5 +137,4 @@ async fn daemon_rejects_cr_in_host_value() {
         "CR in value must close the connection without a response"
     );
 
-    paths.cleanup();
 }

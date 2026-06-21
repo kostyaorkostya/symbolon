@@ -174,13 +174,14 @@ pub(crate) async fn run_admin_loop(
         Duration::from_secs(5),
     );
     loop {
-        futures_util::select! {
+        // `select_biased!` with shutdown listed first: when both arms
+        // are ready in the same iteration, shutdown wins. Closes the
+        // "accept already ready + shutdown just fired" race without an
+        // explicit `is_cancelled()` post-check inside the accept arm.
+        futures_util::select_biased! {
+            _ = state.shutdown.clone().wait().fuse() => break,
             accept_res = listener.accept().fuse() => {
                 let (stream, _peer) = accept_res.map_err(AdminError::Accept)?;
-                if state.shutdown.is_cancelled() {
-                    drop(stream);
-                    continue;
-                }
                 if !check_peer_uid(&stream, my_uid) {
                     drop(stream);
                     continue;
@@ -190,7 +191,6 @@ pub(crate) async fn run_admin_loop(
                     handle_admin(stream, state).await;
                 });
             }
-            _ = state.shutdown.clone().wait().fuse() => break,
         }
     }
     let _ = tracker.drain().await;
@@ -249,7 +249,7 @@ async fn dispatch(
 
 fn handle_status(state: &SharedState) -> serde_json::Value {
     let uptime_sec = state.start_time.elapsed().as_secs();
-    let mut providers: Vec<&str> = state.providers.iter().map(|p| p.host()).collect();
+    let mut providers: Vec<&str> = state.providers.values().map(|p| p.host()).collect();
     providers.sort();
     let client_count = state.clients.borrow().len();
     serde_json::json!({

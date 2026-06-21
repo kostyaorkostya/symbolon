@@ -36,7 +36,7 @@ use crate::git_credential;
 use crate::ids::{OutReqId, ReqId};
 use crate::providers::jwt_rs256::{self, JwtSigningKey};
 use crate::providers::{
-    MintOutcome as AbstractMintOutcome, Provider, ProviderError, ProviderKind, ProviderReqId,
+    MintOutcome as AbstractMintOutcome, Provider, ProviderError, ProviderReqId,
     SelfcheckOutcome as AbstractSelfcheckOutcome,
 };
 use crate::singleflight_cache::SingleflightCache;
@@ -929,10 +929,6 @@ impl<'a> RepoPath<'a> {
 impl Provider for GitHubProvider {
     fn host(&self) -> &str {
         self.host()
-    }
-
-    fn kind(&self) -> ProviderKind {
-        ProviderKind::Github
     }
 
     async fn mint(&self, req_id: &ReqId, path: &str) -> Result<AbstractMintOutcome, ProviderError> {

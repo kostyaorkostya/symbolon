@@ -113,11 +113,11 @@ pub struct SharedState {
     /// responder.
     pub(crate) psks: RefCell<PskStore>,
     /// One concrete provider per configured `[provider.<name>]`
-    /// section. Wire dispatch picks by `provider.host()`; admin
-    /// dispatch picks by `provider.kind()`. Cardinality is 1 today;
-    /// when GitLab/Gitea land, add a sibling module + `ProviderKind`
-    /// variant.
-    pub(crate) providers: Vec<Box<dyn Provider>>,
+    /// section. Admin dispatch looks up by `ProviderKind` key; wire
+    /// dispatch iterates `.values()` and matches on `provider.host()`.
+    /// Cardinality is 1 today; when GitLab/Gitea land, add a sibling
+    /// module + `ProviderKind` variant and insert here.
+    pub(crate) providers: HashMap<crate::providers::ProviderKind, Box<dyn Provider>>,
     pub(crate) psk_file_path: PathBuf,
     pub(crate) clients_file_path: PathBuf,
     pub(crate) admin_socket_path: PathBuf,
@@ -255,11 +255,15 @@ impl Service {
             Rc::new(CpuWorker::new("symbolon-cpu-worker").map_err(DaemonError::CpuWorker)?);
 
         // Post-sandbox: construct providers with pre-loaded keys.
-        let mut providers: Vec<Box<dyn Provider>> = Vec::new();
+        // Keyed by `ProviderKind` at the registration site so the
+        // `Provider` trait itself doesn't need to know its own kind —
+        // the daemon owns the (kind, impl) pairing.
+        let mut providers: HashMap<crate::providers::ProviderKind, Box<dyn Provider>> =
+            HashMap::new();
         if let Some(gh) = &cfg.provider.github {
             let key = github_key.expect("github_key loaded above when gh is Some");
             let provider = GitHubProvider::new(gh, key, cpu_worker.clone(), shutdown.clone())?;
-            providers.push(Box::new(provider));
+            providers.insert(crate::providers::ProviderKind::Github, Box::new(provider));
         }
 
         let state = Rc::new(SharedState {
@@ -307,7 +311,7 @@ impl Service {
     /// `ProviderError::Cancelled` rather than hanging the daemon at
     /// startup.
     pub async fn selfcheck(&self) {
-        for provider in &self.state.providers {
+        for provider in self.state.providers.values() {
             let req_id = ReqId::new();
             match provider.selfcheck(&req_id).await {
                 Ok(outcome) => {
@@ -342,7 +346,7 @@ impl Service {
             listener,
             admin_listener,
         } = self;
-        let provider_names: Vec<&str> = state.providers.iter().map(|p| p.host()).collect();
+        let provider_names: Vec<&str> = state.providers.values().map(|p| p.host()).collect();
         info!(evt = %EventKind::Startup, providers = ?provider_names, "daemon started");
 
         // Admin loop: held as a JoinHandle and awaited after the
@@ -361,26 +365,20 @@ impl Service {
         // which the spawned tasks are left to time out on their own.
         let tracker = ConnectionTracker::new(PER_CONNECTION_TIMEOUT, Duration::from_secs(5));
         loop {
-            futures_util::select! {
+            // `select_biased!` with shutdown listed first: when both
+            // arms are ready in the same iteration, shutdown wins.
+            // Closes the "accept already ready + shutdown just fired"
+            // race without an explicit `is_cancelled()` post-check.
+            futures_util::select_biased! {
+                _ = state.shutdown.clone().wait().fuse() => break,
                 accept_res = listener.accept().fuse() => {
                     let (stream, _peer) = accept_res.map_err(DaemonError::Accept)?;
-                    // Race: shutdown.cancel() fired while accept was
-                    // already polled-ready in this same select!
-                    // iteration. Drop the stream rather than start
-                    // a handler we won't drain — the next loop
-                    // iteration's select! will pick the
-                    // shutdown.wait() arm and break.
-                    if state.shutdown.is_cancelled() {
-                        drop(stream);
-                        continue;
-                    }
                     let req_id = ReqId::new();
                     let state = state.clone();
                     tracker.spawn(async move || {
                         handle_connection(stream, req_id, state).await;
                     });
                 }
-                _ = state.shutdown.clone().wait().fuse() => break,
             }
         }
 
@@ -445,10 +443,7 @@ impl SharedState {
     /// and uses `provider.host()` instead.
     pub fn lookup_provider(&self, name: &str) -> Option<&(dyn crate::providers::Provider + '_)> {
         let kind: crate::providers::ProviderKind = name.parse().ok()?;
-        self.providers
-            .iter()
-            .find(|p| p.kind() == kind)
-            .map(|b| b.as_ref())
+        self.providers.get(&kind).map(|b| b.as_ref())
     }
 
     /// Reload `clients.json` and atomically swap the in-memory
@@ -814,7 +809,7 @@ async fn handle_connection(mut stream: TcpStream, req_id: ReqId, state: Rc<Share
                 };
                 drop(request_bytes);
 
-                let Some(provider) = state.providers.iter().find(|p| p.host() == request.host)
+                let Some(provider) = state.providers.values().find(|p| p.host() == request.host)
                 else {
                     warn!(
                         req_id = %req_id,
@@ -1268,7 +1263,7 @@ mod tests {
                 m
             }),
             psks: RefCell::new(PskStore::empty()),
-            providers: Vec::new(),
+            providers: HashMap::new(),
             psk_file_path: nonexistent_psk,
             clients_file_path: clients_path.clone(),
             admin_socket_path: PathBuf::new(),

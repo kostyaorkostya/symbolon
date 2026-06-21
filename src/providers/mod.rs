@@ -21,7 +21,7 @@ use serde_json::Value as JsonValue;
 
 use crate::ids::{OutReqId, ReqId};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumString)]
 #[strum(serialize_all = "snake_case")]
 pub enum ProviderKind {
     Github,
@@ -124,8 +124,6 @@ pub trait Provider {
     /// Host string the client's `host=` field must match byte-exact
     /// (AGENTS.md invariant #11).
     fn host(&self) -> &str;
-
-    fn kind(&self) -> ProviderKind;
 
     /// Mint a short-lived credential scoped to one repository.
     /// `path` is the `owner/repo` (or namespace/project) from the

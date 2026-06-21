@@ -11,11 +11,11 @@
 //! catalog.
 
 use tracing::Level;
-use tracing_subscriber::Layer;
-use tracing_subscriber::filter::{LevelFilter, filter_fn};
+use tracing_subscriber::filter::{filter_fn, LevelFilter};
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::Layer;
 
 use crate::config::LogLevel;
 
@@ -57,12 +57,20 @@ pub fn setup_tracing(level: LogLevel) {
     // Shared base config so a future edit can't make stdout and
     // stderr disagree on JSON shape. Macro (not fn) avoids the
     // monstrous fmt::Layer type signature.
+    //
+    // `with_current_span(true)` carries fields recorded on the
+    // active span (`req_id`, `out_req_id`) into every event's JSON
+    // output as a nested `"span"` object. The daemon opens a span
+    // at each request entry and inner functions no longer thread
+    // the correlation ids explicitly. Operator queries become
+    // `.span.req_id` rather than `.req_id` (documented in
+    // PROTOCOLS.md § "Logging schema").
     macro_rules! base_json_layer {
         () => {
             fmt::layer()
                 .json()
                 .flatten_event(true)
-                .with_current_span(false)
+                .with_current_span(true)
                 .with_span_list(false)
                 .with_target(false)
         };

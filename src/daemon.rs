@@ -311,13 +311,19 @@ impl Service {
     /// `ProviderError::Cancelled` rather than hanging the daemon at
     /// startup.
     pub async fn selfcheck(&self) {
+        use tracing::Instrument;
         for provider in self.state.providers.values() {
             let req_id = ReqId::new();
-            match provider.selfcheck(&req_id).await {
+            let span = tracing::info_span!("selfcheck", req_id = %req_id);
+            let result = provider.selfcheck().instrument(span.clone()).await;
+            // The log lines below are emitted under `span` so that
+            // `req_id` rides along in the JSON output via the
+            // current-span carry-over.
+            let _enter = span.enter();
+            match result {
                 Ok(outcome) => {
                     info!(
                         evt = %EventKind::Selfcheck,
-                        req_id = %req_id,
                         out_req_id = %outcome.out_req_id,
                         provider_req_id = outcome.provider_req_id.as_ref().map(|p| p.as_str()).unwrap_or(""),
                         provider = %provider.host(),
@@ -328,7 +334,6 @@ impl Service {
                 Err(e) => {
                     warn!(
                         evt = %EventKind::Selfcheck,
-                        req_id = %req_id,
                         provider = %provider.host(),
                         ok = false,
                         error = %crate::logging::ErrorChain(&e),
@@ -375,8 +380,13 @@ impl Service {
                     let (stream, _peer) = accept_res.map_err(DaemonError::Accept)?;
                     let req_id = ReqId::new();
                     let state = state.clone();
+                    // `req_id` carried via `tracing::Span` instead of
+                    // threaded as an explicit parameter — `info!`/`warn!`
+                    // inside the handler inherits it from the active span.
+                    let span = tracing::info_span!("conn", req_id = %req_id);
                     tracker.spawn(async move || {
-                        handle_connection(stream, req_id, state).await;
+                        use tracing::Instrument;
+                        handle_connection(stream, state).instrument(span).await;
                     });
                 }
             }
@@ -684,7 +694,7 @@ impl TryFrom<ClientsFile> for HashMap<String, ResolvedClient> {
     }
 }
 
-async fn handle_connection(mut stream: TcpStream, req_id: ReqId, state: Rc<SharedState>) {
+async fn handle_connection(mut stream: TcpStream, state: Rc<SharedState>) {
     /// Cross-step state the driver needs to stash so the final
     /// `evt=mint` log event (emitted only after the encrypted
     /// response is on the wire) can see everything from the
@@ -708,7 +718,7 @@ async fn handle_connection(mut stream: TcpStream, req_id: ReqId, state: Rc<Share
         let step = match sess.step() {
             Ok(s) => s,
             Err(e) => {
-                log_session_failure(&req_id, peer, phase_at_entry, client_name.as_deref(), &e);
+                log_session_failure(peer, phase_at_entry, client_name.as_deref(), &e);
                 return;
             }
         };
@@ -717,11 +727,11 @@ async fn handle_connection(mut stream: TcpStream, req_id: ReqId, state: Rc<Share
             Step::ReadExact { n } => {
                 let phase = sess.phase();
                 let Some(bytes) = read_exact_n(&mut stream, n).await else {
-                    log_phase_eof(&req_id, peer, phase, client_name.as_deref());
+                    log_phase_eof(peer, phase, client_name.as_deref());
                     return;
                 };
                 if let Err(e) = sess.recv(&bytes) {
-                    log_session_failure(&req_id, peer, phase, client_name.as_deref(), &e);
+                    log_session_failure(peer, phase, client_name.as_deref(), &e);
                     return;
                 }
             }
@@ -731,7 +741,6 @@ async fn handle_connection(mut stream: TcpStream, req_id: ReqId, state: Rc<Share
                     Some(p) => *p,
                     None => {
                         warn!(
-                            req_id = %req_id,
                             evt = %EventKind::MintDenied,
                             reason = "client_unknown",
                             psk_identity = %identity,
@@ -745,7 +754,6 @@ async fn handle_connection(mut stream: TcpStream, req_id: ReqId, state: Rc<Share
                     // desynced the two files; refuse to mint rather than
                     // guess metadata.
                     warn!(
-                        req_id = %req_id,
                         evt = %EventKind::MintDenied,
                         reason = "client_metadata_missing",
                         psk_identity = %identity,
@@ -753,14 +761,13 @@ async fn handle_connection(mut stream: TcpStream, req_id: ReqId, state: Rc<Share
                     return;
                 };
                 info!(
-                    req_id = %req_id,
                     evt = %EventKind::Accept,
                     psk_identity = %client.name,
                     peer = ?peer,
                 );
                 client_name = Some(client.name);
                 if let Err(e) = sess.set_psk(psk.into_bytes()) {
-                    log_session_failure(&req_id, peer, sess.phase(), client_name.as_deref(), &e);
+                    log_session_failure(peer, sess.phase(), client_name.as_deref(), &e);
                     return;
                 }
             }
@@ -768,7 +775,6 @@ async fn handle_connection(mut stream: TcpStream, req_id: ReqId, state: Rc<Share
             Step::Write(bytes) => {
                 if let Err(e) = write_all_bytes(&mut stream, bytes).await {
                     warn!(
-                        req_id = %req_id,
                         evt = %EventKind::HandshakeFailed,
                         client = client_name.as_deref().unwrap_or(""),
                         reason = "handshake_write_io",
@@ -777,7 +783,7 @@ async fn handle_connection(mut stream: TcpStream, req_id: ReqId, state: Rc<Share
                     return;
                 }
                 if let Err(e) = sess.wrote() {
-                    log_session_failure(&req_id, peer, sess.phase(), client_name.as_deref(), &e);
+                    log_session_failure(peer, sess.phase(), client_name.as_deref(), &e);
                     return;
                 }
             }
@@ -786,7 +792,6 @@ async fn handle_connection(mut stream: TcpStream, req_id: ReqId, state: Rc<Share
                 let client_str = client_name.as_deref().unwrap_or("");
                 if request_bytes.len() > WIRE_READ_BUDGET {
                     warn!(
-                        req_id = %req_id,
                         evt = %EventKind::MintDenied,
                         reason = "malformed_request",
                         client = client_str,
@@ -798,7 +803,6 @@ async fn handle_connection(mut stream: TcpStream, req_id: ReqId, state: Rc<Share
                     Ok(r) => r,
                     Err(e) => {
                         warn!(
-                            req_id = %req_id,
                             evt = %EventKind::MintDenied,
                             reason = "malformed_request",
                             client = client_str,
@@ -812,7 +816,6 @@ async fn handle_connection(mut stream: TcpStream, req_id: ReqId, state: Rc<Share
                 let Some(provider) = state.providers.values().find(|p| p.host() == request.host)
                 else {
                     warn!(
-                        req_id = %req_id,
                         evt = %EventKind::MintDenied,
                         reason = "unknown_host",
                         host = %request.host,
@@ -822,7 +825,7 @@ async fn handle_connection(mut stream: TcpStream, req_id: ReqId, state: Rc<Share
                 };
 
                 let started = Instant::now();
-                let mint_result = provider.mint(&req_id, &request.path).await;
+                let mint_result = provider.mint(&request.path).await;
                 let provider_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
                 let outcome = match mint_result {
@@ -833,7 +836,6 @@ async fn handle_connection(mut stream: TcpStream, req_id: ReqId, state: Rc<Share
                         // that as a distinct event per PROTOCOLS.md.
                         if matches!(e, ProviderError::RepoNotFound) {
                             info!(
-                                req_id = %req_id,
                                 evt = %EventKind::CacheInvalidated,
                                 provider = %request.host,
                                 repo = %request.path,
@@ -841,7 +843,6 @@ async fn handle_connection(mut stream: TcpStream, req_id: ReqId, state: Rc<Share
                             );
                         }
                         log_mint_error(
-                            &req_id,
                             client_str,
                             &request.host,
                             &request.path,
@@ -859,7 +860,6 @@ async fn handle_connection(mut stream: TcpStream, req_id: ReqId, state: Rc<Share
                     &mut response_bytes,
                 ) {
                     warn!(
-                        req_id = %req_id,
                         evt = %EventKind::ProviderError,
                         reason = "response_encode",
                         provider = %request.host,
@@ -869,7 +869,7 @@ async fn handle_connection(mut stream: TcpStream, req_id: ReqId, state: Rc<Share
                 }
 
                 if let Err(e) = sess.set_response(&response_bytes) {
-                    log_session_failure(&req_id, peer, sess.phase(), client_name.as_deref(), &e);
+                    log_session_failure(peer, sess.phase(), client_name.as_deref(), &e);
                     return;
                 }
 
@@ -900,7 +900,6 @@ async fn handle_connection(mut stream: TcpStream, req_id: ReqId, state: Rc<Share
                         .unwrap_or(expires_at_secs);
                     let ttl_sec = expires_at_secs.saturating_sub(now_secs);
                     info!(
-                        req_id = %req_id,
                         out_req_id = %rec.out_req_id,
                         provider_req_id = rec.provider_req_id.as_ref().map(|p| p.as_str()).unwrap_or(""),
                         evt = %EventKind::Mint,
@@ -923,7 +922,6 @@ async fn handle_connection(mut stream: TcpStream, req_id: ReqId, state: Rc<Share
 /// call — used for `FrameTooBig` whose meaning depends on whether
 /// we were doing the handshake or the transport read.
 fn log_session_failure(
-    req_id: &ReqId,
     peer: Option<std::net::SocketAddr>,
     phase: Phase,
     client_name: Option<&str>,
@@ -932,63 +930,53 @@ fn log_session_failure(
     let client_str = client_name.unwrap_or("");
     match err {
         SessionError::PreludeBadMagic { .. } => warn!(
-            req_id = %req_id,
             evt = %EventKind::PreludeInvalid,
             peer = ?peer,
             reason = "bad_magic",
         ),
         SessionError::PreludeBadVersion { .. } => warn!(
-            req_id = %req_id,
             evt = %EventKind::PreludeInvalid,
             peer = ?peer,
             reason = "bad_version",
         ),
         SessionError::PreludeBadIdentityLen { .. } => warn!(
-            req_id = %req_id,
             evt = %EventKind::PreludeInvalid,
             peer = ?peer,
             reason = "bad_identity_len",
         ),
         SessionError::PreludeInvalidCharset { .. } => warn!(
-            req_id = %req_id,
             evt = %EventKind::PreludeInvalid,
             peer = ?peer,
             reason = "invalid_charset",
         ),
         SessionError::HandshakeRead(_) => warn!(
-            req_id = %req_id,
             evt = %EventKind::HandshakeFailed,
             client = client_str,
             reason = "handshake_read_failed",
         ),
         SessionError::HandshakeWrite(_) => warn!(
-            req_id = %req_id,
             evt = %EventKind::HandshakeFailed,
             client = client_str,
             reason = "handshake_write_failed",
         ),
         SessionError::IntoTransport(_) => warn!(
-            req_id = %req_id,
             evt = %EventKind::HandshakeFailed,
             client = client_str,
             reason = "handshake_into_transport_failed",
         ),
         SessionError::TransportRead(_) => warn!(
-            req_id = %req_id,
             evt = %EventKind::MintDenied,
             client = client_str,
             reason = "transport_read",
             detail = "decrypt_failed",
         ),
         SessionError::TransportWrite(_) => warn!(
-            req_id = %req_id,
             evt = %EventKind::ProviderError,
             reason = "response_write",
             client = client_str,
         ),
         SessionError::FrameTooBig { got } => match phase {
             Phase::Transport => warn!(
-                req_id = %req_id,
                 evt = %EventKind::MintDenied,
                 client = client_str,
                 reason = "transport_read",
@@ -996,7 +984,6 @@ fn log_session_failure(
                 got = got,
             ),
             _ => warn!(
-                req_id = %req_id,
                 evt = %EventKind::HandshakeFailed,
                 client = client_str,
                 reason = "frame_too_big",
@@ -1006,7 +993,6 @@ fn log_session_failure(
         SessionError::BadPskLen { .. }
         | SessionError::RecvLen { .. }
         | SessionError::WrongState { .. } => warn!(
-            req_id = %req_id,
             evt = %EventKind::HandshakeFailed,
             client = client_str,
             reason = "internal",
@@ -1018,7 +1004,6 @@ fn log_session_failure(
 /// Log a clean EOF (read returned 0 bytes) attributed to the current
 /// protocol phase.
 fn log_phase_eof(
-    req_id: &ReqId,
     peer: Option<std::net::SocketAddr>,
     phase: Phase,
     client_name: Option<&str>,
@@ -1026,32 +1011,27 @@ fn log_phase_eof(
     let client_str = client_name.unwrap_or("");
     match phase {
         Phase::PreludeHead => warn!(
-            req_id = %req_id,
             evt = %EventKind::PreludeInvalid,
             peer = ?peer,
             reason = "eof_before_prelude_head",
         ),
         Phase::PreludeBody => warn!(
-            req_id = %req_id,
             evt = %EventKind::PreludeInvalid,
             peer = ?peer,
             reason = "eof_before_identity",
         ),
         Phase::Handshake => warn!(
-            req_id = %req_id,
             evt = %EventKind::HandshakeFailed,
             client = client_str,
             reason = "eof_during_handshake",
         ),
         Phase::Transport => warn!(
-            req_id = %req_id,
             evt = %EventKind::MintDenied,
             client = client_str,
             reason = "transport_read",
             detail = "eof",
         ),
         Phase::AwaitingPsk | Phase::Done => warn!(
-            req_id = %req_id,
             evt = %EventKind::HandshakeFailed,
             client = client_str,
             reason = "eof_unexpected_phase",
@@ -1060,7 +1040,6 @@ fn log_phase_eof(
 }
 
 fn log_mint_error(
-    req_id: &ReqId,
     client_name: &str,
     host: &str,
     path: &str,
@@ -1070,7 +1049,6 @@ fn log_mint_error(
     match &err {
         ProviderError::RepoNotFound => {
             warn!(
-                req_id = %req_id,
                 evt = %EventKind::MintDenied,
                 reason = "repo_not_accessible",
                 provider_status = 404,
@@ -1087,7 +1065,6 @@ fn log_mint_error(
                 403
             };
             warn!(
-                req_id = %req_id,
                 evt = %EventKind::MintDenied,
                 reason = "provider_4xx",
                 provider_status = status,
@@ -1100,7 +1077,6 @@ fn log_mint_error(
         }
         ProviderError::RateLimited { retry_after } => {
             warn!(
-                req_id = %req_id,
                 evt = %EventKind::MintDenied,
                 reason = "provider_4xx",
                 provider_status = 429,
@@ -1113,7 +1089,6 @@ fn log_mint_error(
         }
         ProviderError::MalformedPath { .. } => {
             warn!(
-                req_id = %req_id,
                 evt = %EventKind::MintDenied,
                 reason = "malformed_request",
                 provider = %host,
@@ -1124,7 +1099,6 @@ fn log_mint_error(
         }
         ProviderError::UnexpectedStatus { status } => {
             warn!(
-                req_id = %req_id,
                 evt = %EventKind::ProviderError,
                 status = *status,
                 provider = %host,
@@ -1134,7 +1108,6 @@ fn log_mint_error(
         }
         _ => {
             warn!(
-                req_id = %req_id,
                 evt = %EventKind::ProviderError,
                 provider = %host,
                 repo = %path,

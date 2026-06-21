@@ -19,7 +19,7 @@ use derive_more::{AsRef, Display, From};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::ids::{OutReqId, ReqId};
+use crate::ids::OutReqId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumString)]
 #[strum(serialize_all = "snake_case")]
@@ -127,12 +127,14 @@ pub trait Provider {
 
     /// Mint a short-lived credential scoped to one repository.
     /// `path` is the `owner/repo` (or namespace/project) from the
-    /// git-credential request. `req_id` is the broker-side ULID
-    /// for log correlation.
-    async fn mint(&self, req_id: &ReqId, path: &str) -> Result<MintOutcome, ProviderError>;
+    /// git-credential request. Correlation IDs (`req_id`,
+    /// `out_req_id`) flow via the active `tracing::Span` opened by
+    /// the daemon at request entry — implementations log under the
+    /// inherited span rather than threading IDs as parameters.
+    async fn mint(&self, path: &str) -> Result<MintOutcome, ProviderError>;
 
     /// Verify the configured credential can talk to the provider's
     /// API and return diagnostic info. Called once per provider at
     /// startup and on-demand via `symbolon <provider> selfcheck`.
-    async fn selfcheck(&self, req_id: &ReqId) -> Result<SelfcheckOutcome, ProviderError>;
+    async fn selfcheck(&self) -> Result<SelfcheckOutcome, ProviderError>;
 }

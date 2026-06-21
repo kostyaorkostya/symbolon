@@ -187,8 +187,12 @@ pub(crate) async fn run_admin_loop(
                     continue;
                 }
                 let state = state.clone();
+                // `req_id` carried via `tracing::Span` — `info!`/`warn!`
+                // inside the handler inherits it via current-span.
+                let span = tracing::info_span!("admin", req_id = %ReqId::new());
                 tracker.spawn(async move || {
-                    handle_admin(stream, state).await;
+                    use tracing::Instrument;
+                    handle_admin(stream, state).instrument(span).await;
                 });
             }
         }
@@ -198,7 +202,6 @@ pub(crate) async fn run_admin_loop(
 }
 
 async fn handle_admin(mut stream: UnixStream, state: Rc<SharedState>) {
-    let req_id = ReqId::new();
     let raw = match read_line(&mut stream).await {
         Ok(bytes) if !bytes.is_empty() => bytes,
         _ => return,
@@ -206,14 +209,14 @@ async fn handle_admin(mut stream: UnixStream, state: Rc<SharedState>) {
     let request: Request = match serde_json::from_slice(&raw) {
         Ok(r) => r,
         Err(e) => {
-            info!(evt = %EventKind::AdminRequest, req_id = %req_id, ok = false, error = %e);
+            info!(evt = %EventKind::AdminRequest, ok = false, error = %e);
             let resp = error_response("bad_request", &format!("request parse failed: {e}"));
             let _ = write_response(&mut stream, &resp).await;
             return;
         }
     };
-    info!(evt = %EventKind::AdminRequest, req_id = %req_id, op = <&str>::from(&request));
-    let resp_value = match dispatch(&req_id, &request, &state).await {
+    info!(evt = %EventKind::AdminRequest, op = <&str>::from(&request));
+    let resp_value = match dispatch(&request, &state).await {
         Ok(v) => v,
         Err(e) => e,
     };
@@ -221,7 +224,6 @@ async fn handle_admin(mut stream: UnixStream, state: Rc<SharedState>) {
 }
 
 async fn dispatch(
-    req_id: &ReqId,
     request: &Request,
     state: &Rc<SharedState>,
 ) -> Result<serde_json::Value, serde_json::Value> {
@@ -238,8 +240,8 @@ async fn dispatch(
             provider,
             client,
             path,
-        } => handle_mint(req_id, state, provider, client, path).await,
-        Request::Selfcheck { provider } => handle_selfcheck(req_id, state, provider).await,
+        } => handle_mint(state, provider, client, path).await,
+        Request::Selfcheck { provider } => handle_selfcheck(state, provider).await,
     }
 }
 
@@ -464,7 +466,6 @@ async fn handle_revoke(
 }
 
 async fn handle_mint(
-    req_id: &ReqId,
     state: &Rc<SharedState>,
     provider: &str,
     client: &str,
@@ -479,7 +480,7 @@ async fn handle_mint(
             &format!("no enrolled client named '{client}'"),
         ));
     }
-    match provider_obj.mint(req_id, path).await {
+    match provider_obj.mint(path).await {
         Ok(outcome) => {
             let expires_unix = outcome
                 .response
@@ -501,14 +502,13 @@ async fn handle_mint(
 }
 
 async fn handle_selfcheck(
-    req_id: &ReqId,
     state: &Rc<SharedState>,
     provider: &str,
 ) -> Result<serde_json::Value, serde_json::Value> {
     let provider_obj = state
         .lookup_provider(provider)
         .ok_or_else(|| unknown_provider_error(provider))?;
-    match provider_obj.selfcheck(req_id).await {
+    match provider_obj.selfcheck().await {
         Ok(outcome) => Ok(serde_json::json!({
             "ok": true,
             "clock_skew_sec": outcome.clock_skew_sec,

@@ -33,7 +33,7 @@ use crate::config::ProviderGithub;
 use crate::cpu_worker::{CpuWorker, WorkerDead};
 use crate::events::EventKind;
 use crate::git_credential;
-use crate::ids::{OutReqId, ReqId};
+use crate::ids::OutReqId;
 use crate::providers::jwt_rs256::{self, JwtSigningKey};
 use crate::providers::{
     MintOutcome as AbstractMintOutcome, Provider, ProviderError, ProviderReqId,
@@ -364,7 +364,7 @@ impl GitHubProvider {
         &self.host
     }
 
-    pub async fn mint(&self, req_id: &ReqId, path: &str) -> Result<MintData, GithubError> {
+    pub async fn mint(&self, path: &str) -> Result<MintData, GithubError> {
         let RepoPath { owner, repo } = RepoPath::parse(path)?;
         let key = format!(
             "{}/{}",
@@ -381,13 +381,13 @@ impl GitHubProvider {
                 // installation token first, then use it as the bearer for
                 // the actual repo lookup. Logged as two distinct
                 // `provider_call` breadcrumbs.
-                self.with_metadata_token(req_id, async |token| {
-                    self.resolve_repo_id(req_id, token, owner, repo).await
+                self.with_metadata_token(async |token| {
+                    self.resolve_repo_id(token, owner, repo).await
                 })
                 .await
             })
             .await?;
-        self.mint_token(req_id, repo_id).await.inspect_err(|e| {
+        self.mint_token(repo_id).await.inspect_err(|e| {
             // Repo deleted/recreated since the resolve — drop the
             // cached id so the next mint re-resolves.
             if matches!(e, GithubError::RepoNotFound) {
@@ -444,73 +444,77 @@ impl GitHubProvider {
     /// `status = 0` with the error string.
     async fn run_call<T>(
         &self,
-        req_id: &ReqId,
         endpoint: &'static str,
         timeout: Duration,
         build: impl AsyncFnOnce(&OutReqId) -> Result<cyper::RequestBuilder, GithubError>,
         handle: impl AsyncFnOnce(cyper::Response, &CallMeta, &OutReqId) -> Result<T, GithubError>,
     ) -> Result<T, GithubError> {
+        use tracing::Instrument;
         let out_req_id = OutReqId::new();
-        info!(
-            evt = %EventKind::ProviderCall,
-            req_id = %req_id,
-            out_req_id = %out_req_id,
-            endpoint = endpoint,
-            provider = %self.api_base,
-            timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
-        );
-        let started = Instant::now();
-        let raced = futures_util::select_biased! {
-            _ = self.cancel.clone().wait().fuse() => Err(GithubError::Cancelled),
-            r = compio::time::timeout(timeout, async {
-                let resp = build(&out_req_id).await?.send().await?;
-                let meta = CallMeta {
-                    status: resp.status().as_u16(),
-                    provider_req_id: Self::read_provider_req_id(&resp),
-                };
-                let result = handle(resp, &meta, &out_req_id).await;
-                Ok((meta, result))
-            }).fuse() => match r {
-                Ok(inner) => inner,
-                Err(_) => Err(GithubError::Timeout(timeout)),
-            },
-        };
-        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        match raced {
-            Ok((
-                CallMeta {
-                    status,
-                    provider_req_id,
+        // Per-HTTPS-call nested span: inherits `req_id` from the
+        // outer per-connection span (opened by the daemon/admin
+        // accept loop) and adds `out_req_id` so both ids ride
+        // along on every event the closures emit.
+        let span = tracing::info_span!("provider_call", out_req_id = %out_req_id);
+        async move {
+            info!(
+                evt = %EventKind::ProviderCall,
+                endpoint = endpoint,
+                provider = %self.api_base,
+                timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+            );
+            let started = Instant::now();
+            let raced = futures_util::select_biased! {
+                _ = self.cancel.clone().wait().fuse() => Err(GithubError::Cancelled),
+                r = compio::time::timeout(timeout, async {
+                    let resp = build(&out_req_id).await?.send().await?;
+                    let meta = CallMeta {
+                        status: resp.status().as_u16(),
+                        provider_req_id: Self::read_provider_req_id(&resp),
+                    };
+                    let result = handle(resp, &meta, &out_req_id).await;
+                    Ok((meta, result))
+                }).fuse() => match r {
+                    Ok(inner) => inner,
+                    Err(_) => Err(GithubError::Timeout(timeout)),
                 },
-                result,
-            )) => {
-                info!(
-                    evt = %EventKind::ProviderCallDone,
-                    req_id = %req_id,
-                    out_req_id = %out_req_id,
-                    status = status,
-                    // GitHub's `X-GitHub-Request-Id`. The PROTOCOLS.md
-                    // logging schema names this `provider_req_id` so
-                    // future providers (GitLab, Gitea, ...) emit the
-                    // same key with their own upstream correlation id.
-                    provider_req_id = provider_req_id.as_ref().map(|p| p.as_str()).unwrap_or(""),
-                    elapsed_ms = elapsed_ms,
-                );
-                result
-            }
-            Err(e) => {
-                info!(
-                    evt = %EventKind::ProviderCallDone,
-                    req_id = %req_id,
-                    out_req_id = %out_req_id,
-                    status = 0,
-                    provider_req_id = "",
-                    elapsed_ms = elapsed_ms,
-                    error = %e,
-                );
-                Err(e)
+            };
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            match raced {
+                Ok((
+                    CallMeta {
+                        status,
+                        provider_req_id,
+                    },
+                    result,
+                )) => {
+                    info!(
+                        evt = %EventKind::ProviderCallDone,
+                        status = status,
+                        // GitHub's `X-GitHub-Request-Id`. The
+                        // PROTOCOLS.md logging schema names this
+                        // `provider_req_id` so future providers
+                        // (GitLab, Gitea, ...) emit the same key
+                        // with their own upstream correlation id.
+                        provider_req_id = provider_req_id.as_ref().map(|p| p.as_str()).unwrap_or(""),
+                        elapsed_ms = elapsed_ms,
+                    );
+                    result
+                }
+                Err(e) => {
+                    info!(
+                        evt = %EventKind::ProviderCallDone,
+                        status = 0,
+                        provider_req_id = "",
+                        elapsed_ms = elapsed_ms,
+                        error = %e,
+                    );
+                    Err(e)
+                }
             }
         }
+        .instrument(span)
+        .await
     }
 
     /// Mint a scratch metadata-only installation token, hand it to
@@ -525,17 +529,16 @@ impl GitHubProvider {
     /// Documented asymmetry.
     async fn with_metadata_token<T>(
         &self,
-        req_id: &ReqId,
         work: impl AsyncFnOnce(&str) -> Result<T, GithubError>,
     ) -> Result<T, GithubError> {
-        let (token, _expires) = self.mint_metadata_token(req_id).await?;
+        let (token, _expires) = self.mint_metadata_token().await?;
         let result = work(&token).await;
         // Best-effort `DELETE /installation/token`: failures are
         // already logged as `provider_call_done` breadcrumbs; we
         // discard them here because the caller has already finished
         // with the token and the worst case is the token sticks
         // around for its natural 1-hour TTL.
-        let _ = self.revoke_install_token(req_id, &token).await;
+        let _ = self.revoke_install_token(&token).await;
         result
     }
 
@@ -544,9 +547,8 @@ impl GitHubProvider {
     /// `Response` *before* consuming the body — only `run_call`'s shape
     /// (handing `Response` to the closure intact) makes that ordering
     /// expressible without rebuilding the breadcrumb plumbing inline.
-    pub async fn selfcheck(&self, req_id: &ReqId) -> Result<SelfcheckData, GithubError> {
+    pub async fn selfcheck(&self) -> Result<SelfcheckData, GithubError> {
         self.run_call(
-            req_id,
             "selfcheck",
             self.selfcheck_timeout,
             async |out_req_id| {
@@ -591,13 +593,11 @@ impl GitHubProvider {
 
     async fn resolve_repo_id(
         &self,
-        req_id: &ReqId,
         install_token: &str,
         owner: &str,
         repo: &str,
     ) -> Result<RepoId, GithubError> {
         self.run_call(
-            req_id,
             "resolve_repo_id",
             self.request_timeout,
             async |out_req_id| {
@@ -636,12 +636,8 @@ impl GitHubProvider {
     /// `/repos/{owner}/{repo}` lookup that precedes the actual
     /// narrow-scope mint. Returns `(token, expires_at)`; `expires_at`
     /// is only used by the breadcrumb log on the caller's side.
-    async fn mint_metadata_token(
-        &self,
-        req_id: &ReqId,
-    ) -> Result<(String, SystemTime), GithubError> {
+    async fn mint_metadata_token(&self) -> Result<(String, SystemTime), GithubError> {
         self.run_call(
-            req_id,
             "mint_metadata_token",
             self.request_timeout,
             async |out_req_id| {
@@ -669,9 +665,8 @@ impl GitHubProvider {
         .await
     }
 
-    async fn mint_token(&self, req_id: &ReqId, repo_id: RepoId) -> Result<MintData, GithubError> {
+    async fn mint_token(&self, repo_id: RepoId) -> Result<MintData, GithubError> {
         self.run_call(
-            req_id,
             "mint_token",
             self.request_timeout,
             async |out_req_id| {
@@ -724,9 +719,8 @@ impl GitHubProvider {
     /// `DELETE /installation/token` — revokes the currently-held
     /// installation access token. Used by `with_metadata_token` to
     /// narrow the leak window on the broadly-scoped metadata token.
-    async fn revoke_install_token(&self, req_id: &ReqId, token: &str) -> Result<(), GithubError> {
+    async fn revoke_install_token(&self, token: &str) -> Result<(), GithubError> {
         self.run_call(
-            req_id,
             "revoke_install_token",
             self.request_timeout,
             async |out_req_id| {
@@ -931,8 +925,8 @@ impl Provider for GitHubProvider {
         self.host()
     }
 
-    async fn mint(&self, req_id: &ReqId, path: &str) -> Result<AbstractMintOutcome, ProviderError> {
-        let data = GitHubProvider::mint(self, req_id, path).await?;
+    async fn mint(&self, path: &str) -> Result<AbstractMintOutcome, ProviderError> {
+        let data = GitHubProvider::mint(self, path).await?;
         Ok(AbstractMintOutcome {
             response: data.response,
             out_req_id: data.out_req_id,
@@ -940,8 +934,8 @@ impl Provider for GitHubProvider {
         })
     }
 
-    async fn selfcheck(&self, req_id: &ReqId) -> Result<AbstractSelfcheckOutcome, ProviderError> {
-        let data = GitHubProvider::selfcheck(self, req_id).await?;
+    async fn selfcheck(&self) -> Result<AbstractSelfcheckOutcome, ProviderError> {
+        let data = GitHubProvider::selfcheck(self).await?;
         Ok(AbstractSelfcheckOutcome {
             out_req_id: data.out_req_id,
             provider_req_id: data.provider_req_id,

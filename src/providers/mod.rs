@@ -45,8 +45,8 @@ pub enum ProviderError {
     #[error("forbidden: {body}")]
     Forbidden { body: String },
 
-    #[error("repository '{path}' not found or credential lacks access")]
-    RepoNotFound { path: String },
+    #[error("repository not found or credential lacks access")]
+    RepoNotFound,
 
     #[error("rate limited")]
     RateLimited {

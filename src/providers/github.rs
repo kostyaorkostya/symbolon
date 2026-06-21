@@ -132,8 +132,8 @@ pub enum GithubError {
     Unauthorized { body: String },
     #[error("forbidden (403): {body}")]
     Forbidden { body: String },
-    #[error("repository '{path}' not found or App lacks access")]
-    RepoNotFound { path: String },
+    #[error("repository not found or App lacks access")]
+    RepoNotFound,
     #[error("rate limited (429)")]
     RateLimited {
         /// Server-suggested wait time before retry, parsed from the
@@ -209,7 +209,7 @@ impl From<GithubError> for ProviderError {
             GithubError::Http(src) => Self::Transport(Box::new(src)),
             GithubError::Unauthorized { body } => Self::Unauthorized { body },
             GithubError::Forbidden { body } => Self::Forbidden { body },
-            GithubError::RepoNotFound { path } => Self::RepoNotFound { path },
+            GithubError::RepoNotFound => Self::RepoNotFound,
             GithubError::RateLimited { retry_after } => Self::RateLimited { retry_after },
             GithubError::OtherStatus(s) => Self::UnexpectedStatus { status: s },
             GithubError::MalformedPath(p) => Self::MalformedPath { path: p },
@@ -407,15 +407,14 @@ impl GitHubProvider {
                 .await
             })
             .await?;
-
         self.with_breadcrumbs(req_id, "mint_token", self.request_timeout, async |out| {
-            self.mint_token_inner(out, repo_id, path).await
+            self.mint_token_inner(out, repo_id).await
         })
         .await
         .inspect_err(|e| {
             // Repo deleted/recreated since the resolve — drop the
             // cached id so the next mint re-resolves.
-            if matches!(e, GithubError::RepoNotFound { .. }) {
+            if matches!(e, GithubError::RepoNotFound) {
                 self.repo_ids.invalidate(&key);
             }
         })
@@ -466,20 +465,25 @@ impl GitHubProvider {
         };
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         match raced {
-            Ok(pc) => {
+            Ok(ProviderCall {
+                status,
+                provider_req_id,
+                retry_after: _,
+                result,
+            }) => {
                 info!(
                     evt = %EventKind::ProviderCallDone,
                     req_id = %req_id,
                     out_req_id = %out_req_id,
-                    status = pc.status,
+                    status = status,
                     // GitHub's `X-GitHub-Request-Id`. The PROTOCOLS.md
                     // logging schema names this `provider_req_id` so
                     // future providers (GitLab, Gitea, ...) emit the
                     // same key with their own upstream correlation id.
-                    provider_req_id = pc.provider_req_id.as_ref().map(|p| p.as_str()).unwrap_or(""),
+                    provider_req_id = provider_req_id.as_ref().map(|p| p.as_str()).unwrap_or(""),
                     elapsed_ms = elapsed_ms,
                 );
-                pc.result
+                result
             }
             Err(e) => {
                 info!(
@@ -709,9 +713,7 @@ impl GitHubProvider {
                         detail: "json",
                     })
             }
-            404 => Err(GithubError::RepoNotFound {
-                path: format!("{owner}/{repo}"),
-            }),
+            404 => Err(GithubError::RepoNotFound),
             s => Err(GithubError::from_common_status(s, &body, m.retry_after)),
         })
     }
@@ -755,7 +757,6 @@ impl GitHubProvider {
         &self,
         out_req_id: OutReqId,
         repo_id: RepoId,
-        path: &str,
     ) -> ProviderCall<MintData> {
         let jwt = match self.sign_jwt_now().await {
             Ok(j) => j,
@@ -795,9 +796,7 @@ impl GitHubProvider {
                     provider_req_id: m.provider_req_id.cloned(),
                 })
             }
-            404 => Err(GithubError::RepoNotFound {
-                path: path.to_string(),
-            }),
+            404 => Err(GithubError::RepoNotFound),
             s => Err(GithubError::from_common_status(s, &bytes, m.retry_after)),
         })
     }

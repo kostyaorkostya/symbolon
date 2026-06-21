@@ -522,9 +522,9 @@ async fn handle_selfcheck(
 
 fn error_response_from_provider(err: &ProviderError) -> serde_json::Value {
     let (code, msg) = match err {
-        ProviderError::RepoNotFound { path } => (
+        ProviderError::RepoNotFound => (
             "repo_not_accessible",
-            format!("repository '{path}' not found or credential lacks access"),
+            "repository not found or credential lacks access".to_string(),
         ),
         ProviderError::Unauthorized { body } => ("provider_4xx", format!("unauthorized: {body}")),
         ProviderError::Forbidden { body } => ("provider_4xx", format!("forbidden: {body}")),

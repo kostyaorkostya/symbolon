@@ -171,9 +171,7 @@ async fn resolve_returns_404() {
         .mint(&ReqId::from("test-req"), &format!("{OWNER}/{REPO}"))
         .await
         .unwrap_err();
-    assert!(
-        matches!(err, GithubError::RepoNotFound { ref path } if path == &format!("{OWNER}/{REPO}"))
-    );
+    assert!(matches!(err, GithubError::RepoNotFound));
 }
 
 #[compio::test]
@@ -366,7 +364,7 @@ async fn mint_invalidates_on_404() {
         .mint(&ReqId::from("test-req"), &format!("{OWNER}/{REPO}"))
         .await
         .unwrap_err();
-    assert!(matches!(err, GithubError::RepoNotFound { .. }));
+    assert!(matches!(err, GithubError::RepoNotFound));
 
     drop(second_narrow);
 

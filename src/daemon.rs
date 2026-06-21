@@ -836,7 +836,7 @@ async fn handle_connection(mut stream: TcpStream, req_id: ReqId, state: Rc<Share
                         // RepoNotFound at mint-time = the provider just
                         // invalidated a (possibly cached) repo handle; surface
                         // that as a distinct event per PROTOCOLS.md.
-                        if matches!(e, ProviderError::RepoNotFound { .. }) {
+                        if matches!(e, ProviderError::RepoNotFound) {
                             info!(
                                 req_id = %req_id,
                                 evt = %EventKind::CacheInvalidated,
@@ -1073,7 +1073,7 @@ fn log_mint_error(
     err: ProviderError,
 ) {
     match &err {
-        ProviderError::RepoNotFound { .. } => {
+        ProviderError::RepoNotFound => {
             warn!(
                 req_id = %req_id,
                 evt = %EventKind::MintDenied,

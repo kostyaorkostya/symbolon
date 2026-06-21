@@ -407,25 +407,22 @@ impl GitHubProvider {
         self.signer.sign(claims).await
     }
 
-    /// Apply the GitHub-standard request headers (Bearer, Accept,
-    /// X-GitHub-Api-Version, User-Agent, X-Request-Id,
-    /// X-Github-Request-Timeout). Caller supplies `req` already
-    /// pointed at the URL via `self.client.{get,post,delete}(url)?`
-    /// and chains `.body(...)` + content-type afterwards if needed.
+    /// Apply the GitHub-standard request headers that depend only
+    /// on the endpoint (Bearer, Accept, X-GitHub-Api-Version,
+    /// User-Agent). Per-call headers (X-Request-Id, request-timeout)
+    /// are appended by `run_call` after the `build` closure returns,
+    /// so build closures don't have to thread `out_req_id` /
+    /// `timeout` through their own signatures.
     fn apply_standard_headers(
         &self,
         req: cyper::RequestBuilder,
         bearer: &str,
-        out_req_id: &OutReqId,
-        timeout: Duration,
     ) -> Result<cyper::RequestBuilder, GithubError> {
         Ok(req
             .bearer_auth(bearer)?
             .header("accept", ACCEPT_HEADER)?
             .header("x-github-api-version", GITHUB_API_VERSION)?
-            .header("user-agent", &self.user_agent)?
-            .header(X_REQUEST_ID_HEADER, out_req_id.as_str())?
-            .header(REQUEST_TIMEOUT_HEADER, timeout.as_secs())?)
+            .header("user-agent", &self.user_agent)?)
     }
 
     /// Run one outbound HTTPS call end-to-end:
@@ -446,7 +443,7 @@ impl GitHubProvider {
         &self,
         endpoint: &'static str,
         timeout: Duration,
-        build: impl AsyncFnOnce(&OutReqId) -> Result<cyper::RequestBuilder, GithubError>,
+        build: impl AsyncFnOnce() -> Result<cyper::RequestBuilder, GithubError>,
         handle: impl AsyncFnOnce(cyper::Response, &CallMeta, &OutReqId) -> Result<T, GithubError>,
     ) -> Result<T, GithubError> {
         use tracing::Instrument;
@@ -467,7 +464,15 @@ impl GitHubProvider {
             let raced = futures_util::select_biased! {
                 _ = self.cancel.clone().wait().fuse() => Err(GithubError::Cancelled),
                 r = compio::time::timeout(timeout, async {
-                    let resp = build(&out_req_id).await?.send().await?;
+                    // Apply per-call headers (X-Request-Id +
+                    // request-timeout) here so build closures stay
+                    // free of `&OutReqId` / `timeout` plumbing.
+                    let resp = build()
+                        .await?
+                        .header(X_REQUEST_ID_HEADER, out_req_id.as_str())?
+                        .header(REQUEST_TIMEOUT_HEADER, timeout.as_secs())?
+                        .send()
+                        .await?;
                     let meta = CallMeta {
                         status: resp.status().as_u16(),
                         provider_req_id: Self::read_provider_req_id(&resp),
@@ -551,10 +556,10 @@ impl GitHubProvider {
         self.run_call(
             "selfcheck",
             self.selfcheck_timeout,
-            async |out_req_id| {
+            async || {
                 let jwt = self.sign_jwt_now().await?;
                 let req = self.client.get(format!("{}/app", self.api_base))?;
-                self.apply_standard_headers(req, &jwt, out_req_id, self.selfcheck_timeout)
+                self.apply_standard_headers(req, &jwt)
             },
             async |resp, meta, out_req_id| {
                 // HTTP `Date` header (RFC 7231 § 7.1.1.1) parsed via
@@ -600,14 +605,14 @@ impl GitHubProvider {
         self.run_call(
             "resolve_repo_id",
             self.request_timeout,
-            async |out_req_id| {
+            async || {
                 // `owner` / `repo` already came through `RepoPath::parse`,
                 // so they're guaranteed `[A-Za-z0-9._-]+` and need no
                 // URL-escaping.
                 let req = self
                     .client
                     .get(format!("{}/repos/{owner}/{repo}", self.api_base))?;
-                self.apply_standard_headers(req, install_token, out_req_id, self.request_timeout)
+                self.apply_standard_headers(req, install_token)
             },
             async |resp, meta, _out_req_id| {
                 #[derive(Deserialize)]
@@ -640,14 +645,14 @@ impl GitHubProvider {
         self.run_call(
             "mint_metadata_token",
             self.request_timeout,
-            async |out_req_id| {
+            async || {
                 let jwt = self.sign_jwt_now().await?;
                 let req = self.client.post(format!(
                     "{}/app/installations/{}/access_tokens",
                     self.api_base, self.installation_id
                 ))?;
                 Ok(self
-                    .apply_standard_headers(req, &jwt, out_req_id, self.request_timeout)?
+                    .apply_standard_headers(req, &jwt)?
                     .header("content-type", "application/json")?
                     .body(Bytes::from_static(
                         br#"{"permissions":{"metadata":"read"}}"#,
@@ -669,7 +674,7 @@ impl GitHubProvider {
         self.run_call(
             "mint_token",
             self.request_timeout,
-            async |out_req_id| {
+            async || {
                 let jwt = self.sign_jwt_now().await?;
                 let req = self.client.post(format!(
                     "{}/app/installations/{}/access_tokens",
@@ -679,7 +684,7 @@ impl GitHubProvider {
                 // set (AGENTS.md invariants #4, #5). Wire bytes pinned by
                 // `tests::mint_request_headers_and_body_exact` (integration).
                 Ok(self
-                    .apply_standard_headers(req, &jwt, out_req_id, self.request_timeout)?
+                    .apply_standard_headers(req, &jwt)?
                     .header("content-type", "application/json")?
                     .body(Bytes::from(format!(
                         r#"{{"repository_ids":[{repo_id}],"permissions":{{"contents":"write","metadata":"read"}}}}"#
@@ -723,11 +728,11 @@ impl GitHubProvider {
         self.run_call(
             "revoke_install_token",
             self.request_timeout,
-            async |out_req_id| {
+            async || {
                 let req = self
                     .client
                     .delete(format!("{}/installation/token", self.api_base))?;
-                self.apply_standard_headers(req, token, out_req_id, self.request_timeout)
+                self.apply_standard_headers(req, token)
             },
             async |resp, meta, _| match meta.status {
                 204 => Ok(()),

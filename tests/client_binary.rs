@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use symbolon::transport::{self, frame, parse_prelude, MAX_MESSAGE_SIZE};
+use symbolon::transport::{self, MAX_MESSAGE_SIZE, frame, parse_prelude};
 
 const PSK_HEX: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const PSK_BYTES: [u8; 32] = [0xaa; 32];

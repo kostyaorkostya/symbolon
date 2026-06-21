@@ -320,23 +320,22 @@ impl GitHubProvider {
             .unwrap_or_else(|| cfg.api_base.clone())
             .trim_end_matches('/')
             .to_string();
-
-        // Same-origin redirect policy: HTTPS to api.github.com may
-        // redirect within api.github.com, never elsewhere. Off-host
-        // redirects would carry the App JWT off-domain.
-        let api_host = Url::parse(&api_base)
-            .ok()
-            .and_then(|u| u.host_str().map(str::to_owned))
-            .ok_or_else(|| GithubError::MalformedPath(format!("api_base={api_base}")))?;
-        let policy = redirect::Policy::custom(move |attempt| {
-            if attempt.url().host_str() == Some(&api_host) {
-                attempt.follow()
-            } else {
-                attempt.stop()
-            }
-        });
-        let client = cyper::Client::builder().redirect(policy).build()?;
-
+        let client = {
+            // Same-origin redirect policy: HTTPS to api.github.com may
+            // redirect within api.github.com, never elsewhere. Off-host
+            // redirects would carry the App JWT off-domain.
+            let bad_base = || GithubError::MalformedPath(format!("api_base={api_base}"));
+            let url = Url::parse(&api_base).map_err(|_| bad_base())?;
+            let api_host = url.host_str().ok_or_else(bad_base)?.to_owned();
+            let policy = redirect::Policy::custom(move |attempt| {
+                if attempt.url().host_str() == Some(&api_host) {
+                    attempt.follow()
+                } else {
+                    attempt.stop()
+                }
+            });
+            cyper::Client::builder().redirect(policy).build()?
+        };
         let signer = JwtSigner {
             worker: cpu_worker,
             key,
@@ -380,17 +379,32 @@ impl GitHubProvider {
     }
 
     pub async fn mint(&self, req_id: &ReqId, path: &str) -> Result<MintData, GithubError> {
-        let parsed = RepoPath::parse(path)?;
+        let RepoPath { owner, repo } = RepoPath::parse(path)?;
         let key = format!(
             "{}/{}",
-            parsed.owner().to_ascii_lowercase(),
-            parsed.repo().to_ascii_lowercase()
+            owner.to_ascii_lowercase(),
+            repo.to_ascii_lowercase()
         );
         let repo_id = self
             .repo_ids
             .with(&key, async || {
-                self.resolve_repo_id(req_id, parsed.owner(), parsed.repo())
+                // Repo-scoped reads on `GET /repos/{owner}/{repo}` require an
+                // **installation access token**; the raw App JWT only
+                // authenticates App-level endpoints (`/app`,
+                // `/app/installations/...`). Mint a metadata-only
+                // installation token first, then use it as the bearer for
+                // the actual repo lookup. Logged as two distinct
+                // `provider_call` breadcrumbs.
+                self.with_metadata_token(req_id, async |token| {
+                    self.with_breadcrumbs(
+                        req_id,
+                        "resolve_repo_id",
+                        self.request_timeout,
+                        async |out| self.resolve_repo_id_inner(out, token, owner, repo).await,
+                    )
                     .await
+                })
+                .await
             })
             .await?;
 
@@ -487,12 +501,9 @@ impl GitHubProvider {
         self.signer.sign(claims).await
     }
 
-    /// Build a `RequestBuilder` with the shared GitHub headers
-    /// (Accept, API-Version, User-Agent, X-Request-ID,
-    /// Request-Timeout) and bearer auth applied. If `json_body`
-    /// is `Some` (applies to either method), the builder also
-    /// sets `Content-Type: application/json` and attaches the body.
-    fn build_request(
+    /// Build and dispatch a request, returning the raw `Response`.
+    /// Pre-body-read errors surface here.
+    async fn send_authenticated(
         &self,
         method: Method,
         url: &str,
@@ -500,7 +511,7 @@ impl GitHubProvider {
         json_body: Option<Vec<u8>>,
         out_req_id: &OutReqId,
         timeout: Duration,
-    ) -> Result<cyper::RequestBuilder, cyper::Error> {
+    ) -> Result<cyper::Response, GithubError> {
         let mut req = match method {
             Method::Get => self.client.get(url),
             Method::Post => self.client.post(url),
@@ -515,23 +526,6 @@ impl GitHubProvider {
         if let Some(body) = json_body {
             req = req.header("content-type", "application/json")?.body(body);
         }
-        Ok(req)
-    }
-
-    /// Build and dispatch a request, returning the raw `Response`.
-    /// Pre-body-read errors surface here.
-    async fn send_authenticated(
-        &self,
-        method: Method,
-        url: &str,
-        bearer: &str,
-        json_body: Option<Vec<u8>>,
-        out_req_id: &OutReqId,
-        timeout: Duration,
-    ) -> Result<cyper::Response, GithubError> {
-        let req = self
-            .build_request(method, url, bearer, json_body, out_req_id, timeout)
-            .map_err(GithubError::from)?;
         req.send().await.map_err(GithubError::from)
     }
 
@@ -561,31 +555,6 @@ impl GitHubProvider {
             retry_after: Self::read_retry_after(&resp),
             result: resp.bytes().await.map_err(GithubError::from),
         }
-    }
-
-    async fn resolve_repo_id(
-        &self,
-        req_id: &ReqId,
-        owner: &str,
-        repo: &str,
-    ) -> Result<RepoId, GithubError> {
-        // Repo-scoped reads on `GET /repos/{owner}/{repo}` require an
-        // **installation access token**; the raw App JWT only
-        // authenticates App-level endpoints (`/app`,
-        // `/app/installations/...`). Mint a metadata-only
-        // installation token first, then use it as the bearer for
-        // the actual repo lookup. Logged as two distinct
-        // `provider_call` breadcrumbs.
-        self.with_metadata_token(req_id, async |token| {
-            self.with_breadcrumbs(
-                req_id,
-                "resolve_repo_id",
-                self.request_timeout,
-                async |out| self.resolve_repo_id_inner(out, token, owner, repo).await,
-            )
-            .await
-        })
-        .await
     }
 
     /// Mint a scratch metadata-only installation token, hand it to
@@ -622,36 +591,29 @@ impl GitHubProvider {
                 req_id,
                 "revoke_install_token",
                 self.request_timeout,
-                async |out| self.revoke_token_inner(out, &token).await,
+                async |out_req_id| {
+                    self.http_call(
+                        Method::Delete,
+                        &format!("{}/installation/token", self.api_base),
+                        &token,
+                        None,
+                        &out_req_id,
+                        self.request_timeout,
+                    )
+                    .await
+                    .map_with_meta(|_, m| match m.status {
+                        // 204 No Content = revoked.
+                        204 => Ok(()),
+                        s => Err(GithubError::from_common_status(
+                            s,
+                            &Bytes::new(),
+                            m.retry_after,
+                        )),
+                    })
+                },
             )
             .await;
         result
-    }
-
-    async fn revoke_token_inner(
-        &self,
-        out_req_id: OutReqId,
-        install_token: &str,
-    ) -> ProviderCall<()> {
-        let url = format!("{}/installation/token", self.api_base);
-        self.http_call(
-            Method::Delete,
-            &url,
-            install_token,
-            None,
-            &out_req_id,
-            self.request_timeout,
-        )
-        .await
-        .map_with_meta(|_, m| match m.status {
-            // 204 No Content = revoked.
-            204 => Ok(()),
-            s => Err(GithubError::from_common_status(
-                s,
-                &Bytes::new(),
-                m.retry_after,
-            )),
-        })
     }
 
     /// `GET /app` to verify reachability + key/App pairing.
@@ -664,13 +626,12 @@ impl GitHubProvider {
     async fn selfcheck_inner(&self, out_req_id: OutReqId) -> ProviderCall<SelfcheckData> {
         let mut status: u16 = 0;
         let mut provider_req_id: Option<ProviderReqId> = None;
-        let result: Result<SelfcheckData, GithubError> = async {
+        let result = async {
             let jwt = self.sign_jwt_now().await?;
-            let url = format!("{}/app", self.api_base);
             let resp = self
                 .send_authenticated(
                     Method::Get,
-                    &url,
+                    &format!("{}/app", self.api_base),
                     &jwt,
                     None,
                     &out_req_id,
@@ -695,9 +656,9 @@ impl GitHubProvider {
             if status != 200 {
                 return Err(GithubError::from_common_status(status, &body, retry_after));
             }
-            let client_id = Self::check_app_identity(&body, &self.client_id)?;
+            Self::check_app_identity(&body, &self.client_id)?;
             Ok(SelfcheckData {
-                client_id,
+                client_id: self.client_id.clone(),
                 installation_id: self.installation_id,
                 api_base: self.api_base.clone(),
                 clock_skew_sec,
@@ -726,18 +687,16 @@ impl GitHubProvider {
     ) -> ProviderCall<RepoId> {
         // `owner` / `repo` already came through `RepoPath::parse`, so
         // they're guaranteed `[A-Za-z0-9._-]+` and need no URL-escaping.
-        let url = format!("{}/repos/{owner}/{repo}", self.api_base);
-        let call = self
-            .http_call(
-                Method::Get,
-                &url,
-                install_token,
-                None,
-                &out_req_id,
-                self.request_timeout,
-            )
-            .await;
-        call.map_with_meta(|body, m| match m.status {
+        self.http_call(
+            Method::Get,
+            &format!("{}/repos/{owner}/{repo}", self.api_base),
+            install_token,
+            None,
+            &out_req_id,
+            self.request_timeout,
+        )
+        .await
+        .map_with_meta(|body, m| match m.status {
             200 => {
                 #[derive(Deserialize)]
                 struct Resp {
@@ -768,10 +727,6 @@ impl GitHubProvider {
             Ok(j) => j,
             Err(e) => return ProviderCall::pre_send(e),
         };
-        let url = format!(
-            "{}/app/installations/{}/access_tokens",
-            self.api_base, self.installation_id
-        );
         // Inline body: metadata-only installation token, no `repository_ids`
         // — `GET /repos/{owner}/{repo}` accepts installation tokens but not
         // the App JWT, so we mint a broad one for the lookup. We discard the
@@ -780,7 +735,10 @@ impl GitHubProvider {
         // could matter.
         self.http_call(
             Method::Post,
-            &url,
+            &format!(
+                "{}/app/installations/{}/access_tokens",
+                self.api_base, self.installation_id
+            ),
             &jwt,
             Some(br#"{"permissions":{"metadata":"read"}}"#.to_vec()),
             &out_req_id,
@@ -803,22 +761,17 @@ impl GitHubProvider {
             Ok(j) => j,
             Err(e) => return ProviderCall::pre_send(e),
         };
-        let url = format!(
-            "{}/app/installations/{}/access_tokens",
-            self.api_base, self.installation_id
-        );
         // Per-mint body: exactly one repo, hard-coded permission set
         // (AGENTS.md invariants #4, #5). Wire bytes pinned by
         // `tests::mint_request_headers_and_body_exact` (integration).
-        let body = format!(
-            r#"{{"repository_ids":[{repo_id}],"permissions":{{"contents":"write","metadata":"read"}}}}"#
-        )
-        .into_bytes();
         self.http_call(
             Method::Post,
-            &url,
+            &format!(
+                "{}/app/installations/{}/access_tokens",
+                self.api_base, self.installation_id
+            ),
             &jwt,
-            Some(body),
+            Some(format!(r#"{{"repository_ids":[{repo_id}],"permissions":{{"contents":"write","metadata":"read"}}}}"#).into_bytes()),
             &out_req_id,
             self.request_timeout,
         )
@@ -828,6 +781,12 @@ impl GitHubProvider {
                 let (token, expires_at) = Self::parse_mint_response(&bytes)?;
                 Ok(MintData {
                     response: git_credential::Response {
+                        // GitHub-specific sentinel: when the username on a
+                        // git HTTPS clone is the literal `x-access-token`,
+                        // the password is interpreted as an installation
+                        // access token (vs a personal access token or OAuth
+                        // token). Documented in GitHub Apps "Authenticating
+                        // as an installation".
                         username: "x-access-token".to_string(),
                         password: token,
                         password_expiry_utc: expires_at,
@@ -1012,10 +971,9 @@ impl GitHubProvider {
     }
 
     /// Parse `GET /app`'s body and verify the reported `client_id`
-    /// matches the configured one (`expected`). Returns the
-    /// confirmed `client_id` on success so the caller can fold it
-    /// into `SelfcheckData` without re-parsing.
-    fn check_app_identity(body: &[u8], expected: &str) -> Result<String, GithubError> {
+    /// matches the configured one (`expected`). Returns `Ok(())` on
+    /// match; the caller already has `expected` in hand.
+    fn check_app_identity(body: &[u8], expected: &str) -> Result<(), GithubError> {
         #[derive(Deserialize)]
         struct App {
             client_id: String,
@@ -1030,7 +988,7 @@ impl GitHubProvider {
                 reported: app.client_id,
             });
         }
-        Ok(app.client_id)
+        Ok(())
     }
 
     fn parse_mint_response(bytes: &[u8]) -> Result<(String, SystemTime), GithubError> {
@@ -1086,14 +1044,6 @@ impl<'a> RepoPath<'a> {
             return Err(GithubError::MalformedPath(path.to_string()));
         }
         Ok(Self { owner, repo })
-    }
-
-    fn owner(&self) -> &'a str {
-        self.owner
-    }
-
-    fn repo(&self) -> &'a str {
-        self.repo
     }
 }
 
@@ -1264,9 +1214,9 @@ mod tests {
 
     #[test]
     fn repo_path_parse_ok() {
-        let p = RepoPath::parse("octocat/Hello-World").unwrap();
-        assert_eq!(p.owner(), "octocat");
-        assert_eq!(p.repo(), "Hello-World");
+        let RepoPath { owner, repo } = RepoPath::parse("octocat/Hello-World").unwrap();
+        assert_eq!(owner, "octocat");
+        assert_eq!(repo, "Hello-World");
     }
 
     #[test]

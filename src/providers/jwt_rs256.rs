@@ -2,13 +2,13 @@
 //! `alg = "RS256"`. The only JOSE algorithm the GitHub provider
 //! uses. Header format is fixed at `{"typ":"JWT","alg":"RS256"}`.
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use rsa::RsaPrivateKey;
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs1v15::SigningKey;
 use rsa::pkcs8::DecodePrivateKey;
 use rsa::signature::{SignatureEncoding, Signer};
-use rsa::RsaPrivateKey;
 use serde::Serialize;
 use sha2::Sha256;
 

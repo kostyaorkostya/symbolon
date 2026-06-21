@@ -36,7 +36,7 @@
 //! client identity is being used, but without the PSK they can't impersonate
 //! or decrypt anything.
 
-use snow::{params::NoiseParams, Builder, HandshakeState, TransportState};
+use snow::{Builder, HandshakeState, TransportState, params::NoiseParams};
 
 /// `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s`. NN (no static keys), `psk0` mixes
 /// the pre-shared key before the handshake; 1-RTT.

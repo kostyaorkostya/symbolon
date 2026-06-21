@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use derive_more::From;
 
-use crate::transport::{is_identity_byte, MAX_IDENTITY_LEN};
+use crate::transport::{MAX_IDENTITY_LEN, is_identity_byte};
 
 const PSK_LEN: usize = 32;
 

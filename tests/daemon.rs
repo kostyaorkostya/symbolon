@@ -34,7 +34,6 @@ async fn daemon_happy_path() {
         "response: {body:?}"
     );
     assert!(body.starts_with("username=x-access-token\n"));
-
 }
 
 #[compio::test]
@@ -58,7 +57,6 @@ async fn daemon_rejects_unknown_identity() {
         resp.len(),
         String::from_utf8_lossy(&resp),
     );
-
 }
 
 #[compio::test]
@@ -81,7 +79,6 @@ async fn daemon_rejects_wrong_psk() {
         resp.is_empty(),
         "wrong PSK must close the connection, got: {resp:?}"
     );
-
 }
 
 #[compio::test]
@@ -97,7 +94,6 @@ async fn daemon_rejects_unknown_host() {
     let req = b"protocol=https\nhost=evil.example\npath=foo/bar\n\n";
     let resp = client_handshake_and_read_eof(addr, "vm-1", TEST_PSK, req).await;
     assert!(resp.is_empty(), "expected EOF, got: {resp:?}");
-
 }
 
 #[compio::test]
@@ -114,7 +110,6 @@ async fn daemon_rejects_malformed_request() {
     let req = b"protocol=https\nhost=github.com\n\n";
     let resp = client_handshake_and_read_eof(addr, "vm-1", TEST_PSK, req).await;
     assert!(resp.is_empty(), "expected EOF, got: {resp:?}");
-
 }
 
 // End-to-end Clone2Leak defence: a request with an embedded CR byte
@@ -136,5 +131,4 @@ async fn daemon_rejects_cr_in_host_value() {
         resp.is_empty(),
         "CR in value must close the connection without a response"
     );
-
 }

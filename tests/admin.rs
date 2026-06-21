@@ -80,7 +80,6 @@ async fn admin_enroll_persists_to_clients_json_and_psk_file() {
 
     let listed = admin_request(&paths.admin, serde_json::json!({"op": "list"})).await;
     assert_eq!(listed["clients"].as_array().unwrap().len(), 1);
-
 }
 
 #[compio::test]
@@ -109,7 +108,6 @@ async fn admin_enroll_appends_without_clobbering_existing() {
         "lost pre-existing entry: {psk_text}"
     );
     assert!(psk_text.contains("vm-1:"), "missing new entry: {psk_text}");
-
 }
 
 #[compio::test]
@@ -193,7 +191,6 @@ async fn admin_revoke_removes_psk_entry_and_updates_clients() {
 
     let listed = admin_request(&paths.admin, serde_json::json!({"op": "list"})).await;
     assert!(listed["clients"].as_array().unwrap().is_empty());
-
 }
 
 #[compio::test]

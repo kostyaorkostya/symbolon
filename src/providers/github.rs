@@ -512,13 +512,12 @@ impl GitHubProvider {
         method: Method,
         url: &str,
         bearer: &str,
-        json_body: Option<Vec<u8>>,
         out_req_id: &OutReqId,
         timeout: Duration,
     ) -> Result<cyper::Response, GithubError> {
-        let mut req = match method {
+        let mut req = match &method {
             Method::Get => self.client.get(url),
-            Method::Post => self.client.post(url),
+            Method::Post(_) => self.client.post(url),
             Method::Delete => self.client.delete(url),
         }?
         .bearer_auth(bearer)?
@@ -527,10 +526,10 @@ impl GitHubProvider {
         .header("user-agent", &self.user_agent)?
         .header(X_REQUEST_ID_HEADER, out_req_id.as_str())?
         .header(REQUEST_TIMEOUT_HEADER, timeout.as_secs())?;
-        if let Some(body) = json_body {
+        if let Method::Post(body) = method {
             req = req.header("content-type", "application/json")?.body(body);
         }
-        req.send().await.map_err(GithubError::from)
+        Ok(req.send().await?)
     }
 
     /// Send a request and read the response body. Returns the raw
@@ -542,12 +541,11 @@ impl GitHubProvider {
         method: Method,
         url: &str,
         bearer: &str,
-        json_body: Option<Vec<u8>>,
         out_req_id: &OutReqId,
         timeout: Duration,
     ) -> ProviderCall<Bytes> {
         let resp = match self
-            .send_authenticated(method, url, bearer, json_body, out_req_id, timeout)
+            .send_authenticated(method, url, bearer, out_req_id, timeout)
             .await
         {
             Ok(r) => r,
@@ -600,7 +598,6 @@ impl GitHubProvider {
                         Method::Delete,
                         &format!("{}/installation/token", self.api_base),
                         &token,
-                        None,
                         &out_req_id,
                         self.request_timeout,
                     )
@@ -637,7 +634,6 @@ impl GitHubProvider {
                     Method::Get,
                     &format!("{}/app", self.api_base),
                     &jwt,
-                    None,
                     &out_req_id,
                     self.selfcheck_timeout,
                 )
@@ -695,7 +691,6 @@ impl GitHubProvider {
             Method::Get,
             &format!("{}/repos/{owner}/{repo}", self.api_base),
             install_token,
-            None,
             &out_req_id,
             self.request_timeout,
         )
@@ -706,6 +701,12 @@ impl GitHubProvider {
                 struct Resp {
                     id: RepoId,
                 }
+                // cyper's `Response::json()` consumes the response and
+                // can only be called on a 2xx body — we'd lose access
+                // to the raw bytes that `from_common_status` needs to
+                // pull a `message` out of a 4xx GitHub error envelope.
+                // Reading bytes once into `ProviderCall<Bytes>` and
+                // deserialising at the endpoint covers both paths.
                 serde_json::from_slice::<Resp>(&body)
                     .map(|r| r.id)
                     .map_err(|_| GithubError::ParseResponse {
@@ -736,13 +737,14 @@ impl GitHubProvider {
         // for one call in milliseconds and revoked before the hour-long TTL
         // could matter.
         self.http_call(
-            Method::Post,
+            Method::Post(Bytes::from_static(
+                br#"{"permissions":{"metadata":"read"}}"#,
+            )),
             &format!(
                 "{}/app/installations/{}/access_tokens",
                 self.api_base, self.installation_id
             ),
             &jwt,
-            Some(br#"{"permissions":{"metadata":"read"}}"#.to_vec()),
             &out_req_id,
             self.request_timeout,
         )
@@ -766,13 +768,14 @@ impl GitHubProvider {
         // (AGENTS.md invariants #4, #5). Wire bytes pinned by
         // `tests::mint_request_headers_and_body_exact` (integration).
         self.http_call(
-            Method::Post,
+            Method::Post(Bytes::from(format!(
+                r#"{{"repository_ids":[{repo_id}],"permissions":{{"contents":"write","metadata":"read"}}}}"#
+            ))),
             &format!(
                 "{}/app/installations/{}/access_tokens",
                 self.api_base, self.installation_id
             ),
             &jwt,
-            Some(format!(r#"{{"repository_ids":[{repo_id}],"permissions":{{"contents":"write","metadata":"read"}}}}"#).into_bytes()),
             &out_req_id,
             self.request_timeout,
         )
@@ -810,10 +813,14 @@ const REQUEST_TIMEOUT_HEADER: &str = "request-timeout";
 const X_REQUEST_ID_HEADER: &str = "x-request-id";
 const GH_REQUEST_ID_HEADER: &str = "x-github-request-id";
 
-#[derive(Clone, Copy)]
 enum Method {
     Get,
-    Post,
+    /// POST always carries a JSON body. Folding the body into the
+    /// variant drops the separate `Option<body>` plumbing and makes
+    /// "GET/DELETE have no body, POST always does" a compile-time
+    /// fact. `Bytes` is cheap to construct from either a static
+    /// slice (`Bytes::from_static`) or an owned `String`/`Vec<u8>`.
+    Post(Bytes),
     Delete,
 }
 

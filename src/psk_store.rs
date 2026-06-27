@@ -18,7 +18,6 @@
 //! edited file with garbage doesn't get partially imported.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 
 use derive_more::From;
 
@@ -50,53 +49,34 @@ impl Psk {
     }
 }
 
+/// Failure modes for `PskStore::parse`. None of these variants carry the
+/// PSK file path: the caller knows it (it just read the file). The
+/// `daemon::DaemonError::LoadPsks` wrapper stamps the path once at the
+/// load boundary, so the rendered chain reads "failed to load PSK file
+/// at /var/lib/symbolon/psks: line 3: missing `:` separator".
 #[derive(Debug, thiserror::Error)]
 pub enum PskStoreError {
-    #[error("reading {} failed", path.display())]
-    Read {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("PSK file {} is not valid UTF-8", path.display())]
-    Utf8 {
-        path: PathBuf,
-        #[source]
-        source: std::str::Utf8Error,
-    },
-    #[error("PSK file {} line {line}: missing `:` separator", path.display())]
-    MissingSeparator { path: PathBuf, line: usize },
-    #[error("PSK file {} line {line}: identity is empty or longer than 64 bytes", path.display())]
-    BadIdentityLen { path: PathBuf, line: usize },
+    #[error("PSK file is not valid UTF-8")]
+    Utf8(#[from] std::str::Utf8Error),
+    #[error("line {line}: missing `:` separator")]
+    MissingSeparator { line: usize },
+    #[error("line {line}: identity is empty or longer than 64 bytes")]
+    BadIdentityLen { line: usize },
     #[error(
-        "PSK file {} line {line}: identity byte 0x{byte:02x} at offset {offset} is outside \
-         charset [A-Za-z0-9._-]",
-        path.display()
+        "line {line}: identity byte 0x{byte:02x} at offset {offset} is outside \
+         charset [A-Za-z0-9._-]"
     )]
     BadIdentityChar {
-        path: PathBuf,
         line: usize,
         offset: usize,
         byte: u8,
     },
-    #[error("PSK file {} line {line}: PSK hex must be exactly 64 chars (got {got})", path.display())]
-    BadPskHexLen {
-        path: PathBuf,
-        line: usize,
-        got: usize,
-    },
-    #[error("PSK file {} line {line}: PSK hex contains non-hex byte 0x{byte:02x}", path.display())]
-    BadPskHex {
-        path: PathBuf,
-        line: usize,
-        byte: u8,
-    },
-    #[error("PSK file {} line {line}: duplicate identity {identity:?}", path.display())]
-    DuplicateIdentity {
-        path: PathBuf,
-        line: usize,
-        identity: String,
-    },
+    #[error("line {line}: PSK hex must be exactly 64 chars (got {got})")]
+    BadPskHexLen { line: usize, got: usize },
+    #[error("line {line}: PSK hex contains non-hex byte 0x{byte:02x}")]
+    BadPskHex { line: usize, byte: u8 },
+    #[error("line {line}: duplicate identity {identity:?}")]
+    DuplicateIdentity { line: usize, identity: String },
 }
 
 /// In-memory map from identity → 32-byte PSK. The post-storage
@@ -115,9 +95,10 @@ impl PskStore {
         Self::default()
     }
 
-    /// Parse a PSK file's contents into a store. Caller passes `path` only for
-    /// error context.
-    pub fn parse(text: &str, path: &Path) -> Result<Self, PskStoreError> {
+    /// Parse a PSK file's contents into a store. Errors carry the line
+    /// number only; the caller stamps the file path at its boundary
+    /// (see `PskStoreError` doc).
+    pub fn parse(text: &str) -> Result<Self, PskStoreError> {
         let mut entries: HashMap<String, Psk> = HashMap::new();
         for (idx, raw) in text.lines().enumerate() {
             let line_no = idx + 1;
@@ -125,17 +106,13 @@ impl PskStore {
             if line.is_empty() {
                 continue;
             }
-            let (id, hex) =
-                line.split_once(':')
-                    .ok_or_else(|| PskStoreError::MissingSeparator {
-                        path: path.to_path_buf(),
-                        line: line_no,
-                    })?;
-            validate_identity(id, path, line_no)?;
-            let psk = decode_psk_hex(hex, path, line_no)?;
+            let (id, hex) = line
+                .split_once(':')
+                .ok_or(PskStoreError::MissingSeparator { line: line_no })?;
+            validate_identity(id, line_no)?;
+            let psk = decode_psk_hex(hex, line_no)?;
             if entries.insert(id.to_string(), psk).is_some() {
                 return Err(PskStoreError::DuplicateIdentity {
-                    path: path.to_path_buf(),
                     line: line_no,
                     identity: id.to_string(),
                 });
@@ -181,18 +158,14 @@ impl PskStore {
     }
 }
 
-fn validate_identity(id: &str, path: &Path, line: usize) -> Result<(), PskStoreError> {
+fn validate_identity(id: &str, line: usize) -> Result<(), PskStoreError> {
     let bytes = id.as_bytes();
     if bytes.is_empty() || bytes.len() > MAX_IDENTITY_LEN {
-        return Err(PskStoreError::BadIdentityLen {
-            path: path.to_path_buf(),
-            line,
-        });
+        return Err(PskStoreError::BadIdentityLen { line });
     }
     for (offset, &b) in bytes.iter().enumerate() {
         if !is_identity_byte(b) {
             return Err(PskStoreError::BadIdentityChar {
-                path: path.to_path_buf(),
                 line,
                 offset,
                 byte: b,
@@ -202,10 +175,9 @@ fn validate_identity(id: &str, path: &Path, line: usize) -> Result<(), PskStoreE
     Ok(())
 }
 
-fn decode_psk_hex(hex_str: &str, path: &Path, line: usize) -> Result<Psk, PskStoreError> {
+fn decode_psk_hex(hex_str: &str, line: usize) -> Result<Psk, PskStoreError> {
     if hex_str.len() != PSK_LEN * 2 {
         return Err(PskStoreError::BadPskHexLen {
-            path: path.to_path_buf(),
             line,
             got: hex_str.len(),
         });
@@ -213,14 +185,12 @@ fn decode_psk_hex(hex_str: &str, path: &Path, line: usize) -> Result<Psk, PskSto
     let mut out = [0u8; PSK_LEN];
     hex::decode_to_slice(hex_str, &mut out).map_err(|e| match e {
         hex::FromHexError::InvalidHexCharacter { c, .. } => PskStoreError::BadPskHex {
-            path: path.to_path_buf(),
             line,
             byte: c as u8,
         },
         // Length already validated above; OddLength / InvalidStringLength
         // are unreachable here. Surface as BadPskHexLen if reached.
         _ => PskStoreError::BadPskHexLen {
-            path: path.to_path_buf(),
             line,
             got: hex_str.len(),
         },
@@ -231,12 +201,6 @@ fn decode_psk_hex(hex_str: &str, path: &Path, line: usize) -> Result<Psk, PskSto
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const PATH: &str = "/test/psks";
-
-    fn p() -> &'static Path {
-        Path::new(PATH)
-    }
 
     fn psk_a() -> Psk {
         Psk::from([0xAA; 32])
@@ -252,7 +216,7 @@ mod tests {
 
     #[test]
     fn parse_empty_returns_empty_store() {
-        let store = PskStore::parse("", p()).unwrap();
+        let store = PskStore::parse("").unwrap();
         assert_eq!(store.len(), 0);
     }
 
@@ -263,7 +227,7 @@ mod tests {
         store.insert("beta".to_string(), psk_b());
         let rendered = store.render();
 
-        let reparsed = PskStore::parse(&rendered, p()).unwrap();
+        let reparsed = PskStore::parse(&rendered).unwrap();
         assert_eq!(reparsed.lookup("alpha"), Some(&psk_a()));
         assert_eq!(reparsed.lookup("beta"), Some(&psk_b()));
         assert_eq!(reparsed.len(), 2);
@@ -288,21 +252,21 @@ mod tests {
             hex_of(psk_a()),
             hex_of(psk_b())
         );
-        let store = PskStore::parse(&text, p()).unwrap();
+        let store = PskStore::parse(&text).unwrap();
         assert_eq!(store.len(), 2);
     }
 
     #[test]
     fn parse_handles_crlf_line_endings() {
         let text = format!("alpha:{}\r\n", hex_of(psk_a()));
-        let store = PskStore::parse(&text, p()).unwrap();
+        let store = PskStore::parse(&text).unwrap();
         assert_eq!(store.lookup("alpha"), Some(&psk_a()));
     }
 
     #[test]
     fn parse_rejects_missing_separator() {
         assert!(matches!(
-            PskStore::parse("alpha-without-colon\n", p()),
+            PskStore::parse("alpha-without-colon\n"),
             Err(PskStoreError::MissingSeparator { line: 1, .. })
         ));
     }
@@ -311,7 +275,7 @@ mod tests {
     fn parse_rejects_bad_identity_charset() {
         let text = format!("bad ident:{}\n", hex_of(psk_a()));
         assert!(matches!(
-            PskStore::parse(&text, p()),
+            PskStore::parse(&text),
             Err(PskStoreError::BadIdentityChar {
                 line: 1,
                 byte: b' ',
@@ -324,7 +288,7 @@ mod tests {
     fn parse_rejects_empty_identity() {
         let text = format!(":{}\n", hex_of(psk_a()));
         assert!(matches!(
-            PskStore::parse(&text, p()),
+            PskStore::parse(&text),
             Err(PskStoreError::BadIdentityLen { line: 1, .. })
         ));
     }
@@ -332,7 +296,7 @@ mod tests {
     #[test]
     fn parse_rejects_short_hex() {
         assert!(matches!(
-            PskStore::parse("alpha:abcd\n", p()),
+            PskStore::parse("alpha:abcd\n"),
             Err(PskStoreError::BadPskHexLen {
                 line: 1,
                 got: 4,
@@ -345,7 +309,7 @@ mod tests {
     fn parse_rejects_non_hex_chars() {
         let text = format!("alpha:{}\n", "g".repeat(64));
         assert!(matches!(
-            PskStore::parse(&text, p()),
+            PskStore::parse(&text),
             Err(PskStoreError::BadPskHex {
                 line: 1,
                 byte: b'g',
@@ -358,7 +322,7 @@ mod tests {
     fn parse_rejects_duplicate_identity() {
         let text = format!("alpha:{}\nalpha:{}\n", hex_of(psk_a()), hex_of(psk_b()));
         assert!(matches!(
-            PskStore::parse(&text, p()),
+            PskStore::parse(&text),
             Err(PskStoreError::DuplicateIdentity { line: 2, .. })
         ));
     }

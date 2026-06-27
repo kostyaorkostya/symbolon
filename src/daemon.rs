@@ -47,8 +47,12 @@ const PER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 pub enum DaemonError {
     #[error("failed to load clients.json")]
     LoadClients(#[from] crate::config::ConfigError),
-    #[error("failed to load PSK file")]
-    LoadPsks(#[from] PskStoreError),
+    #[error("failed to load PSK file at {}", path.display())]
+    LoadPsks {
+        path: PathBuf,
+        #[source]
+        source: PskStoreError,
+    },
     #[error("failed to construct GitHub provider")]
     Github(#[from] GithubError),
     #[error("failed to read PSK file at {}", path.display())]
@@ -703,13 +707,14 @@ async fn load_psk_store(path: &Path) -> Result<PskStore, DaemonError> {
             });
         }
     };
-    let text = std::str::from_utf8(&bytes).map_err(|source| {
-        DaemonError::LoadPsks(PskStoreError::Utf8 {
-            path: path.to_path_buf(),
-            source,
-        })
+    let text = std::str::from_utf8(&bytes).map_err(|source| DaemonError::LoadPsks {
+        path: path.to_path_buf(),
+        source: PskStoreError::Utf8(source),
     })?;
-    PskStore::parse(text, path).map_err(DaemonError::LoadPsks)
+    PskStore::parse(text).map_err(|source| DaemonError::LoadPsks {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn chmod_socket(path: &Path, mode: u32) -> Result<(), DaemonError> {

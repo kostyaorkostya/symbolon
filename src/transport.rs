@@ -213,21 +213,34 @@ pub fn parse_prelude(input: &[u8]) -> Result<(Identity, usize), PreludeError> {
     Ok((identity, total))
 }
 
-/// Build the responder (server) side of `NOISE_PATTERN` with the given PSK.
-pub fn responder(psk: &Psk) -> Result<HandshakeState, TransportError> {
-    build_handshake(psk, /* initiator */ false)
+/// Build the responder (server) side of `NOISE_PATTERN` with the given
+/// PSK. `prologue` must be the same bytes both peers observed
+/// out-of-band before the handshake (for us, the cleartext SBLN
+/// identity prelude). It is mixed into the handshake transcript hash;
+/// if the two sides disagree on prologue, the first handshake MAC
+/// check fails. See snow `Builder::prologue` docs.
+pub fn responder(psk: &Psk, prologue: &[u8]) -> Result<HandshakeState, TransportError> {
+    build_handshake(psk, prologue, /* initiator */ false)
 }
 
-/// Build the initiator (client) side of `NOISE_PATTERN` with the given PSK.
-pub fn initiator(psk: &Psk) -> Result<HandshakeState, TransportError> {
-    build_handshake(psk, /* initiator */ true)
+/// Build the initiator (client) side of `NOISE_PATTERN` with the given
+/// PSK and shared prologue bytes (see [`responder`] for the prologue
+/// contract).
+pub fn initiator(psk: &Psk, prologue: &[u8]) -> Result<HandshakeState, TransportError> {
+    build_handshake(psk, prologue, /* initiator */ true)
 }
 
-fn build_handshake(psk: &Psk, initiator: bool) -> Result<HandshakeState, TransportError> {
+fn build_handshake(
+    psk: &Psk,
+    prologue: &[u8],
+    initiator: bool,
+) -> Result<HandshakeState, TransportError> {
     let params: NoiseParams = NOISE_PATTERN
         .parse()
         .map_err(|e: snow::Error| TransportError::Params(e))?;
     let builder = Builder::new(params)
+        .prologue(prologue)
+        .map_err(TransportError::Params)?
         .psk(0, psk.as_bytes())
         .map_err(TransportError::Params)?;
     if initiator {
@@ -456,14 +469,20 @@ enum RState {
     WantPreludeBody {
         head: [u8; 6],
     },
-    /// Identity parsed; ask the driver to look up the PSK.
+    /// Identity parsed; ask the driver to look up the PSK. The
+    /// `prelude` bytes (head + identity body) are carried forward to
+    /// be mixed into the Noise handshake transcript via
+    /// `Builder::prologue` once the PSK arrives.
     NeedPsk {
         identity: Identity,
+        prelude: Vec<u8>,
     },
     /// `Step::NeedPsk` has been emitted (identity moved out).
     /// Caller must invoke `set_psk` next; another `step()` here is
     /// a contract violation (`WrongState`).
-    AwaitingPsk,
+    AwaitingPsk {
+        prelude: Vec<u8>,
+    },
     /// PSK provided; ask for the 2-byte handshake-msg-1 length.
     WantHsLen {
         hs: HandshakeState,
@@ -514,7 +533,7 @@ impl RState {
         match self {
             RState::WantPreludeHead => Phase::PreludeHead,
             RState::WantPreludeBody { .. } => Phase::PreludeBody,
-            RState::NeedPsk { .. } | RState::AwaitingPsk => Phase::AwaitingPsk,
+            RState::NeedPsk { .. } | RState::AwaitingPsk { .. } => Phase::AwaitingPsk,
             RState::WantHsLen { .. }
             | RState::WantHsBody { .. }
             | RState::WriteHs { .. }
@@ -595,12 +614,14 @@ impl Responder {
                 self.state = RState::WantPreludeBody { head };
                 Ok(Step::ReadExact { n })
             }
-            RState::NeedPsk { identity } => {
+            RState::NeedPsk { identity, prelude } => {
                 // Move the identity into the Step (zero clone). The
                 // contract is: caller MUST call `set_psk` next. A
                 // second `step()` before that returns WrongState
-                // via the catch-all below.
-                self.state = RState::AwaitingPsk;
+                // via the catch-all below. `prelude` is held in
+                // AwaitingPsk so `set_psk` can mix it into the Noise
+                // handshake transcript.
+                self.state = RState::AwaitingPsk { prelude };
                 Ok(Step::NeedPsk { identity })
             }
             RState::WantHsLen { hs } => {
@@ -636,7 +657,7 @@ impl Responder {
                 Ok(Step::Done)
             }
             other @ (RState::Failed
-            | RState::AwaitingPsk
+            | RState::AwaitingPsk { .. }
             | RState::WroteHsPending { .. }
             | RState::AwaitingResponse { .. }
             | RState::WroteRespPending) => {
@@ -667,7 +688,14 @@ impl Responder {
                 let id_len = head[5] as usize;
                 SessionError::check_recv_len(id_len, bytes.len())?;
                 let identity = parse_prelude_body(bytes)?;
-                self.state = RState::NeedPsk { identity };
+                // Stash the full prelude (head + body) so `set_psk`
+                // can pass it as the Noise prologue. Both peers
+                // independently re-derive these bytes and so agree on
+                // the transcript hash.
+                let mut prelude = Vec::with_capacity(prelude_size(id_len));
+                prelude.extend_from_slice(&head);
+                prelude.extend_from_slice(bytes);
+                self.state = RState::NeedPsk { identity, prelude };
                 Ok(())
             }
             RState::WantHsLen { hs } => {
@@ -716,8 +744,8 @@ impl Responder {
     pub fn set_psk(&mut self, psk: Psk) -> Result<(), SessionError> {
         let state_name: &str = (&self.state).into();
         match std::mem::replace(&mut self.state, RState::Failed) {
-            RState::AwaitingPsk => {
-                let hs = responder(&psk)?;
+            RState::AwaitingPsk { prelude } => {
+                let hs = responder(&psk, &prelude)?;
                 self.state = RState::WantHsLen { hs };
                 Ok(())
             }
@@ -875,7 +903,11 @@ pub struct Initiator {
 impl Initiator {
     pub fn new(identity: Identity, psk: Psk, request: Vec<u8>) -> Result<Self, SessionError> {
         let prelude = encode_prelude(&identity);
-        let hs = initiator(&psk)?;
+        // The cleartext prelude is the only out-of-band data both
+        // peers agree on; bind it into the Noise handshake transcript
+        // so an in-flight tamper of magic/version/identity bytes
+        // surfaces as a handshake failure rather than silently.
+        let hs = initiator(&psk, &prelude)?;
         Ok(Self {
             state: IState::WritePrelude {
                 hs,
@@ -1163,8 +1195,8 @@ mod tests {
     fn noise_handshake_round_trip() {
         let psk = Psk::from([0x42u8; 32]);
 
-        let mut initiator_hs = initiator(&psk).expect("build initiator");
-        let mut responder_hs = responder(&psk).expect("build responder");
+        let mut initiator_hs = initiator(&psk, &[]).expect("build initiator");
+        let mut responder_hs = responder(&psk, &[]).expect("build responder");
 
         let mut buf_i_to_r = [0u8; MAX_MESSAGE_SIZE];
         let mut buf_r_to_i = [0u8; MAX_MESSAGE_SIZE];
@@ -1202,8 +1234,8 @@ mod tests {
     /// (the psk0 mix means the binder check fails).
     #[test]
     fn noise_wrong_psk_rejected() {
-        let mut initiator_hs = initiator(&Psk::from([0xaa; 32])).unwrap();
-        let mut responder_hs = responder(&Psk::from([0xbb; 32])).unwrap();
+        let mut initiator_hs = initiator(&Psk::from([0xaa; 32]), &[]).unwrap();
+        let mut responder_hs = responder(&Psk::from([0xbb; 32]), &[]).unwrap();
 
         let mut buf = [0u8; MAX_MESSAGE_SIZE];
         let mut out = [0u8; MAX_MESSAGE_SIZE];

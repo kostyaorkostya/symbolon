@@ -249,10 +249,11 @@ pub async fn client_handshake_and_send(
     let psk = symbolon::Psk::from(psk);
     let mut stream = TcpStream::connect(addr).await.expect("tcp connect");
     let prelude = transport::encode_prelude(&identity);
+    // Build the handshake with the prelude as Noise prologue BEFORE
+    // write_all consumes the buffer.
+    let mut hs = transport::initiator(&psk, &prelude).expect("build initiator");
     let BufResult(res, _) = stream.write_all(prelude).await;
     res.expect("write prelude");
-
-    let mut hs = transport::initiator(&psk).expect("build initiator");
     let mut scratch = vec![0u8; MAX_MESSAGE_SIZE];
 
     // -> psk, e
@@ -305,15 +306,14 @@ pub async fn client_handshake_and_read_eof(
     };
 
     let prelude = transport::encode_prelude(&identity);
+    let mut hs = match transport::initiator(&psk, &prelude) {
+        Ok(h) => h,
+        Err(_) => return Vec::new(),
+    };
     let BufResult(res, _) = stream.write_all(prelude).await;
     if res.is_err() {
         return Vec::new();
     }
-
-    let mut hs = match transport::initiator(&psk) {
-        Ok(h) => h,
-        Err(_) => return Vec::new(),
-    };
     let mut scratch = vec![0u8; MAX_MESSAGE_SIZE];
 
     // -> psk, e

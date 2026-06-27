@@ -29,12 +29,12 @@ use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::daemon::{ResolvedClient, SharedState, StateMutationError};
+use crate::daemon::{SharedState, StateMutationError};
 use crate::events::EventKind;
 use crate::identity::Identity;
-use crate::ids::ReqId;
+use crate::ids::{OutReqId, ReqId};
 use crate::note::Note;
-use crate::providers::{ProviderError, ProviderKind};
+use crate::providers::{ProviderError, ProviderKind, ProviderReqId};
 use crate::psk::Psk;
 
 /// Admin requests are operator-driven JSON, not adversarial
@@ -73,6 +73,96 @@ pub(crate) enum Request {
     Selfcheck {
         provider: ProviderKind,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Wire responses
+// ---------------------------------------------------------------------------
+//
+// Each op has a typed success shape; the wire `{"ok": true, ...fields}` is
+// formed by flattening into [`OkEnvelope`]. Errors carry their own
+// `{"ok": false, "code", "error"}` shape via [`ErrorResponse`]. Handlers
+// return `Result<TypedResponse, ErrorResponse>`; the top of `dispatch`
+// turns either side into wire bytes.
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct StatusResponse {
+    uptime_sec: u64,
+    /// Provider *hosts* (e.g. `"github.com"`), not [`ProviderKind`]
+    /// names — operators tail logs by host. Sorted for deterministic
+    /// output.
+    providers: Vec<String>,
+    client_count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct ListResponse {
+    clients: Vec<ListEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct ListEntry {
+    name: Identity,
+    providers: Vec<ProviderKind>,
+    #[serde(with = "time::serde::rfc3339")]
+    enrolled_at: time::OffsetDateTime,
+    note: Option<Note>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct MintResponse {
+    username: String,
+    password: String,
+    expires_at_unix: u64,
+    out_req_id: OutReqId,
+    provider_req_id: Option<ProviderReqId>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct SelfcheckResponse {
+    clock_skew_sec: i64,
+    out_req_id: OutReqId,
+    provider_req_id: Option<ProviderReqId>,
+    details: serde_json::Value,
+}
+
+/// Serializes to `{}`; combined with [`OkEnvelope`] yields the bare
+/// `{"ok": true}` ack used by `enroll` and `revoke`.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct Ack {}
+
+/// `{"ok": false, "code": "…", "error": "…"}` — the `ok` field is
+/// always false; construct via [`ErrorResponse::new`].
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct ErrorResponse {
+    ok: bool,
+    code: String,
+    error: String,
+}
+
+impl ErrorResponse {
+    fn new(code: impl Into<String>, error: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            code: code.into(),
+            error: error.into(),
+        }
+    }
+}
+
+/// Wraps a typed success payload in the `{"ok": true, …}` envelope
+/// via `#[serde(flatten)]`. `ok` is always true at construction.
+#[derive(Debug, Serialize)]
+struct OkEnvelope<T> {
+    ok: bool,
+    #[serde(flatten)]
+    data: T,
+}
+
+impl<T> OkEnvelope<T> {
+    fn new(data: T) -> Self {
+        Self { ok: true, data }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -211,39 +301,49 @@ async fn handle_admin(mut stream: UnixStream, state: Rc<SharedState>) {
         Ok(r) => r,
         Err(e) => {
             info!(evt = %EventKind::AdminRequest, ok = false, error = %e);
-            let resp = error_response("bad_request", &format!("request parse failed: {e}"));
-            let _ = write_response(&mut stream, &resp).await;
+            let _ = write_err(
+                &mut stream,
+                &ErrorResponse::new("bad_request", format!("request parse failed: {e}")),
+            )
+            .await;
             return;
         }
     };
     info!(evt = %EventKind::AdminRequest, op = <&str>::from(&request));
-    let resp_value = match dispatch(&request, &state).await {
-        Ok(v) => v,
-        Err(e) => e,
-    };
-    let _ = write_response(&mut stream, &resp_value).await;
+    let _ = dispatch_and_write(&request, &state, &mut stream).await;
 }
 
-async fn dispatch(
+async fn dispatch_and_write(
     request: &Request,
     state: &Rc<SharedState>,
-) -> Result<serde_json::Value, serde_json::Value> {
+    stream: &mut UnixStream,
+) -> std::io::Result<()> {
     match request {
-        Request::Status => Ok(handle_status(state)),
-        Request::List => Ok(handle_list(state)),
+        Request::Status => write_ok(stream, &handle_status(state)).await,
+        Request::List => write_ok(stream, &handle_list(state)).await,
         Request::Enroll {
             provider,
             client,
             note,
             psk,
-        } => handle_enroll(state, *provider, client.clone(), note.clone(), *psk).await,
-        Request::Revoke { provider, client } => handle_revoke(state, *provider, client).await,
+        } => {
+            write_result(
+                stream,
+                handle_enroll(state, *provider, client.clone(), note.clone(), *psk).await,
+            )
+            .await
+        }
+        Request::Revoke { provider, client } => {
+            write_result(stream, handle_revoke(state, *provider, client).await).await
+        }
         Request::Mint {
             provider,
             client,
             path,
-        } => handle_mint(state, *provider, client, path).await,
-        Request::Selfcheck { provider } => handle_selfcheck(state, *provider).await,
+        } => write_result(stream, handle_mint(state, *provider, client, path).await).await,
+        Request::Selfcheck { provider } => {
+            write_result(stream, handle_selfcheck(state, *provider).await).await
+        }
     }
 }
 
@@ -251,43 +351,37 @@ async fn dispatch(
 // Per-op handlers
 // ---------------------------------------------------------------------------
 
-fn handle_status(state: &SharedState) -> serde_json::Value {
-    let uptime_sec = state.start_time.elapsed().as_secs();
-    let mut providers: Vec<&str> = state.providers.values().map(|p| p.host()).collect();
+fn handle_status(state: &SharedState) -> StatusResponse {
+    let mut providers: Vec<String> = state
+        .providers
+        .values()
+        .map(|p| p.host().to_string())
+        .collect();
     providers.sort();
-    let client_count = state.clients.borrow().len();
-    serde_json::json!({
-        "ok": true,
-        "uptime_sec": uptime_sec,
-        "providers": providers,
-        "client_count": client_count,
-    })
+    StatusResponse {
+        uptime_sec: state.start_time.elapsed().as_secs(),
+        providers,
+        client_count: state.clients.borrow().len(),
+    }
 }
 
-fn handle_list(state: &SharedState) -> serde_json::Value {
-    use time::format_description::well_known::Rfc3339;
+fn handle_list(state: &SharedState) -> ListResponse {
     let borrowed = state.clients.borrow();
-    let mut entries: Vec<(&Identity, &ResolvedClient)> = borrowed.iter().collect();
-    entries.sort_by_key(|(id, _)| id.as_str());
-    let entries: Vec<serde_json::Value> = entries
-        .into_iter()
+    let mut clients: Vec<ListEntry> = borrowed
+        .iter()
         .map(|(id, c)| {
-            // Render providers via Display (matches the wire/file
-            // form `"github"`) and sort for deterministic output.
-            let mut provs: Vec<String> = c.providers.iter().map(ProviderKind::to_string).collect();
-            provs.sort();
-            serde_json::json!({
-                "name": id.as_str(),
-                "providers": provs,
-                // `OffsetDateTime` formats deterministically via the
-                // RFC 3339 well-known descriptor; `now_utc()`-sourced
-                // values fall well within the supported year range.
-                "enrolled_at": c.enrolled_at.format(&Rfc3339).expect("RFC3339 format of UTC datetime"),
-                "note": c.note,
-            })
+            let mut providers = c.providers.clone();
+            providers.sort_by_key(|p| p.to_string());
+            ListEntry {
+                name: id.clone(),
+                providers,
+                enrolled_at: c.enrolled_at,
+                note: c.note.clone(),
+            }
         })
         .collect();
-    serde_json::json!({ "ok": true, "clients": entries })
+    clients.sort_by(|a, b| a.name.cmp(&b.name));
+    ListResponse { clients }
 }
 
 async fn handle_enroll(
@@ -296,21 +390,20 @@ async fn handle_enroll(
     client: Identity,
     note: Option<Note>,
     psk: Psk,
-) -> Result<serde_json::Value, serde_json::Value> {
-    // Both `client` and `note` were validated at JSON-deserialise time
-    // by the `Identity` / `Note` newtype serde adapters; no further
-    // in-handler checks needed.
-    let client_str = client.to_string();
-    match state.enroll_client(client, psk, provider, note).await {
+) -> Result<Ack, ErrorResponse> {
+    match state
+        .enroll_client(client.clone(), psk, provider, note)
+        .await
+    {
         Ok(()) => {
-            info!(evt = %EventKind::Enroll, provider = %provider, client = %client_str);
-            Ok(serde_json::json!({ "ok": true }))
+            info!(evt = %EventKind::Enroll, provider = %provider, client = %client);
+            Ok(Ack {})
         }
-        Err(StateMutationError::ClientAlreadyEnrolled(c)) => Err(error_response(
+        Err(StateMutationError::ClientAlreadyEnrolled(c)) => Err(ErrorResponse::new(
             "client_already_enrolled",
-            &format!("client '{c}' already enrolled"),
+            format!("client '{c}' already enrolled"),
         )),
-        Err(e) => Err(error_response("internal", &e.to_string())),
+        Err(e) => Err(ErrorResponse::new("internal", e.to_string())),
     }
 }
 
@@ -318,17 +411,17 @@ async fn handle_revoke(
     state: &SharedState,
     provider: ProviderKind,
     client: &Identity,
-) -> Result<serde_json::Value, serde_json::Value> {
+) -> Result<Ack, ErrorResponse> {
     if state.lookup_provider(provider).is_none() {
         return Err(unknown_provider_error(provider));
     }
     match state.revoke_client(client.as_str()).await {
-        Ok(()) => Ok(serde_json::json!({ "ok": true })),
-        Err(StateMutationError::UnknownClient(c)) => Err(error_response(
+        Ok(()) => Ok(Ack {}),
+        Err(StateMutationError::UnknownClient(c)) => Err(ErrorResponse::new(
             "unknown_client",
-            &format!("no enrolled client named '{c}'"),
+            format!("no enrolled client named '{c}'"),
         )),
-        Err(e) => Err(error_response("internal", &e.to_string())),
+        Err(e) => Err(ErrorResponse::new("internal", e.to_string())),
     }
 }
 
@@ -337,25 +430,26 @@ async fn handle_mint(
     provider: ProviderKind,
     client: &Identity,
     path: &str,
-) -> Result<serde_json::Value, serde_json::Value> {
-    let provider = state
-        .lookup_provider(provider)
-        .ok_or_else(|| unknown_provider_error(provider))?;
+) -> Result<MintResponse, ErrorResponse> {
     if !state.clients.borrow().contains_key(client) {
-        return Err(error_response(
+        return Err(ErrorResponse::new(
             "unknown_client",
-            &format!("no enrolled client named '{client}'"),
+            format!("no enrolled client named '{client}'"),
         ));
     }
-    match provider.mint(path).await {
-        Ok(outcome) => Ok(serde_json::json!({
-            "ok": true,
-            "username": outcome.response.username,
-            "password": outcome.response.password,
-            "expires_at_unix": outcome.response.password_expiry_unix_secs(),
-            "out_req_id": outcome.out_req_id,
-            "provider_req_id": outcome.provider_req_id,
-        })),
+    match state
+        .lookup_provider(provider)
+        .ok_or_else(|| unknown_provider_error(provider))?
+        .mint(path)
+        .await
+    {
+        Ok(outcome) => Ok(MintResponse {
+            expires_at_unix: outcome.response.password_expiry_unix_secs(),
+            username: outcome.response.username,
+            password: outcome.response.password,
+            out_req_id: outcome.out_req_id,
+            provider_req_id: outcome.provider_req_id,
+        }),
         Err(e) => Err(error_response_from_provider(&e)),
     }
 }
@@ -363,23 +457,24 @@ async fn handle_mint(
 async fn handle_selfcheck(
     state: &Rc<SharedState>,
     provider: ProviderKind,
-) -> Result<serde_json::Value, serde_json::Value> {
-    let provider = state
+) -> Result<SelfcheckResponse, ErrorResponse> {
+    match state
         .lookup_provider(provider)
-        .ok_or_else(|| unknown_provider_error(provider))?;
-    match provider.selfcheck().await {
-        Ok(outcome) => Ok(serde_json::json!({
-            "ok": true,
-            "clock_skew_sec": outcome.clock_skew_sec,
-            "out_req_id": outcome.out_req_id,
-            "provider_req_id": outcome.provider_req_id,
-            "details": outcome.details,
-        })),
+        .ok_or_else(|| unknown_provider_error(provider))?
+        .selfcheck()
+        .await
+    {
+        Ok(outcome) => Ok(SelfcheckResponse {
+            clock_skew_sec: outcome.clock_skew_sec,
+            out_req_id: outcome.out_req_id,
+            provider_req_id: outcome.provider_req_id,
+            details: outcome.details,
+        }),
         Err(e) => Err(error_response_from_provider(&e)),
     }
 }
 
-fn error_response_from_provider(err: &ProviderError) -> serde_json::Value {
+fn error_response_from_provider(err: &ProviderError) -> ErrorResponse {
     let (code, msg) = match err {
         ProviderError::RepoNotFound => (
             "repo_not_accessible",
@@ -406,7 +501,7 @@ fn error_response_from_provider(err: &ProviderError) -> serde_json::Value {
         // specific cause (ClientIdMismatch, JWT failures, etc.).
         _ => ("internal", format!("{}", crate::logging::ErrorChain(err))),
     };
-    error_response(code, &msg)
+    ErrorResponse::new(code, msg)
 }
 
 // ---------------------------------------------------------------------------
@@ -430,133 +525,60 @@ pub async fn cli_dispatch(socket_path: &Path, command: CliCommand) -> Result<i32
     let _ = stream.flush().await;
 
     let response_bytes = read_line(&mut stream).await.map_err(AdminError::Io)?;
-    let value: serde_json::Value =
-        serde_json::from_slice(&response_bytes).map_err(AdminError::ResponseParse)?;
-
-    if value.get("ok").and_then(|b| b.as_bool()) != Some(true) {
-        let msg = value
-            .get("error")
-            .and_then(|s| s.as_str())
-            .unwrap_or("(no error message)");
-        eprintln!("symbolon: error: {msg}");
+    let is_ok = is_ok_response(&response_bytes)?;
+    if !is_ok {
+        // Echo the full error JSON to stderr verbatim. Operators
+        // wanting structured access pipe stderr through jq; humans
+        // get the same JSON that machines do.
+        let mut bytes = response_bytes;
+        bytes.push(b'\n');
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), &bytes);
         return Ok(1);
     }
 
-    command.print_success(&value);
+    // Success path. Default: write the daemon's JSON response
+    // verbatim to stdout. Enroll is the one case where the CLI owns
+    // data the daemon doesn't (the PSK we generated locally), so we
+    // synthesize a `{ok, psk_hex}` JSON object instead of echoing
+    // the daemon's `{"ok": true}` ack.
+    match &command {
+        CliCommand::GithubEnroll { psk, .. } => {
+            let hex = psk.to_hex();
+            let hex_str = std::str::from_utf8(&hex).expect("Psk::to_hex is ASCII");
+            let synth = OkEnvelope::new(serde_json::json!({ "psk_hex": hex_str }));
+            let mut bytes = serde_json::to_vec(&synth).map_err(AdminError::ResponseParse)?;
+            bytes.push(b'\n');
+            std::io::Write::write_all(&mut std::io::stdout(), &bytes).map_err(AdminError::Io)?;
+        }
+        _ => {
+            let mut bytes = response_bytes;
+            bytes.push(b'\n');
+            std::io::Write::write_all(&mut std::io::stdout(), &bytes).map_err(AdminError::Io)?;
+        }
+    }
     Ok(0)
 }
 
-/// Read a string field off a JSON response, falling back to `"?"`
-/// for absent / non-string values. Used by the CLI printers, which
-/// run after the daemon already validated the response.
-fn json_str_or_q<'a>(v: &'a serde_json::Value, k: &str) -> &'a str {
-    v.get(k).and_then(|x| x.as_str()).unwrap_or("?")
-}
-
-/// Read a u64 field off a JSON response, falling back to `0`.
-fn json_u64_or_zero(v: &serde_json::Value, k: &str) -> u64 {
-    v.get(k).and_then(|x| x.as_u64()).unwrap_or(0)
-}
-
-/// Read a string-array field and join with `sep`. Empty on absent
-/// or non-array; non-string elements are filtered out.
-fn json_str_array_join(v: &serde_json::Value, k: &str, sep: &str) -> String {
-    v.get(k)
-        .and_then(|x| x.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|x| x.as_str())
-                .collect::<Vec<_>>()
-                .join(sep)
-        })
-        .unwrap_or_default()
-}
-
-impl CliCommand {
-    fn print_success(&self, response: &serde_json::Value) {
-        match self {
-            CliCommand::Status => {
-                println!("Uptime: {}s", json_u64_or_zero(response, "uptime_sec"));
-                println!(
-                    "Providers: {}",
-                    json_str_array_join(response, "providers", ", ")
-                );
-                println!("Clients: {}", json_u64_or_zero(response, "client_count"));
-            }
-            CliCommand::List => {
-                let empty = vec![];
-                let entries = response
-                    .get("clients")
-                    .and_then(|v| v.as_array())
-                    .unwrap_or(&empty);
-                if entries.is_empty() {
-                    println!("(no enrolled clients)");
-                    return;
-                }
-                for c in entries {
-                    println!(
-                        "{}\t{}\t{}",
-                        json_str_or_q(c, "name"),
-                        json_str_array_join(c, "providers", ","),
-                        json_str_or_q(c, "enrolled_at")
-                    );
-                }
-            }
-            CliCommand::GithubEnroll { psk, .. } => {
-                // Stdout is just the 64 hex chars — pipe-friendly
-                // (`symbolon github enroll vm-1 | ssh client 'cat > /etc/symbolon/psk'`).
-                // The PSK is one we generated locally (or one the
-                // operator supplied via `--psk`); daemon response is
-                // a bare `{"ok": true}` ack.
-                let hex = psk.to_hex();
-                println!(
-                    "{}",
-                    std::str::from_utf8(&hex).expect("Psk::to_hex is ASCII")
-                );
-            }
-            CliCommand::GithubRevoke { client } => {
-                println!("Revoked '{client}' from github.com.");
-            }
-            CliCommand::GithubMint { .. } => {
-                println!("username={}", json_str_or_q(response, "username"));
-                println!("password={}", json_str_or_q(response, "password"));
-                println!(
-                    "expires_at_unix={}",
-                    json_u64_or_zero(response, "expires_at_unix")
-                );
-            }
-            CliCommand::GithubSelfcheck => {
-                // Provider-specific fields nest under `details` per
-                // PROVIDER_CONTRACT.md § A3 — only the abstract fields
-                // (`clock_skew_sec`, `provider_req_id`, `out_req_id`)
-                // live at the top level.
-                let details = response.get("details").unwrap_or(&serde_json::Value::Null);
-                let skew = response
-                    .get("clock_skew_sec")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                println!(
-                    "OK: App {} reachable at {}, clock skew {skew}s",
-                    json_str_or_q(details, "client_id"),
-                    json_str_or_q(details, "api_base"),
-                );
-            }
-        }
+/// Minimal-allocation discriminator: read just the `ok` field off the
+/// daemon response without materialising the full payload. The body is
+/// echoed verbatim downstream, so we never need the parsed structure.
+fn is_ok_response(bytes: &[u8]) -> Result<bool, AdminError> {
+    #[derive(Deserialize)]
+    struct OkField {
+        ok: bool,
     }
+    let f: OkField = serde_json::from_slice(bytes).map_err(AdminError::ResponseParse)?;
+    Ok(f.ok)
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn error_response(code: &str, msg: &str) -> serde_json::Value {
-    serde_json::json!({ "ok": false, "code": code, "error": msg })
-}
-
-fn unknown_provider_error(provider: ProviderKind) -> serde_json::Value {
-    error_response(
+fn unknown_provider_error(provider: ProviderKind) -> ErrorResponse {
+    ErrorResponse::new(
         "unknown_provider",
-        &format!("provider '{provider}' not configured"),
+        format!("provider '{provider}' not configured"),
     )
 }
 
@@ -624,7 +646,25 @@ async fn read_line(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
     }
 }
 
-async fn write_response(stream: &mut UnixStream, value: &serde_json::Value) -> std::io::Result<()> {
+async fn write_ok<T: Serialize>(stream: &mut UnixStream, data: &T) -> std::io::Result<()> {
+    write_json(stream, &OkEnvelope { ok: true, data }).await
+}
+
+async fn write_err(stream: &mut UnixStream, err: &ErrorResponse) -> std::io::Result<()> {
+    write_json(stream, err).await
+}
+
+async fn write_result<T: Serialize>(
+    stream: &mut UnixStream,
+    result: Result<T, ErrorResponse>,
+) -> std::io::Result<()> {
+    match result {
+        Ok(data) => write_ok(stream, &data).await,
+        Err(err) => write_err(stream, &err).await,
+    }
+}
+
+async fn write_json<T: Serialize>(stream: &mut UnixStream, value: &T) -> std::io::Result<()> {
     let mut payload = serde_json::to_vec(value).map_err(std::io::Error::other)?;
     payload.push(b'\n');
     let BufResult(res, _) = stream.write_all(payload).await;
@@ -669,10 +709,32 @@ mod tests {
     }
 
     #[test]
-    fn error_response_shape() {
-        let e = error_response("bad_request", "nope");
-        assert_eq!(e["ok"], serde_json::json!(false));
-        assert_eq!(e["code"], "bad_request");
-        assert_eq!(e["error"], "nope");
+    fn error_response_serializes_with_ok_false() {
+        let e = ErrorResponse::new("bad_request", "nope");
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["ok"], serde_json::json!(false));
+        assert_eq!(v["code"], "bad_request");
+        assert_eq!(v["error"], "nope");
+    }
+
+    #[test]
+    fn ok_envelope_flattens_payload() {
+        let env = OkEnvelope::new(StatusResponse {
+            uptime_sec: 3,
+            providers: vec!["github.com".into()],
+            client_count: 0,
+        });
+        let v = serde_json::to_value(&env).unwrap();
+        assert_eq!(v["ok"], serde_json::json!(true));
+        assert_eq!(v["uptime_sec"], 3);
+        assert_eq!(v["providers"], serde_json::json!(["github.com"]));
+        assert_eq!(v["client_count"], 0);
+    }
+
+    #[test]
+    fn ok_envelope_with_ack_yields_bare_ok() {
+        let env = OkEnvelope::new(Ack {});
+        let s = serde_json::to_string(&env).unwrap();
+        assert_eq!(s, r#"{"ok":true}"#);
     }
 }

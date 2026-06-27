@@ -29,12 +29,13 @@ use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::daemon::{SharedState, StateMutationError};
+use crate::connection_tracker::ConnectionTracker;
+use crate::daemon::SharedState;
 use crate::events::EventKind;
 use crate::identity::Identity;
 use crate::ids::{OutReqId, ReqId};
 use crate::note::Note;
-use crate::providers::{ProviderError, ProviderKind, ProviderReqId};
+use crate::providers::{ProviderKind, ProviderReqId, SelfcheckOutcome};
 use crate::psk::Psk;
 
 /// Admin requests are operator-driven JSON, not adversarial
@@ -88,10 +89,7 @@ pub(crate) enum Request {
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct StatusResponse {
     uptime_sec: u64,
-    /// Provider *hosts* (e.g. `"github.com"`), not [`ProviderKind`]
-    /// names — operators tail logs by host. Sorted for deterministic
-    /// output.
-    providers: Vec<String>,
+    providers: Vec<ProviderKind>,
     client_count: usize,
 }
 
@@ -118,33 +116,25 @@ pub(crate) struct MintResponse {
     provider_req_id: Option<ProviderReqId>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct SelfcheckResponse {
-    clock_skew_sec: i64,
-    out_req_id: OutReqId,
-    provider_req_id: Option<ProviderReqId>,
-    details: serde_json::Value,
-}
-
 /// Serializes to `{}`; combined with [`OkEnvelope`] yields the bare
 /// `{"ok": true}` ack used by `enroll` and `revoke`.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Ack {}
 
-/// `{"ok": false, "code": "…", "error": "…"}` — the `ok` field is
-/// always false; construct via [`ErrorResponse::new`].
+/// `{"ok": false, "error": "…"}`. No `code` tag — operators key on
+/// the human-readable `error` message (or follow the matching log
+/// line via `req_id`); the wire isn't a programmatic-discrimination
+/// surface.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct ErrorResponse {
     ok: bool,
-    code: String,
     error: String,
 }
 
 impl ErrorResponse {
-    fn new(code: impl Into<String>, error: impl Into<String>) -> Self {
+    fn new(error: impl Into<String>) -> Self {
         Self {
             ok: false,
-            code: code.into(),
             error: error.into(),
         }
     }
@@ -261,10 +251,7 @@ pub(crate) async fn run_admin_loop(
     // the sole admin surface, so this is the choke point.
     let my_uid = rustix::process::geteuid().as_raw();
 
-    let tracker = crate::connection_tracker::ConnectionTracker::new(
-        PER_CONNECTION_TIMEOUT,
-        Duration::from_secs(5),
-    );
+    let tracker = ConnectionTracker::new(PER_CONNECTION_TIMEOUT, Duration::from_secs(5));
     loop {
         // `select_biased!` with shutdown listed first: when both arms
         // are ready in the same iteration, shutdown wins. Closes the
@@ -303,7 +290,7 @@ async fn handle_admin(mut stream: UnixStream, state: Rc<SharedState>) {
             info!(evt = %EventKind::AdminRequest, ok = false, error = %e);
             let _ = write_err(
                 &mut stream,
-                &ErrorResponse::new("bad_request", format!("request parse failed: {e}")),
+                &ErrorResponse::new(format!("request parse failed: {e}")),
             )
             .await;
             return;
@@ -352,36 +339,27 @@ async fn dispatch_and_write(
 // ---------------------------------------------------------------------------
 
 fn handle_status(state: &SharedState) -> StatusResponse {
-    let mut providers: Vec<String> = state
-        .providers
-        .values()
-        .map(|p| p.host().to_string())
-        .collect();
-    providers.sort();
     StatusResponse {
         uptime_sec: state.start_time.elapsed().as_secs(),
-        providers,
+        providers: state.providers.keys().copied().collect(),
         client_count: state.clients.borrow().len(),
     }
 }
 
 fn handle_list(state: &SharedState) -> ListResponse {
-    let borrowed = state.clients.borrow();
-    let mut clients: Vec<ListEntry> = borrowed
-        .iter()
-        .map(|(id, c)| {
-            let mut providers = c.providers.clone();
-            providers.sort_by_key(|p| p.to_string());
-            ListEntry {
+    ListResponse {
+        clients: state
+            .clients
+            .borrow()
+            .iter()
+            .map(|(id, c)| ListEntry {
                 name: id.clone(),
-                providers,
+                providers: c.providers.clone(),
                 enrolled_at: c.enrolled_at,
                 note: c.note.clone(),
-            }
-        })
-        .collect();
-    clients.sort_by(|a, b| a.name.cmp(&b.name));
-    ListResponse { clients }
+            })
+            .collect(),
+    }
 }
 
 async fn handle_enroll(
@@ -399,11 +377,7 @@ async fn handle_enroll(
             info!(evt = %EventKind::Enroll, provider = %provider, client = %client);
             Ok(Ack {})
         }
-        Err(StateMutationError::ClientAlreadyEnrolled(c)) => Err(ErrorResponse::new(
-            "client_already_enrolled",
-            format!("client '{c}' already enrolled"),
-        )),
-        Err(e) => Err(ErrorResponse::new("internal", e.to_string())),
+        Err(e) => Err(ErrorResponse::new(e.to_string())),
     }
 }
 
@@ -417,11 +391,7 @@ async fn handle_revoke(
     }
     match state.revoke_client(client.as_str()).await {
         Ok(()) => Ok(Ack {}),
-        Err(StateMutationError::UnknownClient(c)) => Err(ErrorResponse::new(
-            "unknown_client",
-            format!("no enrolled client named '{c}'"),
-        )),
-        Err(e) => Err(ErrorResponse::new("internal", e.to_string())),
+        Err(e) => Err(ErrorResponse::new(e.to_string())),
     }
 }
 
@@ -432,10 +402,9 @@ async fn handle_mint(
     path: &str,
 ) -> Result<MintResponse, ErrorResponse> {
     if !state.clients.borrow().contains_key(client) {
-        return Err(ErrorResponse::new(
-            "unknown_client",
-            format!("no enrolled client named '{client}'"),
-        ));
+        return Err(ErrorResponse::new(format!(
+            "no enrolled client named '{client}'"
+        )));
     }
     match state
         .lookup_provider(provider)
@@ -450,58 +419,22 @@ async fn handle_mint(
             out_req_id: outcome.out_req_id,
             provider_req_id: outcome.provider_req_id,
         }),
-        Err(e) => Err(error_response_from_provider(&e)),
+        Err(e) => Err(ErrorResponse::new(
+            crate::logging::ErrorChain(&e).to_string(),
+        )),
     }
 }
 
 async fn handle_selfcheck(
     state: &Rc<SharedState>,
     provider: ProviderKind,
-) -> Result<SelfcheckResponse, ErrorResponse> {
-    match state
+) -> Result<SelfcheckOutcome, ErrorResponse> {
+    state
         .lookup_provider(provider)
         .ok_or_else(|| unknown_provider_error(provider))?
         .selfcheck()
         .await
-    {
-        Ok(outcome) => Ok(SelfcheckResponse {
-            clock_skew_sec: outcome.clock_skew_sec,
-            out_req_id: outcome.out_req_id,
-            provider_req_id: outcome.provider_req_id,
-            details: outcome.details,
-        }),
-        Err(e) => Err(error_response_from_provider(&e)),
-    }
-}
-
-fn error_response_from_provider(err: &ProviderError) -> ErrorResponse {
-    let (code, msg) = match err {
-        ProviderError::RepoNotFound => (
-            "repo_not_accessible",
-            "repository not found or credential lacks access".to_string(),
-        ),
-        ProviderError::Unauthorized { body } => ("provider_4xx", format!("unauthorized: {body}")),
-        ProviderError::Forbidden { body } => ("provider_4xx", format!("forbidden: {body}")),
-        ProviderError::RateLimited { retry_after } => (
-            "provider_4xx",
-            match retry_after {
-                Some(d) => format!("rate limited (retry after {}s)", d.as_secs()),
-                None => "rate limited".to_string(),
-            },
-        ),
-        ProviderError::MalformedPath { path } => {
-            ("bad_request", format!("malformed repository path: {path}"))
-        }
-        ProviderError::UnexpectedStatus { status } => {
-            ("internal", format!("provider status {status}"))
-        }
-        // Transport / Timeout / Cancelled / MalformedResponse /
-        // Internal all collapse to `internal`. The source chain is
-        // walked by ErrorChain so the message includes the GitHub-
-        // specific cause (ClientIdMismatch, JWT failures, etc.).
-        _ => ("internal", format!("{}", crate::logging::ErrorChain(err))),
-    };
-    ErrorResponse::new(code, msg)
+        .map_err(|e| ErrorResponse::new(crate::logging::ErrorChain(&e).to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -576,10 +509,7 @@ fn is_ok_response(bytes: &[u8]) -> Result<bool, AdminError> {
 // ---------------------------------------------------------------------------
 
 fn unknown_provider_error(provider: ProviderKind) -> ErrorResponse {
-    ErrorResponse::new(
-        "unknown_provider",
-        format!("provider '{provider}' not configured"),
-    )
+    ErrorResponse::new(format!("provider '{provider}' not configured"))
 }
 
 // Returns false (denial) only on a definitive non-root, non-self UID.
@@ -710,24 +640,22 @@ mod tests {
 
     #[test]
     fn error_response_serializes_with_ok_false() {
-        let e = ErrorResponse::new("bad_request", "nope");
-        let v = serde_json::to_value(&e).unwrap();
-        assert_eq!(v["ok"], serde_json::json!(false));
-        assert_eq!(v["code"], "bad_request");
-        assert_eq!(v["error"], "nope");
+        let e = ErrorResponse::new("nope");
+        let s = serde_json::to_string(&e).unwrap();
+        assert_eq!(s, r#"{"ok":false,"error":"nope"}"#);
     }
 
     #[test]
     fn ok_envelope_flattens_payload() {
         let env = OkEnvelope::new(StatusResponse {
             uptime_sec: 3,
-            providers: vec!["github.com".into()],
+            providers: vec![ProviderKind::Github],
             client_count: 0,
         });
         let v = serde_json::to_value(&env).unwrap();
         assert_eq!(v["ok"], serde_json::json!(true));
         assert_eq!(v["uptime_sec"], 3);
-        assert_eq!(v["providers"], serde_json::json!(["github.com"]));
+        assert_eq!(v["providers"], serde_json::json!(["github"]));
         assert_eq!(v["client_count"], 0);
     }
 

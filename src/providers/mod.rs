@@ -125,7 +125,7 @@ pub struct MintOutcome {
     pub provider_req_id: Option<ProviderReqId>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelfcheckOutcome {
     pub out_req_id: OutReqId,
     pub provider_req_id: Option<ProviderReqId>,

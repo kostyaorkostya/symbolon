@@ -259,18 +259,24 @@ fn handle_status(state: &SharedState) -> serde_json::Value {
 }
 
 fn handle_list(state: &SharedState) -> serde_json::Value {
+    use time::format_description::well_known::Rfc3339;
     let borrowed = state.clients.borrow();
     let mut entries: Vec<(&crate::identity::Identity, &ResolvedClient)> = borrowed.iter().collect();
     entries.sort_by_key(|(id, _)| id.as_str());
     let entries: Vec<serde_json::Value> = entries
         .into_iter()
         .map(|(id, c)| {
-            let mut provs: Vec<&str> = c.providers.iter().map(String::as_str).collect();
+            // Render providers via Display (matches the wire/file
+            // form `"github"`) and sort for deterministic output.
+            let mut provs: Vec<String> = c.providers.iter().map(ProviderKind::to_string).collect();
             provs.sort();
             serde_json::json!({
                 "name": id.as_str(),
                 "providers": provs,
-                "enrolled_at": c.enrolled_at,
+                // `OffsetDateTime` formats deterministically via the
+                // RFC 3339 well-known descriptor; `now_utc()`-sourced
+                // values fall well within the supported year range.
+                "enrolled_at": c.enrolled_at.format(&Rfc3339).expect("RFC3339 format of UTC datetime"),
                 "note": c.note,
             })
         })

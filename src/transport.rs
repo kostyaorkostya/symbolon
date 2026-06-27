@@ -36,7 +36,7 @@
 //! client identity is being used, but without the PSK they can't impersonate
 //! or decrypt anything.
 
-use snow::{params::NoiseParams, Builder, HandshakeState, TransportState};
+use snow::{Builder, HandshakeState, TransportState, params::NoiseParams};
 
 use crate::identity::{Identity, IdentityError};
 use crate::psk::Psk;

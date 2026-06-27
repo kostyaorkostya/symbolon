@@ -112,8 +112,8 @@ pub enum DaemonError {
 /// a `ResolvedClient` (Identity's `Debug` is deliberately redacted).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedClient {
-    pub(crate) providers: Vec<String>,
-    pub(crate) enrolled_at: String,
+    pub(crate) providers: Vec<ProviderKind>,
+    pub(crate) enrolled_at: time::OffsetDateTime,
     pub(crate) note: Option<String>,
 }
 
@@ -169,8 +169,6 @@ pub(crate) enum StateMutationError {
     ClientAlreadyEnrolled(Identity),
     #[error("no enrolled client named '{0}'")]
     UnknownClient(String),
-    #[error("system clock unusable; cannot stamp enrolled_at")]
-    ClockUnusable,
     #[error("RNG read failed")]
     Rng(#[source] std::io::Error),
     #[error("write psks file")]
@@ -236,15 +234,14 @@ impl SharedState {
         .await
         .map_err(StateMutationError::WritePsks)?;
 
-        let enrolled_at =
-            format_rfc3339_z(SystemTime::now()).ok_or(StateMutationError::ClockUnusable)?;
+        let enrolled_at = time::OffsetDateTime::now_utc();
         let mut clients_doc = read_clients_doc(&self.clients_file_path)
             .await
             .map_err(StateMutationError::ReadClients)?;
         clients_doc.clients.push(crate::config::ClientEntry {
             name: client.to_string(),
-            providers: vec![provider.to_string()],
-            enrolled_at: enrolled_at.clone(),
+            providers: vec![provider],
+            enrolled_at,
             note: note.clone(),
         });
         let clients_bytes =
@@ -256,8 +253,8 @@ impl SharedState {
         self.clients.borrow_mut().insert(
             client,
             ResolvedClient {
-                providers: vec![provider.to_string()],
-                enrolled_at: enrolled_at.clone(),
+                providers: vec![provider],
+                enrolled_at,
                 note,
             },
         );
@@ -323,19 +320,6 @@ async fn read_clients_doc(path: &Path) -> Result<crate::config::ClientsFile, Str
         }),
         Err(e) => Err(format!("read {}: {e}", path.display())),
     }
-}
-
-/// Render `t` as a `Z`-suffixed RFC3339 string. Returns `None` on
-/// any clock pathology (pre-epoch system time, year-9999 overflow
-/// inside the `time` crate, format failure). Enroll surfaces the
-/// `None` case as `internal` to the operator — recording a wrong
-/// timestamp is worse than failing the enroll loudly.
-fn format_rfc3339_z(t: SystemTime) -> Option<String> {
-    let secs = t.duration_since(UNIX_EPOCH).ok()?.as_secs();
-    let secs = i64::try_from(secs).ok()?;
-    let dt = time::OffsetDateTime::from_unix_timestamp(secs).ok()?;
-    dt.format(&time::format_description::well_known::Rfc3339)
-        .ok()
 }
 
 /// Statistics returned from `Service::run` so main can log the
@@ -903,7 +887,7 @@ impl TryFrom<ClientsFile> for HashMap<Identity, ResolvedClient> {
                     source,
                 })?;
             let value = ResolvedClient {
-                providers: entry.providers.into_iter().collect(),
+                providers: entry.providers,
                 enrolled_at: entry.enrolled_at,
                 note: entry.note,
             };
@@ -1351,25 +1335,19 @@ mod tests {
     use super::*;
     use crate::config::ClientEntry;
 
-    #[test]
-    fn format_rfc3339_z_is_z_suffixed() {
-        let t = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let s = format_rfc3339_z(t).expect("post-epoch clock");
-        assert!(s.ends_with('Z'), "got {s}");
-        assert_eq!(s.len(), 20, "expected fixed-width 20, got {s}");
+    fn fixture_time() -> time::OffsetDateTime {
+        time::OffsetDateTime::parse(
+            "2026-05-31T00:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap()
     }
 
-    #[test]
-    fn format_rfc3339_z_returns_none_for_pre_epoch() {
-        let t = UNIX_EPOCH - Duration::from_secs(1);
-        assert!(format_rfc3339_z(t).is_none());
-    }
-
-    fn entry(name: &str, providers: &[&str]) -> ClientEntry {
+    fn entry(name: &str, providers: &[ProviderKind]) -> ClientEntry {
         ClientEntry {
             name: name.to_string(),
-            providers: providers.iter().map(|s| s.to_string()).collect(),
-            enrolled_at: "2026-05-31T00:00:00Z".to_string(),
+            providers: providers.to_vec(),
+            enrolled_at: fixture_time(),
             note: None,
         }
     }
@@ -1377,18 +1355,24 @@ mod tests {
     #[test]
     fn build_clients_table_indexes_by_name() {
         let file = ClientsFile {
-            clients: vec![entry("vm-1", &["github"]), entry("vm-2", &["github"])],
+            clients: vec![
+                entry("vm-1", &[ProviderKind::Github]),
+                entry("vm-2", &[ProviderKind::Github]),
+            ],
         };
         let table = HashMap::try_from(file).unwrap();
         assert_eq!(table.len(), 2);
         let v1 = table.get("vm-1").unwrap();
-        assert!(v1.providers.iter().any(|p| p == "github"));
+        assert!(v1.providers.contains(&ProviderKind::Github));
     }
 
     #[test]
     fn build_clients_table_rejects_duplicate_name() {
         let file = ClientsFile {
-            clients: vec![entry("vm-1", &["github"]), entry("vm-1", &["github"])],
+            clients: vec![
+                entry("vm-1", &[ProviderKind::Github]),
+                entry("vm-1", &[ProviderKind::Github]),
+            ],
         };
         let err = HashMap::try_from(file).unwrap_err();
         assert!(matches!(err, DaemonError::DuplicateClientName(n) if n.as_str() == "vm-1"));
@@ -1410,7 +1394,7 @@ mod tests {
             std::env::temp_dir().join(format!("symbolon-reload-test-{}.json", ulid::Ulid::new()));
         std::fs::write(
             &clients_path,
-            r#"{"clients":[{"name":"new","providers":["github"],"enrolled_at":"y","note":null}]}"#,
+            r#"{"clients":[{"name":"new","providers":["github"],"enrolled_at":"2026-05-31T00:00:00Z","note":null}]}"#,
         )
         .unwrap();
         // psk_file_path points at a nonexistent file; load_psk_store
@@ -1424,7 +1408,7 @@ mod tests {
                     Identity::parse("old").unwrap(),
                     ResolvedClient {
                         providers: Vec::new(),
-                        enrolled_at: "x".to_string(),
+                        enrolled_at: fixture_time(),
                         note: None,
                     },
                 );

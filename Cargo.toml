@@ -22,7 +22,12 @@ cyper = { version = "0.9", default-features = false, features = [
   "rustls",
   "http2",
 ] }
-derive_more = { version = "2.1.1", default-features = false, features = ["as_ref", "display", "from", "into"] }
+derive_more = { version = "2.1.1", default-features = false, features = [
+  "as_ref",
+  "display",
+  "from",
+  "into",
+] }
 futures-channel = "0.3"
 futures-util = "0.3.32"
 hex = "0.4.3"
@@ -55,6 +60,9 @@ thiserror = "2.0.18"
 time = { version = "0.3.47", default-features = false, features = [
   "parsing",
   "formatting",
+  "serde",
+  "serde-well-known",
+  "std",
 ] }
 toml = "1.1.2"
 tracing = { version = "0.1.44", default-features = false, features = [

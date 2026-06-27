@@ -21,8 +21,23 @@ use serde_json::Value as JsonValue;
 
 use crate::ids::OutReqId;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumString, strum::Display)]
+/// `serde::{Serialize, Deserialize}` are derived with the same
+/// snake_case casing as strum, so wire/file forms (`"github"`) match
+/// what `Display`/`FromStr` produce. Both surfaces stay in lockstep.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    strum::EnumString,
+    strum::Display,
+    Serialize,
+    Deserialize,
+)]
 #[strum(serialize_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     Github,
 }

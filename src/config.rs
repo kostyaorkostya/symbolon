@@ -223,12 +223,12 @@ pub struct ClientsFile {
 #[serde(deny_unknown_fields)]
 pub struct ClientEntry {
     pub name: String,
-    pub providers: Vec<String>,
-    /// RFC 3339 UTC timestamp. Kept as a `String`; consumers parse
-    /// on use via `time::OffsetDateTime` if/when they need a typed
-    /// value. The daemon is the sole writer and writes a known
-    /// format. Retyping this field is a separate task.
-    pub enrolled_at: String,
+    pub providers: Vec<crate::providers::ProviderKind>,
+    /// Enrollment timestamp. Round-trips through RFC 3339 on the
+    /// wire (`2026-05-26T12:34:56Z` shape); typing as
+    /// `OffsetDateTime` rejects malformed strings at load time.
+    #[serde(with = "time::serde::rfc3339")]
+    pub enrolled_at: time::OffsetDateTime,
     pub note: Option<String>,
 }
 
@@ -426,8 +426,17 @@ selfcheck_timeout = "5s"
         assert_eq!(parsed.clients.len(), 1);
         let c = &parsed.clients[0];
         assert_eq!(c.name, "dev-vm-1");
-        assert_eq!(c.providers, vec!["github".to_string()]);
-        assert_eq!(c.enrolled_at, "2026-05-26T12:34:56Z");
+        assert_eq!(c.providers, vec![crate::providers::ProviderKind::Github]);
+        // 2026-05-26T12:34:56Z in unix seconds: parsed via the same
+        // RFC3339 adapter the wire uses.
+        assert_eq!(
+            c.enrolled_at,
+            time::OffsetDateTime::parse(
+                "2026-05-26T12:34:56Z",
+                &time::format_description::well_known::Rfc3339,
+            )
+            .unwrap()
+        );
         assert!(c.note.is_none());
     }
 

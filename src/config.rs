@@ -7,7 +7,7 @@
 //! All deserializers carry `#[serde(deny_unknown_fields)]`.
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -76,21 +76,24 @@ pub struct ClientsConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
-    /// Minimum log level the subscriber emits.
-    pub level: LogLevel,
+    /// Minimum log level the subscriber emits. Accepts `"trace"` /
+    /// `"debug"` / `"info"` / `"warn"` / `"error"` per
+    /// `docs/PROTOCOLS.md` (matches `tracing::Level`'s `FromStr`).
+    #[serde(deserialize_with = "deserialize_tracing_level")]
+    pub level: tracing::Level,
 }
 
-/// Log level as it appears in `config.toml`. Mirrors the levels
-/// listed in `docs/PROTOCOLS.md`. Kept local (not `tracing::Level`)
-/// because `tracing::Level` does not implement `serde::Deserialize`.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum LogLevel {
-    Trace,
-    Debug,
-    Info,
-    Warn,
-    Error,
+/// `tracing::Level` doesn't implement `serde::Deserialize`, but its
+/// `FromStr` accepts the exact set of strings we already documented
+/// in PROTOCOLS.md. This shim bridges the two without inventing a
+/// wrapper enum that would have to stay in sync with upstream.
+fn deserialize_tracing_level<'de, D>(d: D) -> Result<tracing::Level, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let s = String::deserialize(d)?;
+    s.parse().map_err(D::Error::custom)
 }
 
 /// `[security]` section. Absent in `config.toml` means `Default` —
@@ -199,21 +202,19 @@ fn default_user_agent() -> String {
     "symbolon".to_string()
 }
 
-/// The on-disk schema version `parse_clients_file` accepts and
-/// every writer must use. Single source of truth — both
-/// `admin::handle_enroll` (file rewrites) and the daemon's
-/// startup parse compare against this constant.
-pub const CLIENTS_SCHEMA_VERSION: u32 = 1;
-
 /// Top-level parsed `clients.json`. Serialize side is used by
 /// `admin::handle_enroll` / `handle_revoke` when rewriting the
 /// file; the round-trip uses the same struct on both ends so the
 /// schema can only drift in one place.
+///
+/// Schema mismatches (added/removed/renamed fields across releases)
+/// are caught by `#[serde(deny_unknown_fields)]` + serde's "missing
+/// required field" errors. We intentionally don't carry a separate
+/// `version` field — for a single-writer/single-reader broker-owned
+/// state file, version flags duplicate what serde already enforces.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientsFile {
-    /// Schema version. Must equal [`CLIENTS_SCHEMA_VERSION`].
-    pub version: u32,
     pub clients: Vec<ClientEntry>,
 }
 
@@ -231,60 +232,24 @@ pub struct ClientEntry {
     pub note: Option<String>,
 }
 
-/// Errors returned by config parsing.
-#[derive(Debug, thiserror::Error)]
-pub enum ConfigError {
-    /// Reading the file from disk failed.
-    #[error("failed to read {}", path.display())]
-    Io {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    /// File bytes were not valid UTF-8.
-    #[error("file contents are not valid UTF-8: {}", path.display())]
-    Utf8 {
-        path: PathBuf,
-        #[source]
-        source: std::str::Utf8Error,
-    },
-    /// TOML deserialization failed.
-    #[error("failed to parse {}", path.display())]
-    Toml {
-        path: PathBuf,
-        #[source]
-        source: toml::de::Error,
-    },
-    /// JSON deserialization failed.
-    #[error("failed to parse {}", path.display())]
-    Json {
-        path: PathBuf,
-        #[source]
-        source: serde_json::Error,
-    },
-    /// `clients.json` has a schema version we don't know how to read.
-    #[error("clients file version unsupported: got {0}, expected 1")]
-    UnsupportedClientsVersion(u32),
-}
+/// Abstract parse error. Boxed so callers can render the
+/// Display/source chain without knowing whether the on-disk format
+/// is TOML, JSON, or something we swap to later — the format is an
+/// implementation detail of `parse`, not a contract.
+pub type ParseError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Parse `config.toml` from a UTF-8 string.
-pub fn parse_config(text: &str, path: &Path) -> Result<Config, ConfigError> {
-    toml::from_str(text).map_err(|source| ConfigError::Toml {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-/// Parse `clients.json` from a UTF-8 string. Validates schema version.
-pub fn parse_clients_file(text: &str, path: &Path) -> Result<ClientsFile, ConfigError> {
-    let parsed: ClientsFile = serde_json::from_str(text).map_err(|source| ConfigError::Json {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if parsed.version != CLIENTS_SCHEMA_VERSION {
-        return Err(ConfigError::UnsupportedClientsVersion(parsed.version));
+impl Config {
+    /// Parse `config.toml` from a UTF-8 string.
+    pub fn parse(text: &str) -> Result<Self, ParseError> {
+        Ok(toml::from_str(text)?)
     }
-    Ok(parsed)
+}
+
+impl ClientsFile {
+    /// Parse `clients.json` from a UTF-8 string.
+    pub fn parse(text: &str) -> Result<Self, ParseError> {
+        Ok(serde_json::from_str(text)?)
+    }
 }
 
 #[cfg(test)]
@@ -327,7 +292,7 @@ selfcheck_timeout = "5s"
             cfg.clients.file,
             PathBuf::from("/var/lib/symbolon/clients.json")
         );
-        assert_eq!(cfg.logging.level, LogLevel::Info);
+        assert_eq!(cfg.logging.level, tracing::Level::INFO);
         let gh = cfg.provider.github.expect("github provider present");
         assert_eq!(gh.host, "github.com");
         assert_eq!(gh.api_base, "https://api.github.com");
@@ -379,7 +344,7 @@ selfcheck_timeout = "5s"
     #[test]
     fn log_level_warn_accepted() {
         let cfg: LoggingConfig = toml::from_str(r#"level = "warn""#).unwrap();
-        assert_eq!(cfg.level, LogLevel::Warn);
+        assert_eq!(cfg.level, tracing::Level::WARN);
     }
 
     #[test]
@@ -441,15 +406,13 @@ selfcheck_timeout = "5s"
 
     #[test]
     fn clients_empty_array_parses() {
-        let parsed: ClientsFile = serde_json::from_str(r#"{"version":1,"clients":[]}"#).unwrap();
-        assert_eq!(parsed.version, 1);
+        let parsed = ClientsFile::parse(r#"{"clients":[]}"#).unwrap();
         assert!(parsed.clients.is_empty());
     }
 
     #[test]
     fn clients_one_entry_parses() {
         let json = r#"{
-  "version": 1,
   "clients": [
     {
       "name": "dev-vm-1",
@@ -459,7 +422,7 @@ selfcheck_timeout = "5s"
     }
   ]
 }"#;
-        let parsed: ClientsFile = serde_json::from_str(json).unwrap();
+        let parsed = ClientsFile::parse(json).unwrap();
         assert_eq!(parsed.clients.len(), 1);
         let c = &parsed.clients[0];
         assert_eq!(c.name, "dev-vm-1");
@@ -471,7 +434,6 @@ selfcheck_timeout = "5s"
     #[test]
     fn clients_unknown_field_on_entry_rejected() {
         let json = r#"{
-  "version": 1,
   "clients": [
     {
       "name": "x",
@@ -482,19 +444,7 @@ selfcheck_timeout = "5s"
     }
   ]
 }"#;
-        assert!(serde_json::from_str::<ClientsFile>(json).is_err());
-    }
-
-    #[test]
-    fn clients_unknown_version_rejected() {
-        // Any version other than the current (1) must be rejected so a
-        // future on-disk format change can't be silently mis-parsed.
-        let json = r#"{"version":2,"clients":[]}"#;
-        let err = parse_clients_file(json, Path::new("/test/clients.json")).unwrap_err();
-        assert!(
-            matches!(err, ConfigError::UnsupportedClientsVersion(2)),
-            "unexpected error: {err}"
-        );
+        assert!(ClientsFile::parse(json).is_err());
     }
 
     #[test]
@@ -502,7 +452,6 @@ selfcheck_timeout = "5s"
         // The schema does not carry a per-client `ip` field;
         // deny_unknown_fields rejects it.
         let json = r#"{
-  "version": 1,
   "clients": [
     {
       "name": "x",
@@ -513,6 +462,14 @@ selfcheck_timeout = "5s"
     }
   ]
 }"#;
-        assert!(serde_json::from_str::<ClientsFile>(json).is_err());
+        assert!(ClientsFile::parse(json).is_err());
+    }
+
+    #[test]
+    fn clients_unknown_top_level_field_rejected() {
+        // A leftover schema field from a prior release should fail to
+        // parse, surfacing the mismatch instead of silently dropping data.
+        let json = r#"{"version":1,"clients":[]}"#;
+        assert!(ClientsFile::parse(json).is_err());
     }
 }

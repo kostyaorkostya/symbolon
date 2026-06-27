@@ -27,6 +27,7 @@ use crate::connection_tracker::ConnectionTracker;
 use crate::cpu_worker::CpuWorker;
 use crate::events::EventKind;
 use crate::git_credential;
+use crate::identity::{Identity, IdentityError};
 use crate::ids::{OutReqId, ReqId};
 use crate::providers::github::{GitHubProvider, GithubError};
 use crate::providers::{Provider, ProviderError, ProviderReqId};
@@ -35,18 +36,23 @@ use crate::sandbox::{self, SandboxError, SandboxPaths, SandboxStatus};
 use crate::transport::{Phase, Responder, SessionError, Step};
 
 /// Per-connection read budget enforced at the daemon's read loop.
-/// Tighter than `git_credential::PARSER_HARD_MAX` (which is the
+/// Tighter than `git_credential::Request::PARSER_HARD_MAX` (which is the
 /// parser's absolute ceiling for direct callers) — at 8 KiB it caps
 /// slow-loris connections well below the parser limit.
 const WIRE_READ_BUDGET: usize = 8 * 1024;
 
-const _WIRE_BUDGET_FITS_PARSER: () = assert!(WIRE_READ_BUDGET <= git_credential::PARSER_HARD_MAX);
+const _WIRE_BUDGET_FITS_PARSER: () =
+    assert!(WIRE_READ_BUDGET <= git_credential::Request::PARSER_HARD_MAX);
 const PER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
-    #[error("failed to load clients.json")]
-    LoadClients(#[from] crate::config::ConfigError),
+    #[error("failed to load clients.json at {}", path.display())]
+    LoadClients {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("failed to load PSK file at {}", path.display())]
     LoadPsks {
         path: PathBuf,
@@ -81,8 +87,14 @@ pub enum DaemonError {
     },
     #[error("I/O error during accept")]
     Accept(#[source] std::io::Error),
-    #[error("clients.json contains duplicate identity {0:?}")]
-    DuplicateClientName(String),
+    #[error("clients.json contains duplicate identity {0}")]
+    DuplicateClientName(Identity),
+    #[error("clients.json contains invalid identity {name:?}")]
+    InvalidClientName {
+        name: String,
+        #[source]
+        source: IdentityError,
+    },
     #[error("config path {0} has no parent directory; sandbox cannot grant write access")]
     NoParentDir(&'static str),
     #[error("failed to apply sandbox")]
@@ -93,9 +105,13 @@ pub enum DaemonError {
     Cancelled,
 }
 
+/// Per-client metadata stored in the in-memory `SharedState.clients`
+/// table. The owning HashMap is keyed on [`Identity`], so the client
+/// name lives in the key — duplicating it as a `name: String` field
+/// here would leak the value through any `{:?}` of a struct holding
+/// a `ResolvedClient` (Identity's `Debug` is deliberately redacted).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedClient {
-    pub(crate) name: String,
     pub(crate) providers: Vec<String>,
     pub(crate) enrolled_at: String,
     pub(crate) note: Option<String>,
@@ -110,7 +126,7 @@ pub(crate) struct ResolvedClient {
 pub struct SharedState {
     /// Identity → metadata. Mutated by admin enroll/revoke. Lookup keyed
     /// on the PSK identity surfaced by the Noise prelude.
-    pub(crate) clients: RefCell<HashMap<String, ResolvedClient>>,
+    pub(crate) clients: RefCell<HashMap<Identity, ResolvedClient>>,
     /// Identity → 32-byte PSK. Same identities as `clients` (the
     /// `enroll`/`revoke` admin paths keep them in lock-step). Daemon
     /// reads this on every accepted connection to seed the Noise
@@ -150,7 +166,7 @@ pub(crate) struct EnrolledClient {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum StateMutationError {
     #[error("client '{0}' already enrolled")]
-    ClientAlreadyEnrolled(String),
+    ClientAlreadyEnrolled(Identity),
     #[error("no enrolled client named '{0}'")]
     UnknownClient(String),
     #[error("system clock unusable; cannot stamp enrolled_at")]
@@ -177,7 +193,7 @@ impl SharedState {
     /// rollback removes the PSK entry so memory stays consistent.
     pub(crate) async fn enroll_client(
         &self,
-        client: String,
+        client: Identity,
         provider: crate::providers::ProviderKind,
         note: Option<String>,
     ) -> Result<EnrolledClient, StateMutationError> {
@@ -193,19 +209,19 @@ impl SharedState {
         // PSK entry so the two in-memory tables stay in lockstep.
         struct Rollback<'a> {
             psks: &'a std::cell::RefCell<crate::psk_store::PskStore>,
-            client: Option<String>,
+            client: Option<Identity>,
         }
         impl Drop for Rollback<'_> {
             fn drop(&mut self) {
                 if let Some(c) = self.client.take() {
-                    self.psks.borrow_mut().remove(&c);
+                    self.psks.borrow_mut().remove(c.as_str());
                 }
             }
         }
 
         self.psks
             .borrow_mut()
-            .insert(client.clone(), crate::psk_store::Psk::from(key_bytes));
+            .insert(client.clone(), crate::psk::Psk::from(key_bytes));
         let mut rollback = Rollback {
             psks: &self.psks,
             client: Some(client.clone()),
@@ -226,7 +242,7 @@ impl SharedState {
             .await
             .map_err(StateMutationError::ReadClients)?;
         clients_doc.clients.push(crate::config::ClientEntry {
-            name: client.clone(),
+            name: client.to_string(),
             providers: vec![provider.to_string()],
             enrolled_at: enrolled_at.clone(),
             note: note.clone(),
@@ -238,9 +254,8 @@ impl SharedState {
             .map_err(StateMutationError::WriteClients)?;
 
         self.clients.borrow_mut().insert(
-            client.clone(),
+            client,
             ResolvedClient {
-                name: client,
                 providers: vec![provider.to_string()],
                 enrolled_at: enrolled_at.clone(),
                 note,
@@ -300,11 +315,10 @@ async fn read_clients_doc(path: &Path) -> Result<crate::config::ClientsFile, Str
         Ok(bytes) => {
             let text = std::str::from_utf8(&bytes)
                 .map_err(|e| format!("non-utf8 {}: {e}", path.display()))?;
-            crate::config::parse_clients_file(text, path)
+            crate::config::ClientsFile::parse(text)
                 .map_err(|e| format!("parse {}: {e}", path.display()))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(crate::config::ClientsFile {
-            version: crate::config::CLIENTS_SCHEMA_VERSION,
             clients: Vec::new(),
         }),
         Err(e) => Err(format!("read {}: {e}", path.display())),
@@ -392,7 +406,12 @@ impl Service {
         config_path: &Path,
         shutdown: CancelToken,
     ) -> Result<Self, DaemonError> {
-        let clients_file = crate::loader::load_clients_file(&cfg.clients.file).await?;
+        let clients_file = crate::loader::load_clients_file(&cfg.clients.file)
+            .await
+            .map_err(|source| DaemonError::LoadClients {
+                path: cfg.clients.file.clone(),
+                source,
+            })?;
         let clients_table = HashMap::try_from(clients_file)?;
 
         // Pre-sandbox: load the PSK store. Tolerate ENOENT — a fresh
@@ -657,7 +676,13 @@ impl SharedState {
         let file = match crate::loader::load_clients_file(path).await {
             Ok(f) => f,
             Err(e) => {
-                warn!(evt = %EventKind::ConfigReload, triggered_by = "sighup", ok = false, error = %crate::logging::ErrorChain(&e));
+                warn!(
+                    evt = %EventKind::ConfigReload,
+                    triggered_by = "sighup",
+                    ok = false,
+                    path = %path.display(),
+                    error = %crate::logging::ErrorChain(&e),
+                );
                 return;
             }
         };
@@ -699,7 +724,7 @@ impl SharedState {
 async fn load_psk_store(path: &Path) -> Result<PskStore, DaemonError> {
     let bytes = match compio::fs::read(path).await {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(PskStore::empty()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(PskStore::new()),
         Err(source) => {
             return Err(DaemonError::PskRead {
                 path: path.to_path_buf(),
@@ -867,15 +892,18 @@ impl Drop for AdminBindGuard {
     }
 }
 
-impl TryFrom<ClientsFile> for HashMap<String, ResolvedClient> {
+impl TryFrom<ClientsFile> for HashMap<Identity, ResolvedClient> {
     type Error = DaemonError;
 
     fn try_from(file: ClientsFile) -> Result<Self, Self::Error> {
         let mut table = HashMap::new();
         for entry in file.clients {
-            let key = entry.name.clone();
+            let key =
+                Identity::parse(&entry.name).map_err(|source| DaemonError::InvalidClientName {
+                    name: entry.name.clone(),
+                    source,
+                })?;
             let value = ResolvedClient {
-                name: entry.name,
                 providers: entry.providers.into_iter().collect(),
                 enrolled_at: entry.enrolled_at,
                 note: entry.note,
@@ -931,7 +959,7 @@ async fn handle_connection(mut stream: TcpStream, state: Rc<SharedState>) {
             }
 
             Step::NeedPsk { identity } => {
-                let psk = match state.psks.borrow().lookup(&identity) {
+                let psk = match state.psks.borrow().lookup(identity.as_str()) {
                     Some(p) => *p,
                     None => {
                         warn!(
@@ -943,7 +971,7 @@ async fn handle_connection(mut stream: TcpStream, state: Rc<SharedState>) {
                         return;
                     }
                 };
-                let Some(client) = state.clients.borrow().get(&identity).cloned() else {
+                if !state.clients.borrow().contains_key(&identity) {
                     // PSK exists but no clients.json entry — operator
                     // desynced the two files; refuse to mint rather than
                     // guess metadata.
@@ -953,14 +981,14 @@ async fn handle_connection(mut stream: TcpStream, state: Rc<SharedState>) {
                         psk_identity = %identity,
                     );
                     return;
-                };
+                }
                 info!(
                     evt = %EventKind::Accept,
-                    psk_identity = %client.name,
+                    psk_identity = %identity,
                     peer = ?peer,
                 );
-                client_name = Some(client.name);
-                if let Err(e) = sess.set_psk(psk.into_bytes()) {
+                client_name = Some(identity.to_string());
+                if let Err(e) = sess.set_psk(psk) {
                     log_session_failure(peer, sess.phase(), client_name.as_deref(), &e);
                     return;
                 }
@@ -993,7 +1021,7 @@ async fn handle_connection(mut stream: TcpStream, state: Rc<SharedState>) {
                     );
                     return;
                 }
-                let request = match git_credential::parse(&request_bytes) {
+                let request = match git_credential::Request::parse(&request_bytes) {
                     Ok(r) => r,
                     Err(e) => {
                         warn!(
@@ -1042,19 +1070,9 @@ async fn handle_connection(mut stream: TcpStream, state: Rc<SharedState>) {
                 };
 
                 let mut response_bytes = Vec::with_capacity(256);
-                if let Err(e) = git_credential::write_response(
-                    &outcome.response,
-                    request.client_supports_authtype,
-                    &mut response_bytes,
-                ) {
-                    warn!(
-                        evt = %EventKind::ProviderError,
-                        reason = "response_encode",
-                        provider = %request.host,
-                        error = %e,
-                    );
-                    return;
-                }
+                outcome
+                    .response
+                    .encode(&mut response_bytes, request.client_supports_authtype);
 
                 if let Err(e) = sess.set_response(&response_bytes) {
                     log_session_failure(peer, sess.phase(), client_name.as_deref(), &e);
@@ -1173,9 +1191,7 @@ fn log_session_failure(
                 got = got,
             ),
         },
-        SessionError::BadPskLen { .. }
-        | SessionError::RecvLen { .. }
-        | SessionError::WrongState { .. } => warn!(
+        SessionError::RecvLen { .. } | SessionError::WrongState { .. } => warn!(
             evt = %EventKind::HandshakeFailed,
             client = client_str,
             reason = "internal",
@@ -1362,32 +1378,26 @@ mod tests {
     #[test]
     fn build_clients_table_indexes_by_name() {
         let file = ClientsFile {
-            version: crate::config::CLIENTS_SCHEMA_VERSION,
             clients: vec![entry("vm-1", &["github"]), entry("vm-2", &["github"])],
         };
         let table = HashMap::try_from(file).unwrap();
         assert_eq!(table.len(), 2);
         let v1 = table.get("vm-1").unwrap();
-        assert_eq!(v1.name, "vm-1");
         assert!(v1.providers.iter().any(|p| p == "github"));
     }
 
     #[test]
     fn build_clients_table_rejects_duplicate_name() {
         let file = ClientsFile {
-            version: crate::config::CLIENTS_SCHEMA_VERSION,
             clients: vec![entry("vm-1", &["github"]), entry("vm-1", &["github"])],
         };
         let err = HashMap::try_from(file).unwrap_err();
-        assert!(matches!(err, DaemonError::DuplicateClientName(n) if n == "vm-1"));
+        assert!(matches!(err, DaemonError::DuplicateClientName(n) if n.as_str() == "vm-1"));
     }
 
     #[test]
     fn build_clients_table_empty_is_ok() {
-        let file = ClientsFile {
-            version: crate::config::CLIENTS_SCHEMA_VERSION,
-            clients: vec![],
-        };
+        let file = ClientsFile { clients: vec![] };
         assert_eq!(HashMap::try_from(file).unwrap().len(), 0);
     }
 
@@ -1401,7 +1411,7 @@ mod tests {
             std::env::temp_dir().join(format!("symbolon-reload-test-{}.json", ulid::Ulid::new()));
         std::fs::write(
             &clients_path,
-            r#"{"version":1,"clients":[{"name":"new","providers":["github"],"enrolled_at":"y","note":null}]}"#,
+            r#"{"clients":[{"name":"new","providers":["github"],"enrolled_at":"y","note":null}]}"#,
         )
         .unwrap();
         // psk_file_path points at a nonexistent file; load_psk_store
@@ -1412,9 +1422,8 @@ mod tests {
             clients: RefCell::new({
                 let mut m = HashMap::new();
                 m.insert(
-                    "old".to_string(),
+                    Identity::parse("old").unwrap(),
                     ResolvedClient {
-                        name: "old".to_string(),
                         providers: Vec::new(),
                         enrolled_at: "x".to_string(),
                         note: None,
@@ -1422,7 +1431,7 @@ mod tests {
                 );
                 m
             }),
-            psks: RefCell::new(PskStore::empty()),
+            psks: RefCell::new(PskStore::new()),
             providers: HashMap::new(),
             psk_file_path: nonexistent_psk,
             clients_file_path: clients_path.clone(),

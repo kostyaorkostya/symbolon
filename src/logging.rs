@@ -17,8 +17,6 @@ use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use crate::config::LogLevel;
-
 /// Display wrapper that walks `Error::source()` and joins each
 /// level with `: `. Use at log sites that surface a thiserror
 /// chain — without this, `error = %e` only renders the top
@@ -45,14 +43,8 @@ impl<E: std::error::Error> std::fmt::Display for ErrorChain<'_, E> {
     }
 }
 
-pub fn setup_tracing(level: LogLevel) {
-    let level_filter: LevelFilter = match level {
-        LogLevel::Trace => LevelFilter::TRACE,
-        LogLevel::Debug => LevelFilter::DEBUG,
-        LogLevel::Info => LevelFilter::INFO,
-        LogLevel::Warn => LevelFilter::WARN,
-        LogLevel::Error => LevelFilter::ERROR,
-    };
+pub fn setup_tracing(level: Level) {
+    let level_filter = LevelFilter::from_level(level);
 
     // Shared base config so a future edit can't make stdout and
     // stderr disagree on JSON shape. Macro (not fn) avoids the

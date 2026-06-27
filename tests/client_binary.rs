@@ -58,7 +58,8 @@ fn client_binary_round_trips_request_through_noise() {
         assert_eq!(consumed, prelude.len());
 
         // Build responder; the PSK we use must match the client's.
-        let mut hs = transport::responder(&PSK_BYTES).expect("build responder");
+        let mut hs =
+            transport::responder(&symbolon::Psk::from(PSK_BYTES)).expect("build responder");
         let mut scratch = vec![0u8; MAX_MESSAGE_SIZE];
 
         // -> psk, e

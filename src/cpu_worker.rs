@@ -56,7 +56,11 @@ impl CpuWorker {
         let (tx, rx) = mpsc::channel::<Job>();
         let thread = std::thread::Builder::new()
             .name(name.into())
-            .spawn(move || worker_loop(rx))?;
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    job();
+                }
+            })?;
         Ok(Self {
             tx: Some(tx),
             thread: Some(thread),
@@ -77,13 +81,16 @@ impl CpuWorker {
         R: Send + 'static,
     {
         let (reply_tx, reply_rx) = oneshot::channel();
-        let job: Job = Box::new(move || {
+        let job = Box::new(move || {
             // Caller's future may have been cancelled before the
             // reply lands; drop the result silently in that case.
             let _ = reply_tx.send(f());
         });
-        let tx = self.tx.as_ref().ok_or(WorkerDead)?;
-        tx.send(job).map_err(|_| WorkerDead)?;
+        self.tx
+            .as_ref()
+            .ok_or(WorkerDead)?
+            .send(job)
+            .map_err(|_| WorkerDead)?;
         reply_rx.await.map_err(|_| WorkerDead)
     }
 }
@@ -100,12 +107,6 @@ impl Drop for CpuWorker {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
-    }
-}
-
-fn worker_loop(rx: mpsc::Receiver<Job>) {
-    while let Ok(job) = rx.recv() {
-        job();
     }
 }
 

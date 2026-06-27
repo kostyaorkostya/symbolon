@@ -12,7 +12,7 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    if let Ok(req) = symbolon::parse_git_credential(data) {
+    if let Ok(req) = symbolon::GitCredentialRequest::parse(data) {
         // Clone2Leak post-condition: parse succeeded ⇒ no CR
         // anywhere in the structured request.
         assert!(

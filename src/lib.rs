@@ -32,11 +32,13 @@ pub(crate) mod cpu_worker;
 pub(crate) mod daemon;
 pub(crate) mod events;
 pub(crate) mod git_credential;
+pub(crate) mod identity;
 pub(crate) mod ids;
 pub(crate) mod loader;
 pub(crate) mod logging;
 pub(crate) mod mlock;
 pub(crate) mod providers;
+pub(crate) mod psk;
 pub(crate) mod psk_store;
 pub(crate) mod ready;
 pub(crate) mod sandbox;
@@ -55,8 +57,8 @@ pub mod transport;
 pub use crate::admin::{CliCommand, cli_dispatch};
 #[doc(hidden)]
 pub use crate::config::{
-    AdminConfig, ClientsConfig, Config, ListenConfig, LogLevel, LoggingConfig, MlockMode,
-    ProviderGithub, Providers, RuntimeConfig, SandboxMode, SecurityConfig,
+    AdminConfig, ClientsConfig, Config, ListenConfig, LoggingConfig, MlockMode, ProviderGithub,
+    Providers, RuntimeConfig, SandboxMode, SecurityConfig,
 };
 #[doc(hidden)]
 pub use crate::cpu_worker::CpuWorker;
@@ -64,6 +66,8 @@ pub use crate::cpu_worker::CpuWorker;
 pub use crate::daemon::{Service, ServiceHandle, run as run_daemon};
 #[doc(hidden)]
 pub use crate::events::EventKind;
+#[doc(hidden)]
+pub use crate::identity::{Identity, IdentityError};
 #[doc(hidden)]
 pub use crate::ids::{OutReqId, ReqId};
 #[doc(hidden)]
@@ -77,12 +81,14 @@ pub use crate::providers::ProviderReqId;
 #[doc(hidden)]
 pub use crate::providers::github::{GitHubProvider, GithubError, InstallationId, RepoId};
 #[doc(hidden)]
+pub use crate::psk::Psk;
+#[doc(hidden)]
 pub use crate::ready::notify as ready_notify;
 #[doc(hidden)]
 pub use crate::signals::{spawn_shutdown_watcher, spawn_sighup_handler};
 
 // Fuzz harnesses call these parser entry points directly.
 #[doc(hidden)]
-pub use crate::git_credential::parse as parse_git_credential;
+pub use crate::git_credential::Request as GitCredentialRequest;
 #[doc(hidden)]
 pub use crate::transport::parse_prelude as parse_identity_prelude;

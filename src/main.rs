@@ -61,7 +61,7 @@ async fn run_daemon(config_path: PathBuf) -> ExitCode {
     let cfg = match symbolon::load_config(&config_path).await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("symbolon: {e}");
+            eprintln!("symbolon: failed to load {}: {e}", config_path.display());
             return ExitCode::from(1);
         }
     };
@@ -149,7 +149,7 @@ async fn run_cli(config_path: PathBuf, command: CliCommand) -> ExitCode {
     let cfg = match symbolon::load_config(&config_path).await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("symbolon: {e}");
+            eprintln!("symbolon: failed to load {}: {e}", config_path.display());
             return ExitCode::from(1);
         }
     };

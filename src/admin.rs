@@ -260,15 +260,15 @@ fn handle_status(state: &SharedState) -> serde_json::Value {
 
 fn handle_list(state: &SharedState) -> serde_json::Value {
     let borrowed = state.clients.borrow();
-    let mut clients: Vec<&ResolvedClient> = borrowed.values().collect();
-    clients.sort_by_key(|c| c.name.as_str());
-    let entries: Vec<serde_json::Value> = clients
+    let mut entries: Vec<(&crate::identity::Identity, &ResolvedClient)> = borrowed.iter().collect();
+    entries.sort_by_key(|(id, _)| id.as_str());
+    let entries: Vec<serde_json::Value> = entries
         .into_iter()
-        .map(|c| {
+        .map(|(id, c)| {
             let mut provs: Vec<&str> = c.providers.iter().map(String::as_str).collect();
             provs.sort();
             serde_json::json!({
-                "name": c.name,
+                "name": id.as_str(),
                 "providers": provs,
                 "enrolled_at": c.enrolled_at,
                 "note": c.note,
@@ -288,12 +288,15 @@ async fn handle_enroll(
         Ok(k) => k,
         Err(_) => return Err(unknown_provider_error(provider)),
     };
-    if !crate::transport::Identity::is_valid(client) {
-        return Err(error_response(
-            "bad_request",
-            "client name must be non-empty ASCII without ':' or whitespace",
-        ));
-    }
+    let identity = match crate::identity::Identity::parse(client) {
+        Ok(id) => id,
+        Err(_) => {
+            return Err(error_response(
+                "bad_request",
+                "client name must be non-empty ASCII without ':' or whitespace",
+            ));
+        }
+    };
     // PROTOCOLS.md "CR or embedded LF inside any string field is
     // rejected (same Clone2Leak-class defence applied to the admin
     // path)" — applies to `note` as well as `client`.
@@ -306,7 +309,7 @@ async fn handle_enroll(
         ));
     }
 
-    match state.enroll_client(client.to_string(), kind, note).await {
+    match state.enroll_client(identity, kind, note).await {
         Ok(enrolled) => {
             info!(evt = %EventKind::Enroll, provider = provider, client = client);
             Ok(serde_json::json!({
@@ -682,23 +685,6 @@ mod tests {
     fn status_request_serializes_to_op_field() {
         let s = serde_json::to_string(&Request::Status).unwrap();
         assert!(s.contains("\"op\":\"status\""));
-    }
-
-    #[test]
-    fn is_valid_client_name_accepts_typical_names() {
-        assert!(crate::transport::Identity::is_valid("dev-vm-1"));
-        assert!(crate::transport::Identity::is_valid("client.42"));
-        assert!(crate::transport::Identity::is_valid("a_b_c"));
-    }
-
-    #[test]
-    fn is_valid_client_name_rejects_bad() {
-        assert!(!crate::transport::Identity::is_valid(""));
-        assert!(!crate::transport::Identity::is_valid("with space"));
-        assert!(!crate::transport::Identity::is_valid("has:colon"));
-        assert!(!crate::transport::Identity::is_valid("has\nlf"));
-        assert!(!crate::transport::Identity::is_valid("has\rcr"));
-        assert!(!crate::transport::Identity::is_valid("över-äscii"));
     }
 
     #[test]

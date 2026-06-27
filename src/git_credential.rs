@@ -16,6 +16,7 @@
 //! is expected to close the connection without a response on any
 //! `Err` and log `evt=mint_denied reason=malformed_request`.
 
+use std::io::Write;
 use std::time::SystemTime;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,16 +41,50 @@ pub struct Response {
 }
 
 impl Response {
+    /// Validate-and-construct. All wire-emit invariants are checked
+    /// here so [`Response::encode`] can be infallible:
+    /// - `username` and `password` must not contain CR (0x0D), LF
+    ///   (0x0A), or NUL (0x00) — Clone2Leak-class defence applied
+    ///   symmetrically with the request parser (AGENTS.md #12).
+    /// - `password_expiry_utc` must be ≥ UNIX_EPOCH (we render it as
+    ///   seconds-since-epoch).
+    pub fn new(
+        username: String,
+        password: String,
+        password_expiry_utc: SystemTime,
+    ) -> Result<Self, GitCredentialError> {
+        Self::check_field("username", &username)?;
+        Self::check_field("password", &password)?;
+        if password_expiry_utc < std::time::UNIX_EPOCH {
+            return Err(GitCredentialError::PreEpochExpiry);
+        }
+        Ok(Self {
+            username,
+            password,
+            password_expiry_utc,
+        })
+    }
+
     /// Render `password_expiry_utc` as seconds-since-epoch for the
-    /// admin/log wire shape. Saturates to `0` on pre-epoch input —
-    /// GitHub never returns a `expires_at` before 1970, so the
-    /// saturating arm is dead in practice; it exists only to keep
-    /// callers from needing their own `Option` plumbing.
+    /// admin/log wire shape. Infallible by construction —
+    /// [`Response::new`] rejects pre-epoch input.
     pub fn password_expiry_unix_secs(&self) -> u64 {
         self.password_expiry_utc
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
+            .expect("Response::new rejects pre-epoch input")
+            .as_secs()
+    }
+
+    /// Reject CR/LF/NUL inside a value that will be emitted as a
+    /// `key=value\n` line. Same Clone2Leak-class defence the request
+    /// parser enforces on inbound bytes (AGENTS.md invariant #12).
+    fn check_field(field: &'static str, value: &str) -> Result<(), GitCredentialError> {
+        for &b in value.as_bytes() {
+            if matches!(b, 0x00 | 0x0D | 0x0A) {
+                return Err(GitCredentialError::ResponseControlByte { field });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -69,231 +104,216 @@ pub enum GitCredentialError {
     DuplicateKey { key: &'static str },
     #[error("required key '{key}' missing")]
     MissingRequiredKey { key: &'static str },
-    #[error("CR byte (0x0D) in value for '{key}'")]
-    CarriageReturnInValue { key: &'static str },
-    #[error("NUL byte (0x00) in value for '{key}'")]
-    NulInValue { key: &'static str },
+    #[error("forbidden control byte 0x{byte:02x} on line {line_no} at offset {offset}")]
+    ControlByteInLine {
+        line_no: usize,
+        offset: usize,
+        byte: u8,
+    },
     #[error("value for '{key}' is not valid UTF-8")]
     InvalidUtf8 { key: &'static str },
     #[error("response field '{field}' contains a forbidden control byte")]
     ResponseControlByte { field: &'static str },
     #[error("password_expiry_utc is before the UNIX epoch")]
-    EmitInvalidExpiry,
+    PreEpochExpiry,
     #[error("value for '{key}' exceeds {max} bytes")]
     ValueTooLong { key: &'static str, max: usize },
     #[error("request block exceeds {max} bytes")]
     RequestTooLarge { max: usize },
 }
 
-/// Hard ceilings for git-credential request parsing. Real-world
-/// inputs are tens of bytes; legitimate hosts/paths run hundreds at
-/// most. Bounded to defend against pathological inputs (e.g. a
-/// runaway value buffer) without restricting any plausible repo URL.
-///
-/// `PARSER_HARD_MAX` is the absolute parser ceiling for direct
-/// callers (fuzz harnesses, in-process tests). The daemon enforces
-/// a tighter per-connection `WIRE_READ_BUDGET` on the read loop
-/// before bytes even reach this parser; see `src/daemon.rs`.
-pub const MAX_VALUE_BYTES: usize = 4 * 1024;
-pub const PARSER_HARD_MAX: usize = 64 * 1024;
+impl Request {
+    /// Per-value byte cap. Real-world host/path values run hundreds of
+    /// bytes at most; this defends against pathological values without
+    /// restricting any plausible repo URL.
+    pub const MAX_VALUE_BYTES: usize = 4 * 1024;
 
-/// Parse a git-credential request block.
-///
-/// The format is a sequence of `key=value\n` lines terminated by an
-/// empty line (`\n\n`). Recognised keys are `protocol`, `host`, and
-/// `path`; unknown keys (e.g. `wwwauth[]`, `capability[]`) are
-/// accepted and ignored per `gitcredentials(7)`. `path` has a single
-/// trailing `.git` suffix stripped per `docs/PROTOCOLS.md` § "`path`
-/// handling".
-///
-/// CR (0x0D) and NUL (0x00) bytes in any recognised key's value are
-/// rejected (Clone2Leak defence — see the module-level docs).
-/// Returns `Err` on any deviation; the daemon closes the connection
-/// without a response on any error from this function.
-pub fn parse(input: &[u8]) -> Result<Request, GitCredentialError> {
-    if input.len() > PARSER_HARD_MAX {
-        return Err(GitCredentialError::RequestTooLarge {
-            max: PARSER_HARD_MAX,
-        });
-    }
-    let term_pos = input
-        .windows(2)
-        .position(|w| w == b"\n\n")
-        .ok_or(GitCredentialError::UnterminatedBlock)?;
-    if term_pos + 2 < input.len() {
-        return Err(GitCredentialError::TrailingBytes);
-    }
+    /// Absolute parser ceiling for the entire request block. Direct
+    /// callers (fuzz harnesses, in-process tests) hit this; the daemon
+    /// enforces a tighter per-connection `WIRE_READ_BUDGET` on the
+    /// read loop before bytes even reach this parser (see
+    /// `src/daemon.rs`).
+    pub const PARSER_HARD_MAX: usize = 64 * 1024;
 
-    let block = &input[..term_pos];
-
-    let mut protocol: Option<String> = None;
-    let mut host: Option<String> = None;
-    let mut path: Option<String> = None;
-    let mut client_supports_authtype = false;
-
-    for (i, line) in block.split(|&c| c == b'\n').enumerate() {
-        let line_no = i + 1;
-        let eq_pos = line
-            .iter()
-            .position(|&c| c == b'=')
-            .ok_or(GitCredentialError::MissingSeparator { line_no })?;
-        let key_bytes = &line[..eq_pos];
-        let value_bytes = &line[eq_pos + 1..];
-
-        if key_bytes.is_empty() {
-            return Err(GitCredentialError::EmptyKey { line_no });
-        }
-
-        // `capability[]` is the only repeating array key we inspect.
-        // Multiple lines like `capability[]=authtype\ncapability[]=state\n`
-        // are all valid; we track whether `authtype` appeared. Empty
-        // value `capability[]=` is the spec-defined "reset" for the
-        // array and clears any earlier flags (per git-credential.adoc
-        // array semantics).
-        if key_bytes == b"capability[]" {
-            if value_bytes.is_empty() {
-                client_supports_authtype = false;
-            } else if value_bytes == b"authtype" {
-                client_supports_authtype = true;
-            }
-            // Other capabilities (e.g. `state`) ignored — we don't
-            // implement them.
-            continue;
-        }
-
-        // Unknown keys are accepted and ignored: `gitcredentials(7)`
-        // is extensible (`wwwauth[]`, etc.). Whitespace-around-`=`
-        // requests also land here as unknown keys (e.g. `host ` with
-        // a trailing space), and `url=` shorthand is rejected
-        // implicitly by the same path.
-        let (key, slot) = match key_bytes {
-            b"protocol" => ("protocol", &mut protocol),
-            b"host" => ("host", &mut host),
-            b"path" => ("path", &mut path),
-            _ => continue,
-        };
-
-        if value_bytes.len() > MAX_VALUE_BYTES {
-            return Err(GitCredentialError::ValueTooLong {
-                key,
-                max: MAX_VALUE_BYTES,
+    /// Parse a git-credential request block.
+    ///
+    /// The format is a sequence of `key=value\n` lines terminated by an
+    /// empty line (`\n\n`). Recognised keys are `protocol`, `host`, and
+    /// `path`; unknown keys (e.g. `wwwauth[]`, `capability[]`) are
+    /// accepted and ignored per `gitcredentials(7)`. `path` has a single
+    /// trailing `.git` suffix stripped per `docs/PROTOCOLS.md` § "`path`
+    /// handling".
+    ///
+    /// CR (0x0D) and NUL (0x00) bytes in any recognised key's value are
+    /// rejected (Clone2Leak defence — see the module-level docs).
+    /// Returns `Err` on any deviation; the daemon closes the connection
+    /// without a response on any error from this function.
+    pub fn parse(input: &[u8]) -> Result<Self, GitCredentialError> {
+        if input.len() > Self::PARSER_HARD_MAX {
+            return Err(GitCredentialError::RequestTooLarge {
+                max: Self::PARSER_HARD_MAX,
             });
         }
+        let term_pos = input
+            .windows(2)
+            .position(|w| w == b"\n\n")
+            .ok_or(GitCredentialError::UnterminatedBlock)?;
+        if term_pos + 2 < input.len() {
+            return Err(GitCredentialError::TrailingBytes);
+        }
 
-        for &b in value_bytes {
-            match b {
-                0x00 => return Err(GitCredentialError::NulInValue { key }),
-                0x0D => return Err(GitCredentialError::CarriageReturnInValue { key }),
-                _ => {}
+        let block = &input[..term_pos];
+
+        let mut protocol: Option<String> = None;
+        let mut host: Option<String> = None;
+        let mut path: Option<String> = None;
+        let mut client_supports_authtype = false;
+
+        for (i, line) in block.split(|&c| c == b'\n').enumerate() {
+            let line_no = i + 1;
+            // Clone2Leak defence (AGENTS.md #12): forbid CR/NUL anywhere
+            // on the line before we even tokenize. Stricter than checking
+            // values only — keys are produced by git itself and never
+            // legitimately carry these bytes, so rejecting them in
+            // unrecognized keys / capability values is harmless.
+            if let Some((offset, &byte)) = line
+                .iter()
+                .enumerate()
+                .find(|&(_, &b)| matches!(b, 0x00 | 0x0D))
+            {
+                return Err(GitCredentialError::ControlByteInLine {
+                    line_no,
+                    offset,
+                    byte,
+                });
             }
+            let (key_bytes, value_bytes) = line
+                .iter()
+                .position(|&c| c == b'=')
+                .map(|p| (&line[..p], &line[p + 1..]))
+                .ok_or(GitCredentialError::MissingSeparator { line_no })?;
+
+            // Dispatch on key. Recognized keys bind a `(name, slot)` for
+            // value validation below; `capability[]` mutates the flag
+            // inline and continues; unknown / empty keys terminate the
+            // iteration (empty = error, unknown = ignored per
+            // `gitcredentials(7)` extensibility).
+            let (key, slot) = match key_bytes {
+                b"" => return Err(GitCredentialError::EmptyKey { line_no }),
+                b"capability[]" => {
+                    // Repeating array key. Empty value `capability[]=` is
+                    // the spec-defined "reset" that clears earlier flags
+                    // (git-credential.adoc array semantics); other
+                    // capabilities (e.g. `state`) ignored.
+                    match value_bytes {
+                        b"" => client_supports_authtype = false,
+                        b"authtype" => client_supports_authtype = true,
+                        _ => {}
+                    }
+                    continue;
+                }
+                b"protocol" => ("protocol", &mut protocol),
+                b"host" => ("host", &mut host),
+                b"path" => ("path", &mut path),
+                // Unknown keys accepted and ignored (`wwwauth[]`, etc.).
+                // Whitespace-around-`=` (e.g. `host `) lands here too;
+                // so does `url=` shorthand which we don't implement.
+                _ => continue,
+            };
+
+            if slot.is_some() {
+                return Err(GitCredentialError::DuplicateKey { key });
+            }
+
+            if value_bytes.len() > Self::MAX_VALUE_BYTES {
+                return Err(GitCredentialError::ValueTooLong {
+                    key,
+                    max: Self::MAX_VALUE_BYTES,
+                });
+            }
+            if value_bytes.is_empty() {
+                return Err(GitCredentialError::EmptyValue { key });
+            }
+
+            let value = std::str::from_utf8(value_bytes)
+                .map_err(|_| GitCredentialError::InvalidUtf8 { key })?
+                .to_string();
+            *slot = Some(value);
         }
 
-        if value_bytes.is_empty() {
-            return Err(GitCredentialError::EmptyValue { key });
-        }
-        if slot.is_some() {
-            return Err(GitCredentialError::DuplicateKey { key });
-        }
+        let protocol =
+            protocol.ok_or(GitCredentialError::MissingRequiredKey { key: "protocol" })?;
+        let host = host.ok_or(GitCredentialError::MissingRequiredKey { key: "host" })?;
+        let path_raw = path.ok_or(GitCredentialError::MissingRequiredKey { key: "path" })?;
 
-        let value = std::str::from_utf8(value_bytes)
-            .map_err(|_| GitCredentialError::InvalidUtf8 { key })?
-            .to_string();
-        *slot = Some(value);
+        // Strip a single trailing literal `.git` suffix (PROTOCOLS.md
+        // "`path` handling"). If that strip empties the path, the request
+        // is malformed — treat the same as an empty `path=` value.
+        let path = match path_raw.strip_suffix(".git") {
+            Some("") => return Err(GitCredentialError::EmptyValue { key: "path" }),
+            Some(stripped) => stripped.to_string(),
+            None => path_raw,
+        };
+
+        Ok(Self {
+            protocol,
+            host,
+            path,
+            client_supports_authtype,
+        })
     }
-
-    let protocol = protocol.ok_or(GitCredentialError::MissingRequiredKey { key: "protocol" })?;
-    let host = host.ok_or(GitCredentialError::MissingRequiredKey { key: "host" })?;
-    let path_raw = path.ok_or(GitCredentialError::MissingRequiredKey { key: "path" })?;
-
-    // Strip a single trailing literal `.git` suffix (PROTOCOLS.md
-    // "`path` handling"). If that strip empties the path, the request
-    // is malformed — treat the same as an empty `path=` value.
-    let path = match path_raw.strip_suffix(".git") {
-        Some("") => return Err(GitCredentialError::EmptyValue { key: "path" }),
-        Some(stripped) => stripped.to_string(),
-        None => path_raw,
-    };
-
-    Ok(Request {
-        protocol,
-        host,
-        path,
-        client_supports_authtype,
-    })
 }
 
-/// Emit the response shape git-credential expects. When
-/// `client_supports_authtype` is true (negotiated via
-/// `capability[]=authtype` in the request), emit the modern
-/// `authtype=Bearer` + `credential=<token>` + `ephemeral=true`
-/// shape; otherwise emit the legacy `username`/`password` shape
-/// for git ≤ 2.45.
-///
-/// The modern shape:
-/// - **`authtype=Bearer` + `credential=<token>`** produces the
-///   `Authorization: Bearer <token>` header git constructs in
-///   `http.c::http_append_auth_header` — the same form GitHub's
-///   REST API documents (the git-HTTP frontend accepts it too,
-///   though that's not explicitly documented).
-/// - **`ephemeral=true`** tells downstream credential helpers
-///   (cache, store) NOT to persist the credential — load-bearing
-///   for our 1-hour-TTL installation tokens.
-/// - `username` is omitted: when `credential` is set, the
-///   git-credential spec says `username` / `password` are not used.
-pub(crate) fn write_response(
-    resp: &Response,
-    client_supports_authtype: bool,
-    out: &mut Vec<u8>,
-) -> Result<(), GitCredentialError> {
-    check_response_field("password", &resp.password)?;
+impl Response {
+    /// Emit the response shape git-credential expects. Infallible by
+    /// construction: [`Response::new`] has already validated all
+    /// fields. When `client_supports_authtype` is true (negotiated
+    /// via `capability[]=authtype` in the request), emit the modern
+    /// `authtype=Bearer` + `credential=<token>` + `ephemeral=true`
+    /// shape; otherwise emit the legacy `username`/`password` shape
+    /// for git ≤ 2.45.
+    ///
+    /// The modern shape:
+    /// - **`authtype=Bearer` + `credential=<token>`** produces the
+    ///   `Authorization: Bearer <token>` header git constructs in
+    ///   `http.c::http_append_auth_header` — the same form GitHub's
+    ///   REST API documents (the git-HTTP frontend accepts it too,
+    ///   though that's not explicitly documented).
+    /// - **`ephemeral=true`** tells downstream credential helpers
+    ///   (cache, store) NOT to persist the credential — load-bearing
+    ///   for our 1-hour-TTL installation tokens.
+    /// - `username` is omitted: when `credential` is set, the
+    ///   git-credential spec says `username` / `password` are not used.
+    pub(crate) fn encode(&self, out: &mut Vec<u8>, client_supports_authtype: bool) {
+        let expiry_secs = self.password_expiry_unix_secs();
 
-    let expiry_secs = resp
-        .password_expiry_utc
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| GitCredentialError::EmitInvalidExpiry)?
-        .as_secs();
-    let expiry_str = expiry_secs.to_string();
-
-    if client_supports_authtype {
-        // Modern shape (git 2.46+ after authtype capability negotiation).
-        // The token in `resp.password` IS the bearer credential.
-        out.extend_from_slice(b"capability[]=authtype\n");
-        out.extend_from_slice(b"authtype=Bearer\n");
-        out.extend_from_slice(b"credential=");
-        out.extend_from_slice(resp.password.as_bytes());
-        out.push(b'\n');
-        out.extend_from_slice(b"ephemeral=true\n");
-        out.extend_from_slice(b"password_expiry_utc=");
-        out.extend_from_slice(expiry_str.as_bytes());
-        out.push(b'\n');
-        out.push(b'\n');
-    } else {
-        check_response_field("username", &resp.username)?;
-        // Legacy shape (git ≤ 2.45 or any client that didn't
-        // declare authtype capability). The `username` is always
-        // `x-access-token` for GitHub installation tokens.
-        out.extend_from_slice(b"username=");
-        out.extend_from_slice(resp.username.as_bytes());
-        out.push(b'\n');
-        out.extend_from_slice(b"password=");
-        out.extend_from_slice(resp.password.as_bytes());
-        out.push(b'\n');
-        out.extend_from_slice(b"password_expiry_utc=");
-        out.extend_from_slice(expiry_str.as_bytes());
-        out.push(b'\n');
-        out.push(b'\n');
-    }
-
-    Ok(())
-}
-
-fn check_response_field(field: &'static str, value: &str) -> Result<(), GitCredentialError> {
-    for &b in value.as_bytes() {
-        if matches!(b, 0x00 | 0x0D | 0x0A) {
-            return Err(GitCredentialError::ResponseControlByte { field });
+        if client_supports_authtype {
+            // Modern shape (git 2.46+ after authtype capability negotiation).
+            // The token in `self.password` IS the bearer credential.
+            out.extend_from_slice(b"capability[]=authtype\n");
+            out.extend_from_slice(b"authtype=Bearer\n");
+            out.extend_from_slice(b"credential=");
+            out.extend_from_slice(self.password.as_bytes());
+            out.push(b'\n');
+            out.extend_from_slice(b"ephemeral=true\n");
+        } else {
+            // Legacy shape (git ≤ 2.45 or any client that didn't
+            // declare authtype capability). The `username` is always
+            // `x-access-token` for GitHub installation tokens.
+            out.extend_from_slice(b"username=");
+            out.extend_from_slice(self.username.as_bytes());
+            out.push(b'\n');
+            out.extend_from_slice(b"password=");
+            out.extend_from_slice(self.password.as_bytes());
+            out.push(b'\n');
         }
+        // `write!` on Vec<u8> via io::Write formats `expiry_secs`
+        // directly into the buffer with no intermediate String.
+        // Vec<u8>'s io::Write impl never errors, so the expect is
+        // truly unreachable.
+        write!(out, "password_expiry_utc={expiry_secs}\n\n")
+            .expect("Vec<u8>'s io::Write is infallible");
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -302,17 +322,18 @@ mod tests {
     use std::time::Duration;
 
     fn resp(username: &str, password: &str, expiry_secs: u64) -> Response {
-        Response {
-            username: username.to_string(),
-            password: password.to_string(),
-            password_expiry_utc: SystemTime::UNIX_EPOCH + Duration::from_secs(expiry_secs),
-        }
+        Response::new(
+            username.to_string(),
+            password.to_string(),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(expiry_secs),
+        )
+        .expect("test inputs are valid")
     }
 
     #[test]
     fn parse_minimal_request_ok() {
         let input = b"protocol=https\nhost=github.com\npath=octocat/Spoon-Knife\n\n";
-        let req = parse(input).unwrap();
+        let req = Request::parse(input).unwrap();
         assert_eq!(req.protocol, "https");
         assert_eq!(req.host, "github.com");
         assert_eq!(req.path, "octocat/Spoon-Knife");
@@ -322,7 +343,7 @@ mod tests {
     #[test]
     fn parse_authtype_capability_sets_flag() {
         let input = b"capability[]=authtype\nprotocol=https\nhost=github.com\npath=o/r\n\n";
-        let req = parse(input).unwrap();
+        let req = Request::parse(input).unwrap();
         assert!(req.client_supports_authtype);
     }
 
@@ -331,7 +352,7 @@ mod tests {
         // `state` is a valid capability we don't implement; declaring
         // it must not toggle the authtype flag.
         let input = b"capability[]=state\nprotocol=https\nhost=github.com\npath=o/r\n\n";
-        let req = parse(input).unwrap();
+        let req = Request::parse(input).unwrap();
         assert!(!req.client_supports_authtype);
     }
 
@@ -340,28 +361,28 @@ mod tests {
         // git-credential array semantics: empty value resets the list.
         let input =
             b"capability[]=authtype\ncapability[]=\nprotocol=https\nhost=github.com\npath=o/r\n\n";
-        let req = parse(input).unwrap();
+        let req = Request::parse(input).unwrap();
         assert!(!req.client_supports_authtype);
     }
 
     #[test]
     fn parse_strips_dot_git_suffix() {
         let input = b"protocol=https\nhost=github.com\npath=octocat/Spoon-Knife.git\n\n";
-        let req = parse(input).unwrap();
+        let req = Request::parse(input).unwrap();
         assert_eq!(req.path, "octocat/Spoon-Knife");
     }
 
     #[test]
     fn parse_does_not_strip_inner_dot_git() {
         let input = b"protocol=https\nhost=github.com\npath=a.gitfoo/b\n\n";
-        let req = parse(input).unwrap();
+        let req = Request::parse(input).unwrap();
         assert_eq!(req.path, "a.gitfoo/b");
     }
 
     #[test]
     fn parse_accepts_unknown_keys() {
         let input = b"protocol=https\nhost=github.com\npath=foo\nwwwauth[]=Bearer realm=x\ncapability[]=authtype\n\n";
-        let req = parse(input).unwrap();
+        let req = Request::parse(input).unwrap();
         assert_eq!(req.host, "github.com");
         assert_eq!(req.path, "foo");
     }
@@ -369,7 +390,7 @@ mod tests {
     #[test]
     fn parse_preserves_host_case_byte_exact() {
         let input = b"protocol=https\nhost=GitHub.Com\npath=foo\n\n";
-        let req = parse(input).unwrap();
+        let req = Request::parse(input).unwrap();
         assert_eq!(req.host, "GitHub.Com");
     }
 
@@ -377,9 +398,12 @@ mod tests {
     fn parse_rejects_cr_in_host_value() {
         // Clone2Leak: attacker tries to inject a second line via CR.
         let input = b"protocol=https\nhost=github.com\rmalicious=1\npath=p\n\n";
-        let err = parse(input).unwrap_err();
+        let err = Request::parse(input).unwrap_err();
         assert!(
-            matches!(err, GitCredentialError::CarriageReturnInValue { key } if key == "host"),
+            matches!(
+                err,
+                GitCredentialError::ControlByteInLine { byte: 0x0D, .. }
+            ),
             "unexpected: {err:?}"
         );
     }
@@ -389,7 +413,7 @@ mod tests {
         // An LF byte mid-"value" ends the line; the bytes that follow
         // surface as a malformed line, not a value.
         let input = b"host=foo\nbar\nprotocol=https\npath=p\n\n";
-        let err = parse(input).unwrap_err();
+        let err = Request::parse(input).unwrap_err();
         assert!(
             matches!(err, GitCredentialError::MissingSeparator { line_no: 2 }),
             "unexpected: {err:?}"
@@ -397,10 +421,13 @@ mod tests {
     }
 
     #[test]
-    fn emit_rejects_cr_in_password() {
-        let r = resp("u", "tok\ren", 0);
-        let mut out = Vec::new();
-        let err = write_response(&r, false, &mut out).unwrap_err();
+    fn new_rejects_cr_in_password() {
+        let err = Response::new(
+            "u".to_string(),
+            "tok\ren".to_string(),
+            SystemTime::UNIX_EPOCH,
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             GitCredentialError::ResponseControlByte { field: "password" }
@@ -408,10 +435,13 @@ mod tests {
     }
 
     #[test]
-    fn emit_rejects_lf_in_username() {
-        let r = resp("u\ninject", "p", 0);
-        let mut out = Vec::new();
-        let err = write_response(&r, false, &mut out).unwrap_err();
+    fn new_rejects_lf_in_username() {
+        let err = Response::new(
+            "u\ninject".to_string(),
+            "p".to_string(),
+            SystemTime::UNIX_EPOCH,
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             GitCredentialError::ResponseControlByte { field: "username" }
@@ -421,7 +451,7 @@ mod tests {
     #[test]
     fn parse_rejects_missing_protocol() {
         let input = b"host=github.com\npath=foo\n\n";
-        let err = parse(input).unwrap_err();
+        let err = Request::parse(input).unwrap_err();
         assert!(matches!(
             err,
             GitCredentialError::MissingRequiredKey { key: "protocol" }
@@ -431,7 +461,7 @@ mod tests {
     #[test]
     fn parse_rejects_missing_host() {
         let input = b"protocol=https\npath=foo\n\n";
-        let err = parse(input).unwrap_err();
+        let err = Request::parse(input).unwrap_err();
         assert!(matches!(
             err,
             GitCredentialError::MissingRequiredKey { key: "host" }
@@ -441,7 +471,7 @@ mod tests {
     #[test]
     fn parse_rejects_missing_path() {
         let input = b"protocol=https\nhost=github.com\n\n";
-        let err = parse(input).unwrap_err();
+        let err = Request::parse(input).unwrap_err();
         assert!(matches!(
             err,
             GitCredentialError::MissingRequiredKey { key: "path" }
@@ -451,7 +481,7 @@ mod tests {
     #[test]
     fn parse_rejects_duplicate_host() {
         let input = b"protocol=https\nhost=foo.com\nhost=bar.com\npath=p\n\n";
-        let err = parse(input).unwrap_err();
+        let err = Request::parse(input).unwrap_err();
         assert!(matches!(
             err,
             GitCredentialError::DuplicateKey { key: "host" }
@@ -461,7 +491,7 @@ mod tests {
     #[test]
     fn parse_rejects_duplicate_path() {
         let input = b"protocol=https\nhost=github.com\npath=a\npath=b\n\n";
-        let err = parse(input).unwrap_err();
+        let err = Request::parse(input).unwrap_err();
         assert!(matches!(
             err,
             GitCredentialError::DuplicateKey { key: "path" }
@@ -471,7 +501,7 @@ mod tests {
     #[test]
     fn parse_rejects_empty_host_value() {
         let input = b"protocol=https\nhost=\npath=foo\n\n";
-        let err = parse(input).unwrap_err();
+        let err = Request::parse(input).unwrap_err();
         assert!(matches!(
             err,
             GitCredentialError::EmptyValue { key: "host" }
@@ -481,9 +511,12 @@ mod tests {
     #[test]
     fn parse_rejects_nul_in_path() {
         let input = b"protocol=https\nhost=github.com\npath=foo\x00bar\n\n";
-        let err = parse(input).unwrap_err();
+        let err = Request::parse(input).unwrap_err();
         assert!(
-            matches!(err, GitCredentialError::NulInValue { key } if key == "path"),
+            matches!(
+                err,
+                GitCredentialError::ControlByteInLine { byte: 0x00, .. }
+            ),
             "unexpected: {err:?}"
         );
     }
@@ -491,7 +524,7 @@ mod tests {
     #[test]
     fn parse_rejects_non_utf8_value() {
         let input = b"protocol=https\nhost=foo\xFFbar\npath=p\n\n";
-        let err = parse(input).unwrap_err();
+        let err = Request::parse(input).unwrap_err();
         assert!(
             matches!(err, GitCredentialError::InvalidUtf8 { key } if key == "host"),
             "unexpected: {err:?}"
@@ -501,7 +534,7 @@ mod tests {
     #[test]
     fn parse_rejects_missing_separator() {
         let input = b"protocol=https\nhost-bad\npath=p\n\n";
-        let err = parse(input).unwrap_err();
+        let err = Request::parse(input).unwrap_err();
         assert!(matches!(
             err,
             GitCredentialError::MissingSeparator { line_no: 2 }
@@ -511,21 +544,21 @@ mod tests {
     #[test]
     fn parse_rejects_empty_key() {
         let input = b"protocol=https\n=value\npath=p\n\n";
-        let err = parse(input).unwrap_err();
+        let err = Request::parse(input).unwrap_err();
         assert!(matches!(err, GitCredentialError::EmptyKey { line_no: 2 }));
     }
 
     #[test]
     fn parse_rejects_unterminated_block() {
         let input = b"protocol=https\nhost=github.com\npath=p\n";
-        let err = parse(input).unwrap_err();
+        let err = Request::parse(input).unwrap_err();
         assert!(matches!(err, GitCredentialError::UnterminatedBlock));
     }
 
     #[test]
     fn parse_rejects_trailing_bytes_after_blank_line() {
         let input = b"protocol=https\nhost=github.com\npath=p\n\nextra\n";
-        let err = parse(input).unwrap_err();
+        let err = Request::parse(input).unwrap_err();
         assert!(matches!(err, GitCredentialError::TrailingBytes));
     }
 
@@ -535,7 +568,7 @@ mod tests {
         // unknown-key path, so `host=` is absent and the parser
         // surfaces MissingRequiredKey { key: "host" }.
         let input = b"protocol=https\nurl=https://github.com/owner/repo\n\n";
-        let err = parse(input).unwrap_err();
+        let err = Request::parse(input).unwrap_err();
         assert!(matches!(
             err,
             GitCredentialError::MissingRequiredKey { key: "host" }
@@ -547,7 +580,7 @@ mod tests {
         // `host = x` parses as key `b"host "` (with trailing space),
         // which is unknown and ignored.
         let input = b"protocol=https\nhost = github.com\npath=foo\n\n";
-        let err = parse(input).unwrap_err();
+        let err = Request::parse(input).unwrap_err();
         assert!(matches!(
             err,
             GitCredentialError::MissingRequiredKey { key: "host" }
@@ -558,7 +591,7 @@ mod tests {
     fn emit_round_trips_minimal_response() {
         let r = resp("x-access-token", "ghs_xxxxxxxxxxx", 1_700_000_000);
         let mut out = Vec::new();
-        write_response(&r, false, &mut out).unwrap();
+        r.encode(&mut out, false);
         assert_eq!(
             out,
             b"username=x-access-token\npassword=ghs_xxxxxxxxxxx\npassword_expiry_utc=1700000000\n\n"
@@ -569,7 +602,7 @@ mod tests {
     fn emit_appends_to_nonempty_buffer() {
         let r = resp("u", "p", 1);
         let mut out = b"junk".to_vec();
-        write_response(&r, false, &mut out).unwrap();
+        r.encode(&mut out, false);
         assert_eq!(&out[..4], b"junk");
         assert_eq!(
             &out[4..],
@@ -581,28 +614,27 @@ mod tests {
     fn emit_renders_expiry_as_unix_seconds() {
         let r = resp("u", "p", 42);
         let mut out = Vec::new();
-        write_response(&r, false, &mut out).unwrap();
+        r.encode(&mut out, false);
         let body = std::str::from_utf8(&out).unwrap();
         assert!(body.contains("password_expiry_utc=42\n"));
     }
 
     #[test]
-    fn emit_rejects_pre_epoch_expiry() {
-        let r = Response {
-            username: "u".to_string(),
-            password: "p".to_string(),
-            password_expiry_utc: SystemTime::UNIX_EPOCH - Duration::from_secs(1),
-        };
-        let mut out = Vec::new();
-        let err = write_response(&r, false, &mut out).unwrap_err();
-        assert!(matches!(err, GitCredentialError::EmitInvalidExpiry));
+    fn new_rejects_pre_epoch_expiry() {
+        let err = Response::new(
+            "u".to_string(),
+            "p".to_string(),
+            SystemTime::UNIX_EPOCH - Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(matches!(err, GitCredentialError::PreEpochExpiry));
     }
 
     #[test]
     fn emit_modern_shape_when_authtype_negotiated() {
         let r = resp("x-access-token", "ghs_xxxxxxxxxxx", 1_700_000_000);
         let mut out = Vec::new();
-        write_response(&r, true, &mut out).unwrap();
+        r.encode(&mut out, true);
         assert_eq!(
             out,
             b"capability[]=authtype\n\
@@ -621,7 +653,7 @@ mod tests {
         // "x-access-token" for us) must NOT leak into the wire.
         let r = resp("x-access-token", "ghs_tok", 1);
         let mut out = Vec::new();
-        write_response(&r, true, &mut out).unwrap();
+        r.encode(&mut out, true);
         let body = std::str::from_utf8(&out).unwrap();
         assert!(!body.contains("username="));
         assert!(!body.contains("password=")); // distinct from `password_expiry_utc`
@@ -629,13 +661,17 @@ mod tests {
     }
 
     #[test]
-    fn emit_modern_rejects_cr_in_token() {
+    fn new_rejects_cr_in_token() {
         // The token goes through the same CR/LF/NUL guard as the
         // legacy `password` field — a malformed token must never
-        // produce an extra wire line.
-        let r = resp("x-access-token", "ghs_xxx\rextra=line", 1);
-        let mut out = Vec::new();
-        let err = write_response(&r, true, &mut out).unwrap_err();
+        // be wrappable in a `Response` and so can never produce an
+        // extra wire line.
+        let err = Response::new(
+            "x-access-token".to_string(),
+            "ghs_xxx\rextra=line".to_string(),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             GitCredentialError::ResponseControlByte { field: "password" }
@@ -644,17 +680,17 @@ mod tests {
 
     #[test]
     fn parse_accepts_value_just_under_max() {
-        let host = "h".repeat(MAX_VALUE_BYTES);
+        let host = "h".repeat(Request::MAX_VALUE_BYTES);
         let input = format!("protocol=https\nhost={host}\npath=p\n\n").into_bytes();
-        let req = parse(&input).unwrap();
-        assert_eq!(req.host.len(), MAX_VALUE_BYTES);
+        let req = Request::parse(&input).unwrap();
+        assert_eq!(req.host.len(), Request::MAX_VALUE_BYTES);
     }
 
     #[test]
     fn parse_rejects_value_just_over_max() {
-        let host = "h".repeat(MAX_VALUE_BYTES + 1);
+        let host = "h".repeat(Request::MAX_VALUE_BYTES + 1);
         let input = format!("protocol=https\nhost={host}\npath=p\n\n").into_bytes();
-        let err = parse(&input).unwrap_err();
+        let err = Request::parse(&input).unwrap_err();
         assert!(matches!(
             err,
             GitCredentialError::ValueTooLong { key: "host", .. }
@@ -666,8 +702,8 @@ mod tests {
         // Build a block one byte past the request cap. The cap is
         // checked before any line scanning, so we don't need a
         // well-formed inner shape.
-        let input = vec![b'x'; PARSER_HARD_MAX + 1];
-        let err = parse(&input).unwrap_err();
+        let input = vec![b'x'; Request::PARSER_HARD_MAX + 1];
+        let err = Request::parse(&input).unwrap_err();
         assert!(matches!(err, GitCredentialError::RequestTooLarge { .. }));
     }
 }

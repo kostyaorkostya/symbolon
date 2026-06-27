@@ -21,9 +21,8 @@ use serde_json::Value;
 use snow::TransportState;
 use symbolon::transport::{self, MAX_MESSAGE_SIZE};
 use symbolon::{
-    AdminConfig, ClientsConfig, Config, CpuWorker, GitHubProvider, ListenConfig, LogLevel,
-    LoggingConfig, MlockMode, ProviderGithub, Providers, RuntimeConfig, SandboxMode,
-    SecurityConfig,
+    AdminConfig, ClientsConfig, Config, CpuWorker, GitHubProvider, ListenConfig, LoggingConfig,
+    MlockMode, ProviderGithub, Providers, RuntimeConfig, SandboxMode, SecurityConfig,
 };
 use wiremock::matchers::{body_bytes, method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -174,7 +173,7 @@ pub fn build_full_config(paths: &TempPaths, api_base: String, bind: SocketAddr) 
             file: paths.clients.clone(),
         },
         logging: LoggingConfig {
-            level: LogLevel::Info,
+            level: tracing::Level::INFO,
         },
         security: SecurityConfig {
             sandbox: SandboxMode::Off,
@@ -197,7 +196,7 @@ pub fn build_full_config(paths: &TempPaths, api_base: String, bind: SocketAddr) 
     }
 }
 
-/// Write a `clients.json` (schema v1) with the given enrolled identities.
+/// Write a `clients.json` with the given enrolled identities.
 pub fn write_clients_json(path: &Path, entries: &[&str]) {
     let entries_json: Vec<String> = entries
         .iter()
@@ -207,7 +206,7 @@ pub fn write_clients_json(path: &Path, entries: &[&str]) {
             )
         })
         .collect();
-    let body = format!(r#"{{"version":1,"clients":[{}]}}"#, entries_json.join(","));
+    let body = format!(r#"{{"clients":[{}]}}"#, entries_json.join(","));
     std::fs::write(path, body).unwrap();
 }
 
@@ -246,8 +245,10 @@ pub async fn client_handshake_and_send(
     psk: [u8; 32],
     payload: &[u8],
 ) -> Vec<u8> {
+    let identity = symbolon::Identity::parse(identity).expect("test identity must be valid");
+    let psk = symbolon::Psk::from(psk);
     let mut stream = TcpStream::connect(addr).await.expect("tcp connect");
-    let prelude = transport::encode_prelude(identity).expect("encode prelude");
+    let prelude = transport::encode_prelude(&identity);
     let BufResult(res, _) = stream.write_all(prelude).await;
     res.expect("write prelude");
 
@@ -293,15 +294,17 @@ pub async fn client_handshake_and_read_eof(
     psk: [u8; 32],
     payload: &[u8],
 ) -> Vec<u8> {
+    let identity = match symbolon::Identity::parse(identity) {
+        Ok(id) => id,
+        Err(_) => return Vec::new(),
+    };
+    let psk = symbolon::Psk::from(psk);
     let mut stream = match TcpStream::connect(addr).await {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
 
-    let prelude = match transport::encode_prelude(identity) {
-        Ok(p) => p,
-        Err(_) => return Vec::new(),
-    };
+    let prelude = transport::encode_prelude(&identity);
     let BufResult(res, _) = stream.write_all(prelude).await;
     if res.is_err() {
         return Vec::new();

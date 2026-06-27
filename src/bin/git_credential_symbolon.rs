@@ -29,6 +29,7 @@ use std::time::Duration;
 use argh::FromArgs;
 
 use symbolon::transport::{Initiator, SessionError, Step};
+use symbolon::{Identity, IdentityError, Psk};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -84,6 +85,13 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &Args) -> Result<(), ClientError> {
+    // Parse the identity at the argv boundary so a misconfigured
+    // invocation fails with a clear "bad identity" message, not
+    // through the transport layer's wire-shaped errors.
+    let identity = Identity::parse(&args.identity).map_err(|source| ClientError::BadIdentity {
+        raw: args.identity.clone(),
+        source,
+    })?;
     let psk = load_psk(&args.psk_file)?;
     let mut request = Vec::new();
     std::io::stdin()
@@ -91,9 +99,9 @@ fn run(args: &Args) -> Result<(), ClientError> {
         .map_err(ClientError::ReadStdin)?;
 
     // Build the Initiator BEFORE opening the socket. Validates the
-    // identity charset and PSK length, so a misconfigured invocation
-    // fails fast without a wasted TCP roundtrip.
-    let sess = Initiator::new(&args.identity, psk, request).map_err(ClientError::Session)?;
+    // PSK length, so a misconfigured invocation fails fast without a
+    // wasted TCP roundtrip.
+    let sess = Initiator::new(identity, psk, request).map_err(ClientError::Session)?;
 
     let mut stream = connect(&args.endpoint)?;
     stream
@@ -162,30 +170,15 @@ fn drive(stream: &mut TcpStream, mut sess: Initiator) -> Result<Vec<u8>, ClientE
     }
 }
 
-fn load_psk(path: &Path) -> Result<[u8; 32], ClientError> {
+fn load_psk(path: &Path) -> Result<Psk, ClientError> {
     let text = std::fs::read_to_string(path).map_err(|source| ClientError::ReadPsk {
         path: path.to_path_buf(),
         source,
     })?;
-    let hex_str = text.trim();
-    if hex_str.len() != 64 {
-        return Err(ClientError::BadPskLen {
-            path: path.to_path_buf(),
-            got: hex_str.len(),
-        });
-    }
-    let mut out = [0u8; 32];
-    hex::decode_to_slice(hex_str, &mut out).map_err(|e| match e {
-        hex::FromHexError::InvalidHexCharacter { c, .. } => ClientError::BadPskHex {
-            path: path.to_path_buf(),
-            byte: c as u8,
-        },
-        _ => ClientError::BadPskLen {
-            path: path.to_path_buf(),
-            got: hex_str.len(),
-        },
-    })?;
-    Ok(out)
+    Psk::from_hex(text.trim()).map_err(|source| ClientError::BadPsk {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -196,10 +189,12 @@ enum ClientError {
         #[source]
         source: std::io::Error,
     },
-    #[error("PSK file {} must contain exactly 64 hex chars (got {got})", path.display())]
-    BadPskLen { path: PathBuf, got: usize },
-    #[error("PSK file {} has non-hex byte 0x{byte:02x}", path.display())]
-    BadPskHex { path: PathBuf, byte: u8 },
+    #[error("PSK file {} is malformed", path.display())]
+    BadPsk {
+        path: PathBuf,
+        #[source]
+        source: hex::FromHexError,
+    },
     #[error("resolving endpoint {endpoint:?} failed")]
     Resolve {
         endpoint: String,
@@ -224,4 +219,10 @@ enum ClientError {
     ReadHandshake(#[source] std::io::Error),
     #[error("Noise session error")]
     Session(#[source] SessionError),
+    #[error("invalid --identity {raw:?}")]
+    BadIdentity {
+        raw: String,
+        #[source]
+        source: IdentityError,
+    },
 }

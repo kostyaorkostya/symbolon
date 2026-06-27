@@ -677,19 +677,30 @@ impl GitHubProvider {
                 match meta.status {
                     201 => {
                         let (token, expires_at) = Self::parse_mint_response(&body)?;
+                        // GitHub-specific sentinel: when the username on a
+                        // git HTTPS clone is the literal `x-access-token`,
+                        // the password is interpreted as an installation
+                        // access token (vs a personal access token or OAuth
+                        // token). Documented in GitHub Apps "Authenticating
+                        // as an installation".
+                        //
+                        // `Response::new` validates that the token has no
+                        // CR/LF/NUL and that the expiry isn't pre-epoch.
+                        // GitHub has never been observed to return such a
+                        // token; if it ever does, surface it as a malformed
+                        // mint response rather than letting bad bytes reach
+                        // the wire emit.
+                        let response = git_credential::Response::new(
+                            "x-access-token".to_string(),
+                            token,
+                            expires_at,
+                        )
+                        .map_err(|_| GithubError::ParseResponse {
+                            context: "mint",
+                            detail: "invalid token or expiry from GitHub",
+                        })?;
                         Ok(AbstractMintOutcome {
-                            response: git_credential::Response {
-                                // GitHub-specific sentinel: when the username
-                                // on a git HTTPS clone is the literal
-                                // `x-access-token`, the password is
-                                // interpreted as an installation access token
-                                // (vs a personal access token or OAuth token).
-                                // Documented in GitHub Apps "Authenticating
-                                // as an installation".
-                                username: "x-access-token".to_string(),
-                                password: token,
-                                password_expiry_utc: expires_at,
-                            },
+                            response,
                             out_req_id: out_req_id.clone(),
                             provider_req_id: meta.provider_req_id.clone(),
                         })
@@ -750,9 +761,6 @@ struct CallMeta {
 // JWT signing
 // ============================================================================
 
-const JWT_LEEWAY_PAST: u64 = 60;
-const JWT_LIFETIME: u64 = 540;
-
 #[derive(Serialize)]
 struct JwtClaims {
     iss: String,
@@ -761,12 +769,20 @@ struct JwtClaims {
 }
 
 impl JwtClaims {
+    /// Clock-skew leeway: stamp `iat` 60 s in the past so a slightly
+    /// behind broker still passes GitHub's "iat in the future" check.
+    const LEEWAY_PAST_SECS: u64 = 60;
+    /// Lifetime: 9 minutes. GitHub caps App JWTs at 10 minutes; the
+    /// 60 s margin matches `LEEWAY_PAST_SECS` so total skew tolerance
+    /// is 1 minute on either side.
+    const LIFETIME_SECS: u64 = 540;
+
     fn new(now: SystemTime, client_id: &str) -> Self {
         let unix = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         Self {
             iss: client_id.to_string(),
-            iat: unix.saturating_sub(JWT_LEEWAY_PAST),
-            exp: unix.saturating_add(JWT_LIFETIME),
+            iat: unix.saturating_sub(Self::LEEWAY_PAST_SECS),
+            exp: unix.saturating_add(Self::LIFETIME_SECS),
         }
     }
 }

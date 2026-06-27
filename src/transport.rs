@@ -38,6 +38,9 @@
 
 use snow::{Builder, HandshakeState, TransportState, params::NoiseParams};
 
+use crate::identity::{Identity, IdentityError};
+use crate::psk::Psk;
+
 /// `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s`. NN (no static keys), `psk0` mixes
 /// the pre-shared key before the handshake; 1-RTT.
 pub const NOISE_PATTERN: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
@@ -55,9 +58,10 @@ pub const PRELUDE_MAGIC: [u8; 4] = *b"SBLN";
 /// changes; daemon rejects unknown versions.
 pub const PRELUDE_VERSION: u8 = 0x01;
 
-/// Maximum identity byte length. Matches the practical-name range; chosen so
-/// a malformed prelude can never exceed `6 + MAX_IDENTITY_LEN` bytes.
-pub const MAX_IDENTITY_LEN: usize = 64;
+/// Prelude carries `id_len` as a `u8`; `Identity::MAX_LEN` must fit
+/// in that byte. Mirrors the `_WIRE_BUDGET_FITS_PARSER` pattern in
+/// `daemon.rs` — catch at compile time, not via `debug_assert!`.
+const _IDENTITY_FITS_PRELUDE_LEN: () = assert!(Identity::MAX_LEN <= u8::MAX as usize);
 
 /// Errors raised when parsing or validating the identity prelude.
 #[derive(Debug, thiserror::Error)]
@@ -68,13 +72,32 @@ pub enum PreludeError {
     BadMagic { got: [u8; 4] },
     #[error("prelude version {got} not supported (expected {PRELUDE_VERSION})")]
     BadVersion { got: u8 },
-    #[error("prelude identity length {got} out of range (1..={MAX_IDENTITY_LEN})")]
+    #[error(
+        "prelude identity length {got} out of range (1..={})",
+        Identity::MAX_LEN
+    )]
     BadIdentityLen { got: u8 },
     #[error(
         "prelude identity byte 0x{byte:02x} at offset {offset} is outside the allowed \
          charset [A-Za-z0-9._-]"
     )]
     InvalidCharset { offset: usize, byte: u8 },
+}
+
+/// Lift identity validation errors from `Identity::parse` (used by the
+/// wire-side body parser) into the wire-error vocabulary. `BadLen.got`
+/// is `usize`; the wire reports `u8`. Saturate — the wire parser can't
+/// produce > 255 because `parse_prelude_head` already validated id_len
+/// fits in a single byte.
+impl From<IdentityError> for PreludeError {
+    fn from(e: IdentityError) -> Self {
+        match e {
+            IdentityError::BadLen { got } => Self::BadIdentityLen {
+                got: got.min(u8::MAX as usize) as u8,
+            },
+            IdentityError::BadCharset { offset, byte } => Self::InvalidCharset { offset, byte },
+        }
+    }
 }
 
 /// Errors raised when constructing or driving the Noise handshake.
@@ -87,8 +110,6 @@ pub enum PreludeError {
 pub enum TransportError {
     #[error("constructing Noise handshake parameters failed")]
     Params(#[source] snow::Error),
-    #[error("PSK must be exactly 32 bytes; got {got}")]
-    BadPskLen { got: usize },
     #[error("Noise handshake read failed")]
     HandshakeRead(#[source] snow::Error),
     #[error("Noise handshake write failed")]
@@ -103,77 +124,25 @@ pub enum TransportError {
     OversizedFrame { got: usize },
 }
 
-/// Parsed identity prelude. Borrows the identity bytes from the input buffer;
-/// callers can clone into an owned `String` via [`Identity::to_string`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Identity<'a>(&'a str);
-
-impl<'a> Identity<'a> {
-    /// The raw identity string. Guaranteed to match `[A-Za-z0-9._-]+` and to
-    /// be between 1 and `MAX_IDENTITY_LEN` bytes long.
-    pub fn as_str(&self) -> &'a str {
-        self.0
-    }
-
-    /// True iff `s` would parse as a valid identity body: non-empty,
-    /// at most [`MAX_IDENTITY_LEN`] bytes, all bytes in
-    /// `[A-Za-z0-9._-]`. Single source of truth for the validation
-    /// rule shared with the admin enroll path and `psk_store`.
-    pub fn is_valid(s: &str) -> bool {
-        let bytes = s.as_bytes();
-        !bytes.is_empty()
-            && bytes.len() <= MAX_IDENTITY_LEN
-            && bytes.iter().copied().all(is_identity_byte)
-    }
-}
-
-impl std::fmt::Display for Identity<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0)
-    }
-}
-
-/// Canonical "valid byte in a client identity" predicate: ASCII
-/// alphanumeric or one of `.`, `_`, `-`. Rejects CR/LF/NUL/
-/// whitespace by construction. Same rule as the git-credential
-/// value rule (AGENTS.md invariant #12 in spirit). Shared with
-/// `psk_store` (file-row validation) and `admin` (enroll-input
-/// validation) so drift between the three call sites is
-/// impossible.
-pub(crate) fn is_identity_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')
-}
-
 /// Total prelude byte length given an identity length.
 pub const fn prelude_size(identity_len: usize) -> usize {
     6 + identity_len
 }
 
-/// Encode an identity into prelude bytes. Surfaces the same
-/// `PreludeError` variants the wire-side parser would emit, so
-/// the client can fail-fast with the actual reason rather than
-/// sending bytes the server will reject.
-pub fn encode_prelude(identity: &str) -> Result<Vec<u8>, PreludeError> {
-    let bytes = identity.as_bytes();
-    let id_len = u8::try_from(bytes.len())
-        .ok()
-        .filter(|&n| n >= 1 && (n as usize) <= MAX_IDENTITY_LEN)
-        .ok_or(PreludeError::BadIdentityLen {
-            got: bytes.len().min(u8::MAX as usize) as u8,
-        })?;
-    if let Some((offset, &byte)) = bytes
-        .iter()
-        .enumerate()
-        .find(|&(_, &b)| !is_identity_byte(b))
-    {
-        return Err(PreludeError::InvalidCharset { offset, byte });
-    }
+/// Encode an `Identity` into prelude bytes. Infallible: `Identity`'s
+/// constructor already enforces `1..=Identity::MAX_LEN` length and the
+/// `[A-Za-z0-9._-]` charset, which is exactly what the wire requires.
+pub fn encode_prelude(identity: &Identity) -> Vec<u8> {
+    // `Identity::parse` bounds `bytes.len()` to `1..=Identity::MAX_LEN`,
+    // and `_IDENTITY_FITS_PRELUDE_LEN` proves at compile time that
+    // `Identity::MAX_LEN <= u8::MAX`, so the cast is statically lossless.
+    let bytes = identity.as_str().as_bytes();
     let mut out = Vec::with_capacity(prelude_size(bytes.len()));
     out.extend_from_slice(&PRELUDE_MAGIC);
     out.push(PRELUDE_VERSION);
-    out.push(id_len);
+    out.push(bytes.len() as u8);
     out.extend_from_slice(bytes);
-    Ok(out)
+    out
 }
 
 /// Validate the 6-byte prelude head: magic, version, and identity length.
@@ -181,42 +150,52 @@ pub fn encode_prelude(identity: &str) -> Result<Vec<u8>, PreludeError> {
 /// state machine to reject `bad_magic` / `bad_version` / `bad_identity_len`
 /// after the first 6 bytes, before pulling the identity body off the wire.
 fn parse_prelude_head(head: &[u8; 6]) -> Result<u8, PreludeError> {
-    let magic: [u8; 4] = head[0..4].try_into().expect("slice of length 4");
-    if magic != PRELUDE_MAGIC {
-        return Err(PreludeError::BadMagic { got: magic });
+    let &[m0, m1, m2, m3, version, id_len] = head;
+    match ([m0, m1, m2, m3], version, id_len) {
+        (m, _, _) if m != PRELUDE_MAGIC => Err(PreludeError::BadMagic { got: m }),
+        (_, v, _) if v != PRELUDE_VERSION => Err(PreludeError::BadVersion { got: v }),
+        (_, _, l) if l == 0 || l as usize > Identity::MAX_LEN => {
+            Err(PreludeError::BadIdentityLen { got: l })
+        }
+        (_, _, l) => Ok(l),
     }
-    let version = head[4];
-    if version != PRELUDE_VERSION {
-        return Err(PreludeError::BadVersion { got: version });
-    }
-    let id_len = head[5];
-    if id_len == 0 || (id_len as usize) > MAX_IDENTITY_LEN {
-        return Err(PreludeError::BadIdentityLen { got: id_len });
-    }
-    Ok(id_len)
 }
 
-/// Validate the identity body charset and return the borrowed identity.
+/// Validate the identity body charset and return the parsed [`Identity`].
 /// Caller has already validated the head (so `body.len()` matches the
 /// declared `id_len`).
-fn parse_prelude_body(body: &[u8]) -> Result<Identity<'_>, PreludeError> {
-    for (offset, &b) in body.iter().enumerate() {
-        if !is_identity_byte(b) {
-            return Err(PreludeError::InvalidCharset { offset, byte: b });
+///
+/// Non-UTF-8 input falls through `Identity::parse` indirectly: we
+/// first try a fast `from_utf8` and on failure surface the bad byte
+/// at the first invalid offset via `InvalidCharset`. That keeps the
+/// "first bad byte" reporting the wire layer wants while letting
+/// `Identity::parse` own the actual charset rule.
+fn parse_prelude_body(body: &[u8]) -> Result<Identity, PreludeError> {
+    match std::str::from_utf8(body) {
+        Ok(s) => Ok(Identity::parse(s)?),
+        Err(e) => {
+            // `valid_up_to()` is the offset of the first byte that
+            // broke UTF-8; that byte also fails the ASCII-only
+            // identity charset rule, so reporting it as
+            // `InvalidCharset` matches what `Identity::parse` would
+            // say if the bytes happened to be valid UTF-8.
+            let offset = e.valid_up_to();
+            Err(PreludeError::InvalidCharset {
+                offset,
+                byte: body[offset],
+            })
         }
     }
-    // SAFETY: is_identity_byte only accepts ASCII bytes, so the slice is valid UTF-8.
-    let id_str = std::str::from_utf8(body).expect("ascii-only by construction");
-    Ok(Identity(id_str))
 }
 
-/// Parse a prelude from `input`. On success returns the borrowed identity and
-/// the byte length consumed. The caller slices `input[consumed..]` to find
-/// the first Noise framed message. The fuzz harness targets this function.
+/// Parse a prelude from `input`. On success returns the parsed
+/// identity and the byte length consumed. The caller slices
+/// `input[consumed..]` to find the first Noise framed message. The
+/// fuzz harness targets this function.
 ///
-/// Streaming callers should use [`Responder`] instead; it sees bytes as they
-/// arrive and validates the head before reading the body.
-pub fn parse_prelude(input: &[u8]) -> Result<(Identity<'_>, usize), PreludeError> {
+/// Streaming callers should use [`Responder`] instead; it sees bytes
+/// as they arrive and validates the head before reading the body.
+pub fn parse_prelude(input: &[u8]) -> Result<(Identity, usize), PreludeError> {
     if input.len() < 6 {
         return Err(PreludeError::Incomplete {
             needed: 6 - input.len(),
@@ -234,25 +213,22 @@ pub fn parse_prelude(input: &[u8]) -> Result<(Identity<'_>, usize), PreludeError
     Ok((identity, total))
 }
 
-/// Build the responder (server) side of `NOISE_PATTERN` with the given 32-byte PSK.
-pub fn responder(psk: &[u8]) -> Result<HandshakeState, TransportError> {
+/// Build the responder (server) side of `NOISE_PATTERN` with the given PSK.
+pub fn responder(psk: &Psk) -> Result<HandshakeState, TransportError> {
     build_handshake(psk, /* initiator */ false)
 }
 
-/// Build the initiator (client) side of `NOISE_PATTERN` with the given 32-byte PSK.
-pub fn initiator(psk: &[u8]) -> Result<HandshakeState, TransportError> {
+/// Build the initiator (client) side of `NOISE_PATTERN` with the given PSK.
+pub fn initiator(psk: &Psk) -> Result<HandshakeState, TransportError> {
     build_handshake(psk, /* initiator */ true)
 }
 
-fn build_handshake(psk: &[u8], initiator: bool) -> Result<HandshakeState, TransportError> {
-    let psk_array: &[u8; 32] = psk
-        .try_into()
-        .map_err(|_| TransportError::BadPskLen { got: psk.len() })?;
+fn build_handshake(psk: &Psk, initiator: bool) -> Result<HandshakeState, TransportError> {
     let params: NoiseParams = NOISE_PATTERN
         .parse()
         .map_err(|e: snow::Error| TransportError::Params(e))?;
     let builder = Builder::new(params)
-        .psk(0, psk_array)
+        .psk(0, psk.as_bytes())
         .map_err(TransportError::Params)?;
     if initiator {
         builder.build_initiator().map_err(TransportError::Params)
@@ -355,7 +331,7 @@ pub enum Step {
     ReadExact { n: usize },
     /// Look up the PSK for `identity`. Caller calls `set_psk(psk)`;
     /// dropping the session is how a "not enrolled" lookup ends.
-    NeedPsk { identity: String },
+    NeedPsk { identity: Identity },
     /// Write these bytes to the wire, then call `wrote()`.
     Write(Vec<u8>),
     /// Decrypted plaintext request the responder just received. Caller
@@ -405,8 +381,6 @@ pub enum SessionError {
     TransportWrite(#[source] snow::Error),
     #[error("frame body length {got} exceeds maximum {MAX_MESSAGE_SIZE}")]
     FrameTooBig { got: usize },
-    #[error("PSK must be 32 bytes; got {got}")]
-    BadPskLen { got: usize },
     #[error("recv length mismatch: expected {expected}, got {got}")]
     RecvLen { expected: usize, got: usize },
     #[error("{method} called in wrong state ({state})")]
@@ -442,7 +416,6 @@ impl From<TransportError> for SessionError {
     fn from(e: TransportError) -> Self {
         match e {
             TransportError::OversizedFrame { got } => Self::FrameTooBig { got },
-            TransportError::BadPskLen { got } => Self::BadPskLen { got },
             TransportError::HandshakeRead(s) => Self::HandshakeRead(s),
             TransportError::HandshakeWrite(s) => Self::HandshakeWrite(s),
             TransportError::Transition(s) => Self::IntoTransport(s),
@@ -485,7 +458,7 @@ enum RState {
     },
     /// Identity parsed; ask the driver to look up the PSK.
     NeedPsk {
-        identity: String,
+        identity: Identity,
     },
     /// `Step::NeedPsk` has been emitted (identity moved out).
     /// Caller must invoke `set_psk` next; another `step()` here is
@@ -693,7 +666,7 @@ impl Responder {
             RState::WantPreludeBody { head } => {
                 let id_len = head[5] as usize;
                 SessionError::check_recv_len(id_len, bytes.len())?;
-                let identity = parse_prelude_body(bytes)?.as_str().to_string();
+                let identity = parse_prelude_body(bytes)?;
                 self.state = RState::NeedPsk { identity };
                 Ok(())
             }
@@ -740,7 +713,7 @@ impl Responder {
     }
 
     /// Provide the PSK requested by the previous `Step::NeedPsk`.
-    pub fn set_psk(&mut self, psk: [u8; 32]) -> Result<(), SessionError> {
+    pub fn set_psk(&mut self, psk: Psk) -> Result<(), SessionError> {
         let state_name: &str = (&self.state).into();
         match std::mem::replace(&mut self.state, RState::Failed) {
             RState::AwaitingPsk => {
@@ -900,8 +873,8 @@ pub struct Initiator {
 }
 
 impl Initiator {
-    pub fn new(identity: &str, psk: [u8; 32], request: Vec<u8>) -> Result<Self, SessionError> {
-        let prelude = encode_prelude(identity)?;
+    pub fn new(identity: Identity, psk: Psk, request: Vec<u8>) -> Result<Self, SessionError> {
+        let prelude = encode_prelude(&identity);
         let hs = initiator(&psk)?;
         Ok(Self {
             state: IState::WritePrelude {
@@ -1076,17 +1049,17 @@ impl Initiator {
 mod tests {
     use super::*;
 
-    fn good_identity() -> &'static str {
-        "dev-vm-1.test_03"
+    fn good_identity() -> Identity {
+        Identity::parse("dev-vm-1.test_03").unwrap()
     }
 
     #[test]
     fn prelude_round_trip() {
         let id = good_identity();
-        let bytes = encode_prelude(id).expect("identity is valid");
-        assert_eq!(bytes.len(), prelude_size(id.len()));
+        let bytes = encode_prelude(&id);
+        assert_eq!(bytes.len(), prelude_size(id.as_str().len()));
         let (parsed, consumed) = parse_prelude(&bytes).expect("round-trip parse");
-        assert_eq!(parsed.as_str(), id);
+        assert_eq!(parsed, id);
         assert_eq!(consumed, bytes.len());
     }
 
@@ -1105,7 +1078,7 @@ mod tests {
 
     #[test]
     fn prelude_rejects_bad_magic() {
-        let mut bytes = encode_prelude("foo").unwrap();
+        let mut bytes = encode_prelude(&Identity::parse("foo").unwrap());
         bytes[0] = b'X';
         assert!(matches!(
             parse_prelude(&bytes),
@@ -1115,7 +1088,7 @@ mod tests {
 
     #[test]
     fn prelude_rejects_bad_version() {
-        let mut bytes = encode_prelude("foo").unwrap();
+        let mut bytes = encode_prelude(&Identity::parse("foo").unwrap());
         bytes[4] = 0x99;
         assert!(matches!(
             parse_prelude(&bytes),
@@ -1141,8 +1114,8 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&PRELUDE_MAGIC);
         bytes.push(PRELUDE_VERSION);
-        bytes.push((MAX_IDENTITY_LEN as u8) + 1);
-        bytes.resize(bytes.len() + MAX_IDENTITY_LEN + 1, b'a');
+        bytes.push((Identity::MAX_LEN as u8) + 1);
+        bytes.resize(bytes.len() + Identity::MAX_LEN + 1, b'a');
         assert!(matches!(
             parse_prelude(&bytes),
             Err(PreludeError::BadIdentityLen { .. })
@@ -1181,44 +1154,14 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn encode_rejects_empty_identity() {
-        assert!(matches!(
-            encode_prelude(""),
-            Err(PreludeError::BadIdentityLen { got: 0 })
-        ));
-    }
-
-    #[test]
-    fn encode_rejects_too_long() {
-        let id = "a".repeat(MAX_IDENTITY_LEN + 1);
-        assert!(matches!(
-            encode_prelude(&id),
-            Err(PreludeError::BadIdentityLen { .. })
-        ));
-    }
-
-    #[test]
-    fn encode_rejects_bad_charset() {
-        assert!(matches!(
-            encode_prelude("foo bar"),
-            Err(PreludeError::InvalidCharset { byte: b' ', .. })
-        ));
-        assert!(matches!(
-            encode_prelude("foo/bar"),
-            Err(PreludeError::InvalidCharset { byte: b'/', .. })
-        ));
-        assert!(matches!(
-            encode_prelude("foo\nbar"),
-            Err(PreludeError::InvalidCharset { byte: b'\n', .. })
-        ));
-    }
+    // encode_prelude rejection tests removed: validation now lives in
+    // `Identity::parse`, covered by `identity::tests::parse_rejects_*`.
 
     /// End-to-end Noise NNpsk0 handshake + a transport-mode message round-trip,
     /// driven entirely in-memory.
     #[test]
     fn noise_handshake_round_trip() {
-        let psk = [0x42u8; 32];
+        let psk = Psk::from([0x42u8; 32]);
 
         let mut initiator_hs = initiator(&psk).expect("build initiator");
         let mut responder_hs = responder(&psk).expect("build responder");
@@ -1259,8 +1202,8 @@ mod tests {
     /// (the psk0 mix means the binder check fails).
     #[test]
     fn noise_wrong_psk_rejected() {
-        let mut initiator_hs = initiator(&[0xaa; 32]).unwrap();
-        let mut responder_hs = responder(&[0xbb; 32]).unwrap();
+        let mut initiator_hs = initiator(&Psk::from([0xaa; 32])).unwrap();
+        let mut responder_hs = responder(&Psk::from([0xbb; 32])).unwrap();
 
         let mut buf = [0u8; MAX_MESSAGE_SIZE];
         let mut out = [0u8; MAX_MESSAGE_SIZE];
@@ -1269,17 +1212,8 @@ mod tests {
         assert!(res.is_err(), "responder must reject mismatched PSK");
     }
 
-    #[test]
-    fn builder_rejects_short_psk() {
-        assert!(matches!(
-            initiator(&[0u8; 31]),
-            Err(TransportError::BadPskLen { got: 31 })
-        ));
-        assert!(matches!(
-            responder(&[0u8; 33]),
-            Err(TransportError::BadPskLen { got: 33 })
-        ));
-    }
+    // `builder_rejects_short_psk` removed: `responder`/`initiator`
+    // now take `&Psk`, which enforces the 32-byte invariant by type.
 
     #[test]
     fn frame_round_trip() {
@@ -1308,13 +1242,17 @@ mod tests {
     /// daemon ↔ client wire is broken.
     #[test]
     fn responder_initiator_round_trip() {
-        let psk = [0x42u8; 32];
+        let psk = Psk::from([0x42u8; 32]);
         let request = b"protocol=https\nhost=github.com\npath=foo/bar\n\n".to_vec();
         let response_plain = b"username=x-access-token\npassword=ghs_abc\n\n".to_vec();
 
         let mut server = Responder::new();
-        let mut client =
-            Initiator::new("dev-vm-1.test_03", psk, request.clone()).expect("build initiator");
+        let mut client = Initiator::new(
+            Identity::parse("dev-vm-1.test_03").unwrap(),
+            psk,
+            request.clone(),
+        )
+        .expect("build initiator");
 
         let mut c_to_s: Vec<u8> = Vec::new();
         let mut s_to_c: Vec<u8> = Vec::new();
@@ -1333,7 +1271,7 @@ mod tests {
                     }
                 }
                 Step::NeedPsk { identity } => {
-                    assert_eq!(identity, "dev-vm-1.test_03");
+                    assert_eq!(identity.as_str(), "dev-vm-1.test_03");
                     server.set_psk(psk).expect("server set_psk");
                 }
                 Step::Write(bytes) => {
@@ -1451,13 +1389,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn initiator_rejects_bad_identity_at_construction() {
-        let psk = [0x42u8; 32];
-        match Initiator::new("foo bar", psk, vec![]) {
-            Err(SessionError::PreludeInvalidCharset { byte: b' ', .. }) => {}
-            Err(other) => panic!("wrong error: {other:?}"),
-            Ok(_) => panic!("space in identity must reject"),
-        }
-    }
+    // Bad-identity rejection at Initiator::new is impossible by
+    // construction now — the parameter is `Identity`, validated at
+    // `Identity::parse` (see `identity::tests::parse_rejects_*`).
 }

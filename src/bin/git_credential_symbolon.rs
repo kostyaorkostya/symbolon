@@ -27,6 +27,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use argh::FromArgs;
+use hex::FromHex;
 
 use symbolon::transport::{Initiator, SessionError, Step};
 use symbolon::{Identity, IdentityError, Psk};

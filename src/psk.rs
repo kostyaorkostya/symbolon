@@ -16,12 +16,33 @@ use derive_more::From;
 ///
 /// Construction is open (any 32 bytes is a valid PSK); the type just
 /// proves the length invariant the Noise handshake requires.
-#[derive(Clone, Copy, PartialEq, Eq, From)]
+///
+/// `Serialize`/`Deserialize` go through `#[serde(transparent)]` to
+/// the inner `[u8; LEN]` — that's a JSON array of numbers on the
+/// admin wire. The admin protocol is internal (UDS, UID-gated) so
+/// wire ergonomics don't justify a hex-string adapter. The on-disk
+/// PSK file uses hex, but that path goes through `to_hex` /
+/// `hex::FromHex` explicitly, not serde.
+#[derive(Clone, Copy, PartialEq, Eq, From, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
 pub struct Psk([u8; Self::LEN]);
 
 impl std::fmt::Debug for Psk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Psk(<redacted>)")
+    }
+}
+
+/// Hex decoding via the standard `hex::FromHex` trait. Callers need
+/// `use hex::FromHex;` in scope to invoke `Psk::from_hex(...)`. The
+/// input is `T: AsRef<[u8]>` — accepts `&str`, `&[u8]`, `String`, etc.
+impl hex::FromHex for Psk {
+    type Error = hex::FromHexError;
+
+    fn from_hex<T: AsRef<[u8]>>(hex: T) -> Result<Self, Self::Error> {
+        let mut out = [0u8; Self::LEN];
+        hex::decode_to_slice(hex, &mut out)?;
+        Ok(Self(out))
     }
 }
 
@@ -40,16 +61,6 @@ impl Psk {
     /// owned `[u8; 32]` and the caller has no further need for the Psk.
     pub fn into_bytes(self) -> [u8; Self::LEN] {
         self.0
-    }
-
-    /// Decode a 64-char ASCII hex string into a 32-byte `Psk`. Errors
-    /// propagate `hex::FromHexError` verbatim so callers can attach
-    /// their own context (line number, source path) at the boundary
-    /// that has it.
-    pub fn from_hex(hex_str: &str) -> Result<Self, hex::FromHexError> {
-        let mut out = [0u8; Self::LEN];
-        hex::decode_to_slice(hex_str, &mut out)?;
-        Ok(Self(out))
     }
 
     /// Render to the 64-byte ASCII hex form used by the on-disk PSK

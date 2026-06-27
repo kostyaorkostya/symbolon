@@ -152,14 +152,6 @@ pub struct SharedState {
 const CLIENTS_FILE_MODE: u32 = 0o640;
 const PSK_FILE_MODE: u32 = 0o600;
 
-/// Successful enroll outcome. The `psk_hex` is shown to the operator
-/// so they can install it on the client side. The RFC3339
-/// `enrolled_at` timestamp stamped into `clients.json` is not
-/// surfaced — the admin wire response doesn't include it today.
-pub(crate) struct EnrolledClient {
-    pub(crate) psk_hex: String,
-}
-
 /// State-mutation failure from `SharedState::enroll_client` or
 /// `revoke_client`. The admin layer owns the variant→wire-code
 /// mapping so the wire vocabulary stays in one place.
@@ -169,8 +161,6 @@ pub(crate) enum StateMutationError {
     ClientAlreadyEnrolled(Identity),
     #[error("no enrolled client named '{0}'")]
     UnknownClient(String),
-    #[error("RNG read failed")]
-    Rng(#[source] std::io::Error),
     #[error("write psks file")]
     WritePsks(#[source] std::io::Error),
     #[error("write clients.json")]
@@ -192,14 +182,13 @@ impl SharedState {
     pub(crate) async fn enroll_client(
         &self,
         client: Identity,
+        psk: crate::psk::Psk,
         provider: ProviderKind,
         note: Option<String>,
-    ) -> Result<EnrolledClient, StateMutationError> {
+    ) -> Result<(), StateMutationError> {
         if self.clients.borrow().contains_key(&client) {
             return Err(StateMutationError::ClientAlreadyEnrolled(client));
         }
-        let key_bytes = generate_psk_key().await.map_err(StateMutationError::Rng)?;
-        let psk_hex = hex::encode(key_bytes);
 
         // RAII rollback: insert into in-memory PSK store; if any of
         // the on-disk writes fail (or the in-memory clients insert
@@ -217,9 +206,7 @@ impl SharedState {
             }
         }
 
-        self.psks
-            .borrow_mut()
-            .insert(client.clone(), crate::psk::Psk::from(key_bytes));
+        self.psks.borrow_mut().insert(client.clone(), psk);
         let mut rollback = Rollback {
             psks: &self.psks,
             client: Some(client.clone()),
@@ -260,7 +247,7 @@ impl SharedState {
         );
         rollback.client = None; // commit
 
-        Ok(EnrolledClient { psk_hex })
+        Ok(())
     }
 
     /// Coordinate the in-memory + on-disk state changes for a
@@ -295,16 +282,6 @@ impl SharedState {
         self.clients.borrow_mut().remove(client);
         Ok(())
     }
-}
-
-async fn generate_psk_key() -> std::io::Result<[u8; 32]> {
-    use compio::io::AsyncReadAtExt;
-    let file = compio::fs::File::open("/dev/urandom").await?;
-    let buf = vec![0u8; 32];
-    let compio::BufResult(res, buf) = file.read_exact_at(buf, 0).await;
-    res?;
-    buf.try_into()
-        .map_err(|_| std::io::Error::other("short read from /dev/urandom"))
 }
 
 async fn read_clients_doc(path: &Path) -> Result<crate::config::ClientsFile, String> {
@@ -646,8 +623,10 @@ impl SharedState {
     /// to the right provider instance. Wire-side dispatch (the
     /// git-credential `host=` match) lives in `handle_connection`
     /// and uses `provider.host()` instead.
-    pub fn lookup_provider(&self, name: &str) -> Option<&(dyn crate::providers::Provider + '_)> {
-        let kind: ProviderKind = name.parse().ok()?;
+    pub fn lookup_provider(
+        &self,
+        kind: ProviderKind,
+    ) -> Option<&(dyn crate::providers::Provider + '_)> {
         self.providers.get(&kind).map(|b| b.as_ref())
     }
 

@@ -6,9 +6,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use argh::FromArgs;
+use hex::FromHex;
 
 use symbolon::CliCommand;
 use symbolon::EventKind;
+use symbolon::Psk;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/symbolon/config.toml";
 
@@ -41,10 +43,30 @@ async fn main() -> ExitCode {
         Subcommand::List(_) => run_cli(config_path, CliCommand::List).await,
         Subcommand::Github(g) => {
             let cmd = match g.cmd {
-                GithubSub::Enroll(a) => CliCommand::GithubEnroll {
-                    client: a.client,
-                    note: a.note,
-                },
+                GithubSub::Enroll(a) => {
+                    let psk = match a.psk.as_deref() {
+                        Some(hex) => match Psk::from_hex(hex) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!("symbolon: --psk invalid: {e}");
+                                return ExitCode::from(2);
+                            }
+                        },
+                        None => {
+                            let mut bytes = [0u8; 32];
+                            if let Err(e) = getrandom::fill(&mut bytes) {
+                                eprintln!("symbolon: failed to read OS RNG: {e}");
+                                return ExitCode::from(1);
+                            }
+                            Psk::from(bytes)
+                        }
+                    };
+                    CliCommand::GithubEnroll {
+                        client: a.client,
+                        note: a.note,
+                        psk,
+                    }
+                }
                 GithubSub::Revoke(a) => CliCommand::GithubRevoke { client: a.client },
                 GithubSub::Mint(a) => CliCommand::GithubMint {
                     client: a.client,
@@ -214,7 +236,10 @@ enum GithubSub {
     Selfcheck(SelfcheckArgs),
 }
 
-/// enroll a client; broker generates a PSK and prints provisioning steps
+/// enroll a client; prints the 64-hex PSK to stdout for the operator
+/// to install on the client side. PSK is freshly generated locally by
+/// default; supply your own with `--psk <64-hex>` (useful for backup
+/// restore, key rotation, or deterministic test setups).
 #[derive(FromArgs)]
 #[argh(subcommand, name = "enroll")]
 struct EnrollArgs {
@@ -223,6 +248,10 @@ struct EnrollArgs {
     /// free-form note
     #[argh(option)]
     note: Option<String>,
+    /// optional pre-generated 64-char hex PSK; if omitted the CLI
+    /// reads 32 fresh bytes from the OS RNG
+    #[argh(option)]
+    psk: Option<String>,
 }
 
 /// revoke an enrolled client

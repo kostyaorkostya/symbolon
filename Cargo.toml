@@ -30,6 +30,7 @@ derive_more = { version = "2.1.1", default-features = false, features = [
 ] }
 futures-channel = "0.3"
 futures-util = "0.3.32"
+getrandom = "0.4.3"
 hex = "0.4.3"
 humantime-serde = "1.1.1"
 landlock = "0.4.5"

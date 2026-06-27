@@ -37,6 +37,13 @@ async fn admin_list_initially_empty() {
     assert!(resp["clients"].as_array().unwrap().is_empty());
 }
 
+/// A fixed all-`0xCD` PSK that several tests use for enroll requests.
+/// On the admin wire it serialises as a JSON array of 32 numbers
+/// (the default for `[u8; 32]`); on disk it lands as the matching
+/// 64-char hex string `TEST_PSK_HEX`.
+const TEST_PSK: [u8; 32] = [0xCD; 32];
+const TEST_PSK_HEX: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+
 #[compio::test]
 async fn admin_enroll_persists_to_clients_json_and_psk_file() {
     let paths = unique_paths_full();
@@ -51,17 +58,15 @@ async fn admin_enroll_persists_to_clients_json_and_psk_file() {
             "provider": "github",
             "client": "vm-1",
             "note": null,
+            "psk": TEST_PSK,
         }),
     )
     .await;
     assert_eq!(resp["ok"], serde_json::json!(true), "got: {resp:?}");
-    let psk_hex = resp["psk_hex"].as_str().unwrap();
-    assert_eq!(psk_hex.len(), 64);
-    assert!(psk_hex.chars().all(|c| c.is_ascii_hexdigit()));
 
     let psk_text = std::fs::read_to_string(&paths.psks).unwrap();
     assert!(
-        psk_text.contains(&format!("vm-1:{psk_hex}")),
+        psk_text.contains(&format!("vm-1:{TEST_PSK_HEX}")),
         "psk file missing entry: {psk_text:?}"
     );
     let psk_mode = std::fs::metadata(&paths.psks).unwrap().permissions().mode() & 0o777;
@@ -97,6 +102,7 @@ async fn admin_enroll_appends_without_clobbering_existing() {
             "provider": "github",
             "client": "vm-1",
             "note": null,
+            "psk": TEST_PSK,
         }),
     )
     .await;
@@ -125,6 +131,7 @@ async fn admin_enroll_rejects_duplicate_client_name() {
             "provider": "github",
             "client": "vm-1",
             "note": null,
+            "psk": TEST_PSK,
         }),
     )
     .await;
@@ -146,6 +153,7 @@ async fn admin_enroll_rejects_bad_charset() {
             "provider": "github",
             "client": "name with space",
             "note": null,
+            "psk": TEST_PSK,
         }),
     )
     .await;
@@ -167,6 +175,7 @@ async fn admin_revoke_removes_psk_entry_and_updates_clients() {
             "provider": "github",
             "client": "vm-1",
             "note": null,
+            "psk": TEST_PSK,
         }),
     )
     .await;

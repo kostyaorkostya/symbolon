@@ -20,6 +20,8 @@
 
 use std::collections::HashMap;
 
+use hex::FromHex;
+
 use crate::identity::{Identity, IdentityError};
 use crate::psk::Psk;
 

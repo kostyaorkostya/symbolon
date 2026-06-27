@@ -25,6 +25,11 @@ pub struct ReqId(String);
 
 impl ReqId {
     /// Generate a fresh ULID-based request id.
+    // `Default` deliberately NOT impl'd: minting a fresh ULID on
+    // `Default::default()` is non-pure and surprises generic callers
+    // that expect Default to be cheap and side-effect-free (POLA).
+    // Every call site uses `ReqId::new()` explicitly.
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self(ulid::Ulid::new().to_string())
     }
@@ -40,12 +45,6 @@ impl From<&str> for ReqId {
     }
 }
 
-impl Default for ReqId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Per-outbound-HTTPS-call correlation id. Generated inside the
 /// provider's `with_breadcrumbs` wrapper, one per call. Distinct
 /// from [`ReqId`] so a swap at the breadcrumb logging site is a
@@ -57,6 +56,8 @@ impl Default for ReqId {
 pub struct OutReqId(String);
 
 impl OutReqId {
+    // Same `Default`-not-impl'd rationale as `ReqId::new` above.
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self(ulid::Ulid::new().to_string())
     }
@@ -69,12 +70,6 @@ impl OutReqId {
 impl From<&str> for OutReqId {
     fn from(s: &str) -> Self {
         Self(s.to_string())
-    }
-}
-
-impl Default for OutReqId {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

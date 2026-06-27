@@ -21,7 +21,7 @@ use serde_json::Value as JsonValue;
 
 use crate::ids::OutReqId;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumString)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumString, strum::Display)]
 #[strum(serialize_all = "snake_case")]
 pub enum ProviderKind {
     Github,
@@ -103,12 +103,14 @@ impl ProviderReqId {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct MintOutcome {
     pub response: crate::git_credential::Response,
     pub out_req_id: OutReqId,
     pub provider_req_id: Option<ProviderReqId>,
 }
 
+#[derive(Debug, Clone)]
 pub struct SelfcheckOutcome {
     pub out_req_id: OutReqId,
     pub provider_req_id: Option<ProviderReqId>,

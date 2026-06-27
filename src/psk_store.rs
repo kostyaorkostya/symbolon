@@ -167,8 +167,8 @@ impl PskStore {
     /// Render the store to the on-disk file format. Identities are emitted in
     /// sorted order so the file is deterministic (helps diff-based audit).
     pub fn render(&self) -> String {
-        let mut keys: Vec<&String> = self.entries.keys().collect();
-        keys.sort();
+        let mut keys: Vec<&str> = self.entries.keys().map(String::as_str).collect();
+        keys.sort_unstable();
         let mut out = String::with_capacity(keys.len() * (MAX_IDENTITY_LEN + 1 + PSK_LEN * 2 + 1));
         for k in keys {
             let psk = self.entries.get(k).expect("key from same map");

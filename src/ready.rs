@@ -24,7 +24,7 @@ pub async fn notify(pidfile: Option<&Path>) {
     let _ = sd_notify::notify(&[NotifyState::Ready]);
     if let Some(path) = pidfile {
         let contents = format!("{}\n", std::process::id()).into_bytes();
-        if let Err(e) = crate::admin::atomic_write(path, contents, 0o644).await {
+        if let Err(e) = crate::atomic_fs::atomic_write(path, contents, 0o644).await {
             tracing::warn!(evt = %EventKind::ReadyPidfileWriteFailed, path = %path.display(), error = %e);
         }
     }

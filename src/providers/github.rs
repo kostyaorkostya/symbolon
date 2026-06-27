@@ -230,29 +230,6 @@ impl From<GithubError> for ProviderError {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct SelfcheckData {
-    pub(crate) client_id: String,
-    pub(crate) installation_id: InstallationId,
-    pub(crate) api_base: String,
-    pub(crate) clock_skew_sec: i64,
-    /// ULID of the outbound HTTPS call. Pairs with the
-    /// `provider_call` / `provider_call_done` breadcrumbs.
-    pub(crate) out_req_id: OutReqId,
-    /// `X-GitHub-Request-Id` returned by the API, if any.
-    pub(crate) provider_req_id: Option<ProviderReqId>,
-}
-
-#[derive(Debug, Clone)]
-pub struct MintData {
-    pub response: git_credential::Response,
-    /// ULID of the outbound `mint_token` HTTPS call. Pairs with
-    /// the `provider_call` / `provider_call_done` breadcrumbs.
-    pub out_req_id: OutReqId,
-    /// `X-GitHub-Request-Id` returned by the mint endpoint, if any.
-    pub provider_req_id: Option<ProviderReqId>,
-}
-
 pub struct GitHubProvider {
     /// Configured `[provider.github].host` — the value the daemon
     /// matches `host=` against in incoming git-credential requests
@@ -364,7 +341,7 @@ impl GitHubProvider {
         &self.host
     }
 
-    pub async fn mint(&self, path: &str) -> Result<MintData, GithubError> {
+    pub async fn mint(&self, path: &str) -> Result<AbstractMintOutcome, GithubError> {
         let RepoPath { owner, repo } = RepoPath::parse(path)?;
         let key = format!(
             "{}/{}",
@@ -552,7 +529,7 @@ impl GitHubProvider {
     /// `Response` *before* consuming the body — only `run_call`'s shape
     /// (handing `Response` to the closure intact) makes that ordering
     /// expressible without rebuilding the breadcrumb plumbing inline.
-    pub async fn selfcheck(&self) -> Result<SelfcheckData, GithubError> {
+    pub async fn selfcheck(&self) -> Result<AbstractSelfcheckOutcome, GithubError> {
         self.run_call(
             "selfcheck",
             self.selfcheck_timeout,
@@ -583,13 +560,17 @@ impl GitHubProvider {
                     ));
                 }
                 Self::check_app_identity(&body, &self.client_id)?;
-                Ok(SelfcheckData {
-                    client_id: self.client_id.clone(),
-                    installation_id: self.installation_id,
-                    api_base: self.api_base.clone(),
-                    clock_skew_sec,
+                Ok(AbstractSelfcheckOutcome {
                     out_req_id: out_req_id.clone(),
                     provider_req_id: meta.provider_req_id.clone(),
+                    clock_skew_sec,
+                    // GitHub-specific diagnostic dump documented in
+                    // `docs/providers/github.md`.
+                    details: json!({
+                        "client_id": self.client_id,
+                        "installation_id": self.installation_id,
+                        "api_base": self.api_base,
+                    }),
                 })
             },
         )
@@ -670,7 +651,7 @@ impl GitHubProvider {
         .await
     }
 
-    async fn mint_token(&self, repo_id: RepoId) -> Result<MintData, GithubError> {
+    async fn mint_token(&self, repo_id: RepoId) -> Result<AbstractMintOutcome, GithubError> {
         self.run_call(
             "mint_token",
             self.request_timeout,
@@ -696,7 +677,7 @@ impl GitHubProvider {
                 match meta.status {
                     201 => {
                         let (token, expires_at) = Self::parse_mint_response(&body)?;
-                        Ok(MintData {
+                        Ok(AbstractMintOutcome {
                             response: git_credential::Response {
                                 // GitHub-specific sentinel: when the username
                                 // on a git HTTPS clone is the literal
@@ -931,26 +912,11 @@ impl Provider for GitHubProvider {
     }
 
     async fn mint(&self, path: &str) -> Result<AbstractMintOutcome, ProviderError> {
-        let data = GitHubProvider::mint(self, path).await?;
-        Ok(AbstractMintOutcome {
-            response: data.response,
-            out_req_id: data.out_req_id,
-            provider_req_id: data.provider_req_id,
-        })
+        Ok(GitHubProvider::mint(self, path).await?)
     }
 
     async fn selfcheck(&self) -> Result<AbstractSelfcheckOutcome, ProviderError> {
-        let data = GitHubProvider::selfcheck(self).await?;
-        Ok(AbstractSelfcheckOutcome {
-            out_req_id: data.out_req_id,
-            provider_req_id: data.provider_req_id,
-            clock_skew_sec: data.clock_skew_sec,
-            details: json!({
-                "client_id": data.client_id,
-                "installation_id": data.installation_id,
-                "api_base": data.api_base,
-            }),
-        })
+        Ok(GitHubProvider::selfcheck(self).await?)
     }
 }
 

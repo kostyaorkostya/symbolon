@@ -129,6 +129,197 @@ pub struct SharedState {
     pub(crate) shutdown: CancelToken,
 }
 
+const CLIENTS_FILE_MODE: u32 = 0o640;
+const PSK_FILE_MODE: u32 = 0o600;
+
+/// Successful enroll outcome. The `psk_hex` is shown to the operator
+/// so they can install it on the client side. The RFC3339
+/// `enrolled_at` timestamp stamped into `clients.json` is not
+/// surfaced — the admin wire response doesn't include it today.
+pub(crate) struct EnrolledClient {
+    pub(crate) psk_hex: String,
+}
+
+/// State-mutation failure from `SharedState::enroll_client` or
+/// `revoke_client`. The admin layer owns the variant→wire-code
+/// mapping so the wire vocabulary stays in one place.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum StateMutationError {
+    #[error("client '{0}' already enrolled")]
+    ClientAlreadyEnrolled(String),
+    #[error("no enrolled client named '{0}'")]
+    UnknownClient(String),
+    #[error("system clock unusable; cannot stamp enrolled_at")]
+    ClockUnusable,
+    #[error("RNG read failed")]
+    Rng(#[source] std::io::Error),
+    #[error("write psks file")]
+    WritePsks(#[source] std::io::Error),
+    #[error("write clients.json")]
+    WriteClients(#[source] std::io::Error),
+    #[error("read clients.json: {0}")]
+    ReadClients(String),
+    #[error("encode clients.json")]
+    EncodeClients(#[source] serde_json::Error),
+}
+
+impl SharedState {
+    /// Coordinate the in-memory + on-disk state changes for an
+    /// enroll. Writes the PSK file first (so a crash between writes
+    /// leaves an orphan PSK entry — unreachable but harmless —
+    /// rather than the reverse, which would leave a known client
+    /// whose PSK lookup fails). On any failure between the in-memory
+    /// PSK insert and the in-memory clients insert, the RAII
+    /// rollback removes the PSK entry so memory stays consistent.
+    pub(crate) async fn enroll_client(
+        &self,
+        client: String,
+        provider: crate::providers::ProviderKind,
+        note: Option<String>,
+    ) -> Result<EnrolledClient, StateMutationError> {
+        if self.clients.borrow().contains_key(&client) {
+            return Err(StateMutationError::ClientAlreadyEnrolled(client));
+        }
+        let key_bytes = generate_psk_key().await.map_err(StateMutationError::Rng)?;
+        let psk_hex = hex::encode(key_bytes);
+
+        // RAII rollback: insert into in-memory PSK store; if any of
+        // the on-disk writes fail (or the in-memory clients insert
+        // doesn't reach `commit_client = None`), Drop removes the
+        // PSK entry so the two in-memory tables stay in lockstep.
+        struct Rollback<'a> {
+            psks: &'a std::cell::RefCell<crate::psk_store::PskStore>,
+            client: Option<String>,
+        }
+        impl Drop for Rollback<'_> {
+            fn drop(&mut self) {
+                if let Some(c) = self.client.take() {
+                    self.psks.borrow_mut().remove(&c);
+                }
+            }
+        }
+
+        self.psks
+            .borrow_mut()
+            .insert(client.clone(), crate::psk_store::Psk::from(key_bytes));
+        let mut rollback = Rollback {
+            psks: &self.psks,
+            client: Some(client.clone()),
+        };
+
+        let psk_content = self.psks.borrow().render();
+        crate::atomic_fs::atomic_write(
+            &self.psk_file_path,
+            psk_content.into_bytes(),
+            PSK_FILE_MODE,
+        )
+        .await
+        .map_err(StateMutationError::WritePsks)?;
+
+        let enrolled_at =
+            format_rfc3339_z(SystemTime::now()).ok_or(StateMutationError::ClockUnusable)?;
+        let mut clients_doc = read_clients_doc(&self.clients_file_path)
+            .await
+            .map_err(StateMutationError::ReadClients)?;
+        clients_doc.clients.push(crate::config::ClientEntry {
+            name: client.clone(),
+            providers: vec![provider.to_string()],
+            enrolled_at: enrolled_at.clone(),
+            note: note.clone(),
+        });
+        let clients_bytes =
+            serde_json::to_vec_pretty(&clients_doc).map_err(StateMutationError::EncodeClients)?;
+        crate::atomic_fs::atomic_write(&self.clients_file_path, clients_bytes, CLIENTS_FILE_MODE)
+            .await
+            .map_err(StateMutationError::WriteClients)?;
+
+        self.clients.borrow_mut().insert(
+            client.clone(),
+            ResolvedClient {
+                name: client,
+                providers: vec![provider.to_string()],
+                enrolled_at: enrolled_at.clone(),
+                note,
+            },
+        );
+        rollback.client = None; // commit
+
+        Ok(EnrolledClient { psk_hex })
+    }
+
+    /// Coordinate the in-memory + on-disk state changes for a
+    /// revoke. Writes clients.json first; if that succeeds and the
+    /// PSK file write fails, the orphan PSK entry on disk is
+    /// harmless (unreachable on next start because clients.json no
+    /// longer carries the identity).
+    pub(crate) async fn revoke_client(&self, client: &str) -> Result<(), StateMutationError> {
+        if !self.clients.borrow().contains_key(client) {
+            return Err(StateMutationError::UnknownClient(client.to_string()));
+        }
+        let mut clients_doc = read_clients_doc(&self.clients_file_path)
+            .await
+            .map_err(StateMutationError::ReadClients)?;
+        clients_doc.clients.retain(|c| c.name != client);
+        let clients_bytes =
+            serde_json::to_vec_pretty(&clients_doc).map_err(StateMutationError::EncodeClients)?;
+        crate::atomic_fs::atomic_write(&self.clients_file_path, clients_bytes, CLIENTS_FILE_MODE)
+            .await
+            .map_err(StateMutationError::WriteClients)?;
+
+        self.psks.borrow_mut().remove(client);
+        let psk_content = self.psks.borrow().render();
+        crate::atomic_fs::atomic_write(
+            &self.psk_file_path,
+            psk_content.into_bytes(),
+            PSK_FILE_MODE,
+        )
+        .await
+        .map_err(StateMutationError::WritePsks)?;
+
+        self.clients.borrow_mut().remove(client);
+        Ok(())
+    }
+}
+
+async fn generate_psk_key() -> std::io::Result<[u8; 32]> {
+    use compio::io::AsyncReadAtExt;
+    let file = compio::fs::File::open("/dev/urandom").await?;
+    let buf = vec![0u8; 32];
+    let compio::BufResult(res, buf) = file.read_exact_at(buf, 0).await;
+    res?;
+    buf.try_into()
+        .map_err(|_| std::io::Error::other("short read from /dev/urandom"))
+}
+
+async fn read_clients_doc(path: &Path) -> Result<crate::config::ClientsFile, String> {
+    match compio::fs::read(path).await {
+        Ok(bytes) => {
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|e| format!("non-utf8 {}: {e}", path.display()))?;
+            crate::config::parse_clients_file(text, path)
+                .map_err(|e| format!("parse {}: {e}", path.display()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(crate::config::ClientsFile {
+            version: crate::config::CLIENTS_SCHEMA_VERSION,
+            clients: Vec::new(),
+        }),
+        Err(e) => Err(format!("read {}: {e}", path.display())),
+    }
+}
+
+/// Render `t` as a `Z`-suffixed RFC3339 string. Returns `None` on
+/// any clock pathology (pre-epoch system time, year-9999 overflow
+/// inside the `time` crate, format failure). Enroll surfaces the
+/// `None` case as `internal` to the operator — recording a wrong
+/// timestamp is worse than failing the enroll loudly.
+fn format_rfc3339_z(t: SystemTime) -> Option<String> {
+    let secs = t.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let secs = i64::try_from(secs).ok()?;
+    let dt = time::OffsetDateTime::from_unix_timestamp(secs).ok()?;
+    dt.format(&time::format_description::well_known::Rfc3339)
+        .ok()
+}
+
 /// Statistics returned from `Service::run` so main can log the
 /// final `evt=shutdown` event.
 pub struct RunStats {
@@ -313,33 +504,31 @@ impl Service {
     pub async fn selfcheck(&self) {
         use tracing::Instrument;
         for provider in self.state.providers.values() {
-            let req_id = ReqId::new();
-            let span = tracing::info_span!("selfcheck", req_id = %req_id);
-            let result = provider.selfcheck().instrument(span.clone()).await;
-            // The log lines below are emitted under `span` so that
-            // `req_id` rides along in the JSON output via the
-            // current-span carry-over.
-            let _enter = span.enter();
-            match result {
-                Ok(outcome) => {
-                    info!(
-                        evt = %EventKind::Selfcheck,
-                        out_req_id = %outcome.out_req_id,
-                        provider_req_id = outcome.provider_req_id.as_ref().map(|p| p.as_str()).unwrap_or(""),
-                        provider = %provider.host(),
-                        ok = true,
-                        clock_skew_sec = outcome.clock_skew_sec,
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        evt = %EventKind::Selfcheck,
-                        provider = %provider.host(),
-                        ok = false,
-                        error = %crate::logging::ErrorChain(&e),
-                    );
+            let span = tracing::info_span!("selfcheck", req_id = %ReqId::new());
+            async {
+                match provider.selfcheck().await {
+                    Ok(outcome) => {
+                        info!(
+                            evt = %EventKind::Selfcheck,
+                            out_req_id = %outcome.out_req_id,
+                            provider_req_id = outcome.provider_req_id.as_ref().map(|p| p.as_str()).unwrap_or(""),
+                            provider = %provider.host(),
+                            ok = true,
+                            clock_skew_sec = outcome.clock_skew_sec,
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            evt = %EventKind::Selfcheck,
+                            provider = %provider.host(),
+                            ok = false,
+                            error = %crate::logging::ErrorChain(&e),
+                        );
+                    }
                 }
             }
+            .instrument(span)
+            .await
         }
     }
 
@@ -842,13 +1031,7 @@ async fn handle_connection(mut stream: TcpStream, state: Rc<SharedState>) {
                                 cause = "404",
                             );
                         }
-                        log_mint_error(
-                            client_str,
-                            &request.host,
-                            &request.path,
-                            provider_ms,
-                            e,
-                        );
+                        log_mint_error(client_str, &request.host, &request.path, provider_ms, e);
                         return;
                     }
                 };
@@ -888,12 +1071,7 @@ async fn handle_connection(mut stream: TcpStream, state: Rc<SharedState>) {
                 if let (Some(client_str), Some(rec)) =
                     (client_name.as_deref(), mint_record.as_ref())
                 {
-                    let expires_at_secs = rec
-                        .response
-                        .password_expiry_utc
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
+                    let expires_at_secs = rec.response.password_expiry_unix_secs();
                     let now_secs = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_secs())
@@ -1003,11 +1181,7 @@ fn log_session_failure(
 
 /// Log a clean EOF (read returned 0 bytes) attributed to the current
 /// protocol phase.
-fn log_phase_eof(
-    peer: Option<std::net::SocketAddr>,
-    phase: Phase,
-    client_name: Option<&str>,
-) {
+fn log_phase_eof(peer: Option<std::net::SocketAddr>, phase: Phase, client_name: Option<&str>) {
     let client_str = client_name.unwrap_or("");
     match phase {
         Phase::PreludeHead => warn!(
@@ -1039,13 +1213,7 @@ fn log_phase_eof(
     }
 }
 
-fn log_mint_error(
-    client_name: &str,
-    host: &str,
-    path: &str,
-    provider_ms: u64,
-    err: ProviderError,
-) {
+fn log_mint_error(client_name: &str, host: &str, path: &str, provider_ms: u64, err: ProviderError) {
     match &err {
         ProviderError::RepoNotFound => {
             warn!(
@@ -1162,6 +1330,20 @@ async fn write_all_bytes(stream: &mut TcpStream, payload: Vec<u8>) -> std::io::R
 mod tests {
     use super::*;
     use crate::config::ClientEntry;
+
+    #[test]
+    fn format_rfc3339_z_is_z_suffixed() {
+        let t = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let s = format_rfc3339_z(t).expect("post-epoch clock");
+        assert!(s.ends_with('Z'), "got {s}");
+        assert_eq!(s.len(), 20, "expected fixed-width 20, got {s}");
+    }
+
+    #[test]
+    fn format_rfc3339_z_returns_none_for_pre_epoch() {
+        let t = UNIX_EPOCH - Duration::from_secs(1);
+        assert!(format_rfc3339_z(t).is_none());
+    }
 
     fn entry(name: &str, providers: &[&str]) -> ClientEntry {
         ClientEntry {

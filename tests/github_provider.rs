@@ -26,10 +26,7 @@ async fn mint_happy_path() {
     mount_mint_ok(&server).await;
 
     let provider = build_provider(server.uri()).await;
-    let outcome = provider
-        .mint(&format!("{OWNER}/{REPO}"))
-        .await
-        .unwrap();
+    let outcome = provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
 
     assert_eq!(outcome.response.username, "x-access-token");
     assert_eq!(outcome.response.password, TOKEN);
@@ -80,14 +77,8 @@ async fn mint_uses_cached_repo_id() {
         .await;
 
     let provider = build_provider(server.uri()).await;
-    provider
-        .mint(&format!("{OWNER}/{REPO}"))
-        .await
-        .unwrap();
-    provider
-        .mint(&format!("{OWNER}/{REPO}"))
-        .await
-        .unwrap();
+    provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
+    provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
     // MockServer's drop verifies `.expect(N)` counts.
 }
 
@@ -119,10 +110,7 @@ async fn mint_request_headers_and_body_exact() {
         .await;
 
     let provider = build_provider(server.uri()).await;
-    provider
-        .mint(&format!("{OWNER}/{REPO}"))
-        .await
-        .unwrap();
+    provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
 }
 
 #[compio::test]
@@ -140,10 +128,7 @@ async fn mint_surfaces_github_request_id() {
         .await;
 
     let provider = build_provider(server.uri()).await;
-    let outcome = provider
-        .mint(&format!("{OWNER}/{REPO}"))
-        .await
-        .unwrap();
+    let outcome = provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
     assert_eq!(
         outcome.provider_req_id.as_ref().map(|p| p.as_str()),
         Some("ABC:DEF:1234")
@@ -167,10 +152,7 @@ async fn resolve_returns_404() {
         .await;
 
     let provider = build_provider(server.uri()).await;
-    let err = provider
-        .mint(&format!("{OWNER}/{REPO}"))
-        .await
-        .unwrap_err();
+    let err = provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap_err();
     assert!(matches!(err, GithubError::RepoNotFound));
 }
 
@@ -186,10 +168,7 @@ async fn mint_returns_401() {
 
     let provider = build_provider(server.uri()).await;
     assert!(matches!(
-        provider
-            .mint(&format!("{OWNER}/{REPO}"))
-            .await
-            .unwrap_err(),
+        provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap_err(),
         GithubError::Unauthorized { .. }
     ));
 }
@@ -206,10 +185,7 @@ async fn mint_returns_403() {
 
     let provider = build_provider(server.uri()).await;
     assert!(matches!(
-        provider
-            .mint(&format!("{OWNER}/{REPO}"))
-            .await
-            .unwrap_err(),
+        provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap_err(),
         GithubError::Forbidden { .. }
     ));
 }
@@ -226,10 +202,7 @@ async fn mint_returns_429() {
 
     let provider = build_provider(server.uri()).await;
     assert!(matches!(
-        provider
-            .mint(&format!("{OWNER}/{REPO}"))
-            .await
-            .unwrap_err(),
+        provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap_err(),
         GithubError::RateLimited { retry_after: None }
     ));
 }
@@ -246,10 +219,7 @@ async fn mint_returns_429_with_retry_after() {
         .await;
 
     let provider = build_provider(server.uri()).await;
-    let err = provider
-        .mint(&format!("{OWNER}/{REPO}"))
-        .await
-        .unwrap_err();
+    let err = provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap_err();
     assert!(matches!(
         err,
         GithubError::RateLimited {
@@ -276,10 +246,7 @@ async fn mint_calls_revoke_after_resolve() {
         .await;
 
     let provider = build_provider(server.uri()).await;
-    let _ = provider
-        .mint(&format!("{OWNER}/{REPO}"))
-        .await
-        .unwrap();
+    let _ = provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
     // Verifications happen on MockServer drop.
 }
 
@@ -295,10 +262,7 @@ async fn mint_returns_500() {
 
     let provider = build_provider(server.uri()).await;
     assert!(matches!(
-        provider
-            .mint(&format!("{OWNER}/{REPO}"))
-            .await
-            .unwrap_err(),
+        provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap_err(),
         GithubError::OtherStatus(500)
     ));
 }
@@ -343,10 +307,7 @@ async fn mint_invalidates_on_404() {
         .await;
 
     let provider = build_provider(server.uri()).await;
-    provider
-        .mint(&format!("{OWNER}/{REPO}"))
-        .await
-        .unwrap();
+    provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
 
     drop(first_narrow);
 
@@ -360,10 +321,7 @@ async fn mint_invalidates_on_404() {
         .mount_as_scoped(&server)
         .await;
 
-    let err = provider
-        .mint(&format!("{OWNER}/{REPO}"))
-        .await
-        .unwrap_err();
+    let err = provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap_err();
     assert!(matches!(err, GithubError::RepoNotFound));
 
     drop(second_narrow);
@@ -382,9 +340,6 @@ async fn mint_invalidates_on_404() {
         .mount(&server)
         .await;
 
-    provider
-        .mint(&format!("{OWNER}/{REPO}"))
-        .await
-        .unwrap();
+    provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
     // Drop of `server` at end of test verifies all `.expect(N)` counts.
 }

@@ -25,6 +25,7 @@
 //! code should not depend on them.
 
 pub(crate) mod admin;
+pub(crate) mod atomic_fs;
 pub(crate) mod config;
 pub(crate) mod connection_tracker;
 pub(crate) mod cpu_worker;

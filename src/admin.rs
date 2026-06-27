@@ -20,7 +20,7 @@
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use compio::BufResult;
 use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -32,18 +32,14 @@ use tracing::info;
 use crate::daemon::{ResolvedClient, SharedState};
 use crate::events::EventKind;
 use crate::ids::ReqId;
-use crate::providers::ProviderError;
-use crate::psk_store::Psk;
+use crate::providers::{ProviderError, ProviderKind};
 
-const CLIENTS_FILE_MODE: u32 = 0o640;
-const PSK_FILE_MODE: u32 = 0o600;
 /// Admin requests are operator-driven JSON, not adversarial
 /// throughput; the budget stays at 64 KiB to comfortably fit
 /// human-typed enroll/revoke payloads. The daemon's wire path
 /// uses a tighter 8 KiB budget for its slow-loris exposure.
 const WIRE_READ_BUDGET: usize = 64 * 1024;
 const PER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
-const PROVIDER_GITHUB: &str = "github";
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -99,21 +95,21 @@ impl CliCommand {
             CliCommand::Status => Request::Status,
             CliCommand::List => Request::List,
             CliCommand::GithubEnroll { client, note } => Request::Enroll {
-                provider: PROVIDER_GITHUB.to_string(),
+                provider: ProviderKind::Github.to_string(),
                 client: client.clone(),
                 note: note.clone(),
             },
             CliCommand::GithubRevoke { client } => Request::Revoke {
-                provider: PROVIDER_GITHUB.to_string(),
+                provider: ProviderKind::Github.to_string(),
                 client: client.clone(),
             },
             CliCommand::GithubMint { client, path } => Request::Mint {
-                provider: PROVIDER_GITHUB.to_string(),
+                provider: ProviderKind::Github.to_string(),
                 client: client.clone(),
                 path: path.clone(),
             },
             CliCommand::GithubSelfcheck => Request::Selfcheck {
-                provider: PROVIDER_GITHUB.to_string(),
+                provider: ProviderKind::Github.to_string(),
             },
         }
     }
@@ -282,51 +278,16 @@ fn handle_list(state: &SharedState) -> serde_json::Value {
     serde_json::json!({ "ok": true, "clients": entries })
 }
 
-/// RAII rollback for `handle_enroll`. The PSK is inserted into the
-/// in-memory store BEFORE we attempt the on-disk writes; on any
-/// failure between then and `commit()`, Drop rolls the in-memory
-/// insert back so memory and disk stay coherent. Same pattern as
-/// `InFlightGuard` in `singleflight_cache` — default Drop is the
-/// rollback path; `commit(self)` consumes the guard to transition
-/// to the no-op state read by the shared Drop.
-struct EnrollRollback<'a> {
-    state: &'a SharedState,
-    /// `Some(client)` arms the rollback; `None` means commit was
-    /// called and Drop is a no-op. Carrying the client inside the
-    /// Option means there's no second boolean to keep in sync.
-    client: Option<String>,
-}
-
-impl<'a> EnrollRollback<'a> {
-    fn new(state: &'a SharedState, client: &str) -> Self {
-        Self {
-            state,
-            client: Some(client.to_string()),
-        }
-    }
-
-    fn commit(mut self) {
-        self.client = None;
-    }
-}
-
-impl Drop for EnrollRollback<'_> {
-    fn drop(&mut self) {
-        if let Some(client) = self.client.take() {
-            self.state.psks.borrow_mut().remove(&client);
-        }
-    }
-}
-
 async fn handle_enroll(
     state: &SharedState,
     provider: &str,
     client: &str,
     note: Option<String>,
 ) -> Result<serde_json::Value, serde_json::Value> {
-    if state.lookup_provider(provider).is_none() {
-        return Err(unknown_provider_error(provider));
-    }
+    let kind: ProviderKind = match provider.parse() {
+        Ok(k) => k,
+        Err(_) => return Err(unknown_provider_error(provider)),
+    };
     if !crate::transport::Identity::is_valid(client) {
         return Err(error_response(
             "bad_request",
@@ -345,75 +306,22 @@ async fn handle_enroll(
         ));
     }
 
-    // Identity collision check: every enrolled client has a unique
-    // name. The PSK store and clients.json table are kept in lockstep,
-    // so checking just the clients table is sufficient.
-    if state.clients.borrow().contains_key(client) {
-        return Err(error_response(
+    match state.enroll_client(client.to_string(), kind, note).await {
+        Ok(enrolled) => {
+            info!(evt = %EventKind::Enroll, provider = provider, client = client);
+            Ok(serde_json::json!({
+                "ok": true,
+                "identity": client,
+                "psk_hex": enrolled.psk_hex,
+                "client_name": client,
+            }))
+        }
+        Err(crate::daemon::StateMutationError::ClientAlreadyEnrolled(c)) => Err(error_response(
             "client_already_enrolled",
-            &format!("client '{client}' already enrolled"),
-        ));
+            &format!("client '{c}' already enrolled"),
+        )),
+        Err(e) => Err(error_response("internal", &e.to_string())),
     }
-
-    let key_bytes = generate_psk_key()
-        .await
-        .map_err(|e| error_response("internal", &format!("rng: {e}")))?;
-    let psk_hex = hex::encode(key_bytes);
-
-    // Update the in-memory PSK store, then write the new on-disk file
-    // (deterministic sorted render). RAII: the guard's default Drop
-    // removes the in-memory insert; on success we `commit()` to
-    // disarm it, mirroring the `InFlightGuard` pattern in github.rs.
-    state
-        .psks
-        .borrow_mut()
-        .insert(client.to_string(), Psk::from(key_bytes));
-    let rollback = EnrollRollback::new(state, client);
-    let psk_content = state.psks.borrow().render();
-    atomic_write(
-        &state.psk_file_path,
-        psk_content.into_bytes(),
-        PSK_FILE_MODE,
-    )
-    .await
-    .map_err(|e| error_response("internal", &format!("write psks: {e}")))?;
-
-    // Update clients.json: read, append, atomic write.
-    let enrolled_at = format_rfc3339_z(SystemTime::now());
-    let mut clients_doc = read_clients_doc(&state.clients_file_path)
-        .await
-        .map_err(|e| error_response("internal", &e))?;
-    clients_doc.clients.push(crate::config::ClientEntry {
-        name: client.to_string(),
-        providers: vec![PROVIDER_GITHUB.to_string()],
-        enrolled_at: enrolled_at.clone(),
-        note: note.clone(),
-    });
-    let clients_bytes = serde_json::to_vec_pretty(&clients_doc)
-        .map_err(|e| error_response("internal", &format!("encode clients.json: {e}")))?;
-    atomic_write(&state.clients_file_path, clients_bytes, CLIENTS_FILE_MODE)
-        .await
-        .map_err(|e| error_response("internal", &format!("write clients.json: {e}")))?;
-
-    // Commit to in-memory clients table (keyed on identity now).
-    state.clients.borrow_mut().insert(
-        client.to_string(),
-        ResolvedClient {
-            name: client.to_string(),
-            providers: vec![PROVIDER_GITHUB.to_string()],
-            enrolled_at,
-            note,
-        },
-    );
-    rollback.commit();
-
-    info!(evt = %EventKind::Enroll, provider = provider, client = client);
-    Ok(serde_json::json!({
-        "ok": true,
-        "identity": client,
-        "psk_hex": psk_hex,
-        "client_name": client,
-    }))
 }
 
 async fn handle_revoke(
@@ -424,45 +332,14 @@ async fn handle_revoke(
     if state.lookup_provider(provider).is_none() {
         return Err(unknown_provider_error(provider));
     }
-
-    // Identity must be enrolled. Both the in-memory PSK store and the
-    // clients table are kept in lockstep by `enroll`, so checking one
-    // is sufficient.
-    if !state.clients.borrow().contains_key(client) {
-        return Err(error_response(
+    match state.revoke_client(client).await {
+        Ok(()) => Ok(serde_json::json!({ "ok": true })),
+        Err(crate::daemon::StateMutationError::UnknownClient(c)) => Err(error_response(
             "unknown_client",
-            &format!("no enrolled client named '{client}'"),
-        ));
+            &format!("no enrolled client named '{c}'"),
+        )),
+        Err(e) => Err(error_response("internal", &e.to_string())),
     }
-
-    // Rewrite clients.json without the entry. (The single-provider
-    // build always removes the whole entry; multi-provider revoke is
-    // out of scope this session.)
-    let mut clients_doc = read_clients_doc(&state.clients_file_path)
-        .await
-        .map_err(|e| error_response("internal", &e))?;
-    clients_doc.clients.retain(|c| c.name != client);
-    let clients_bytes = serde_json::to_vec_pretty(&clients_doc)
-        .map_err(|e| error_response("internal", &format!("encode clients.json: {e}")))?;
-    atomic_write(&state.clients_file_path, clients_bytes, CLIENTS_FILE_MODE)
-        .await
-        .map_err(|e| error_response("internal", &format!("write clients.json: {e}")))?;
-
-    // Remove from the PSK store and rewrite the on-disk file.
-    state.psks.borrow_mut().remove(client);
-    let psk_content = state.psks.borrow().render();
-    atomic_write(
-        &state.psk_file_path,
-        psk_content.into_bytes(),
-        PSK_FILE_MODE,
-    )
-    .await
-    .map_err(|e| error_response("internal", &format!("write psks: {e}")))?;
-
-    state.clients.borrow_mut().remove(client);
-
-    info!(evt = %EventKind::Revoke, provider = provider, client = client);
-    Ok(serde_json::json!({ "ok": true }))
 }
 
 async fn handle_mint(
@@ -481,22 +358,14 @@ async fn handle_mint(
         ));
     }
     match provider_obj.mint(path).await {
-        Ok(outcome) => {
-            let expires_unix = outcome
-                .response
-                .password_expiry_utc
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            Ok(serde_json::json!({
-                "ok": true,
-                "username": outcome.response.username,
-                "password": outcome.response.password,
-                "expires_at_unix": expires_unix,
-                "out_req_id": outcome.out_req_id,
-                "provider_req_id": outcome.provider_req_id,
-            }))
-        }
+        Ok(outcome) => Ok(serde_json::json!({
+            "ok": true,
+            "username": outcome.response.username,
+            "password": outcome.response.password,
+            "expires_at_unix": outcome.response.password_expiry_unix_secs(),
+            "out_req_id": outcome.out_req_id,
+            "provider_req_id": outcome.provider_req_id,
+        })),
         Err(e) => Err(error_response_from_provider(&e)),
     }
 }
@@ -587,15 +456,21 @@ pub async fn cli_dispatch(socket_path: &Path, command: CliCommand) -> Result<i32
     Ok(0)
 }
 
-fn s<'a>(v: &'a serde_json::Value, k: &str) -> &'a str {
+/// Read a string field off a JSON response, falling back to `"?"`
+/// for absent / non-string values. Used by the CLI printers, which
+/// run after the daemon already validated the response.
+fn json_str_or_q<'a>(v: &'a serde_json::Value, k: &str) -> &'a str {
     v.get(k).and_then(|x| x.as_str()).unwrap_or("?")
 }
 
-fn u(v: &serde_json::Value, k: &str) -> u64 {
+/// Read a u64 field off a JSON response, falling back to `0`.
+fn json_u64_or_zero(v: &serde_json::Value, k: &str) -> u64 {
     v.get(k).and_then(|x| x.as_u64()).unwrap_or(0)
 }
 
-fn arr_join(v: &serde_json::Value, k: &str, sep: &str) -> String {
+/// Read a string-array field and join with `sep`. Empty on absent
+/// or non-array; non-string elements are filtered out.
+fn json_str_array_join(v: &serde_json::Value, k: &str, sep: &str) -> String {
     v.get(k)
         .and_then(|x| x.as_array())
         .map(|arr| {
@@ -611,9 +486,12 @@ impl CliCommand {
     fn print_success(&self, response: &serde_json::Value) {
         match self {
             CliCommand::Status => {
-                println!("Uptime: {}s", u(response, "uptime_sec"));
-                println!("Providers: {}", arr_join(response, "providers", ", "));
-                println!("Clients: {}", u(response, "client_count"));
+                println!("Uptime: {}s", json_u64_or_zero(response, "uptime_sec"));
+                println!(
+                    "Providers: {}",
+                    json_str_array_join(response, "providers", ", ")
+                );
+                println!("Clients: {}", json_u64_or_zero(response, "client_count"));
             }
             CliCommand::List => {
                 let empty = vec![];
@@ -628,14 +506,14 @@ impl CliCommand {
                 for c in entries {
                     println!(
                         "{}\t{}\t{}",
-                        s(c, "name"),
-                        arr_join(c, "providers", ","),
-                        s(c, "enrolled_at")
+                        json_str_or_q(c, "name"),
+                        json_str_array_join(c, "providers", ","),
+                        json_str_or_q(c, "enrolled_at")
                     );
                 }
             }
             CliCommand::GithubEnroll { client, .. } => {
-                let psk_hex = s(response, "psk_hex");
+                let psk_hex = json_str_or_q(response, "psk_hex");
                 println!("Enrolled '{client}' for github.com.");
                 println!();
                 println!("# On the client VM, install the helper binary alongside git:");
@@ -657,9 +535,12 @@ impl CliCommand {
                 println!("Revoked '{client}' from github.com.");
             }
             CliCommand::GithubMint { .. } => {
-                println!("username={}", s(response, "username"));
-                println!("password={}", s(response, "password"));
-                println!("expires_at_unix={}", u(response, "expires_at_unix"));
+                println!("username={}", json_str_or_q(response, "username"));
+                println!("password={}", json_str_or_q(response, "password"));
+                println!(
+                    "expires_at_unix={}",
+                    json_u64_or_zero(response, "expires_at_unix")
+                );
             }
             CliCommand::GithubSelfcheck => {
                 // Provider-specific fields nest under `details` per
@@ -673,8 +554,8 @@ impl CliCommand {
                     .unwrap_or(0);
                 println!(
                     "OK: App {} reachable at {}, clock skew {skew}s",
-                    s(details, "client_id"),
-                    s(details, "api_base"),
+                    json_str_or_q(details, "client_id"),
+                    json_str_or_q(details, "api_base"),
                 );
             }
         }
@@ -694,99 +575,6 @@ fn unknown_provider_error(provider: &str) -> serde_json::Value {
         "unknown_provider",
         &format!("provider '{provider}' not configured"),
     )
-}
-
-async fn generate_psk_key() -> std::io::Result<[u8; 32]> {
-    use compio::io::AsyncReadAtExt;
-    let file = compio::fs::File::open("/dev/urandom").await?;
-    let buf = vec![0u8; 32];
-    let BufResult(res, buf) = file.read_exact_at(buf, 0).await;
-    res?;
-    buf.try_into()
-        .map_err(|_| std::io::Error::other("short read from /dev/urandom"))
-}
-
-pub(crate) async fn atomic_write(path: &Path, content: Vec<u8>, mode: u32) -> std::io::Result<()> {
-    use compio::io::AsyncWriteAtExt;
-    let dir = path
-        .parent()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent"))?
-        .to_path_buf();
-    let base = path.file_name().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
-    })?;
-    let tmp = dir.join(format!(
-        "{}.tmp.{}",
-        base.to_string_lossy(),
-        ulid::Ulid::new()
-    ));
-    {
-        let mut f = compio::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(mode)
-            .open(&tmp)
-            .await?;
-        let BufResult(res, _) = f.write_all_at(content, 0).await;
-        res?;
-        f.sync_all().await?;
-    }
-    if let Err(e) = compio::fs::rename(&tmp, path).await {
-        let _ = compio::fs::remove_file(&tmp).await;
-        return Err(e);
-    }
-    // Parent-dir fsync: open the dir as a File and call sync_all.
-    // compio::fs::File::open defaults to O_RDONLY which is the right
-    // mode for fsync-only on a directory.
-    compio::fs::File::open(&dir).await?.sync_all().await?;
-    Ok(())
-}
-
-async fn read_clients_doc(path: &Path) -> Result<crate::config::ClientsFile, String> {
-    match compio::fs::read(path).await {
-        Ok(bytes) => {
-            let text = std::str::from_utf8(&bytes)
-                .map_err(|e| format!("non-utf8 {}: {e}", path.display()))?;
-            crate::config::parse_clients_file(text, path)
-                .map_err(|e| format!("parse {}: {e}", path.display()))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(crate::config::ClientsFile {
-            version: crate::config::CLIENTS_SCHEMA_VERSION,
-            clients: Vec::new(),
-        }),
-        Err(e) => Err(format!("read {}: {e}", path.display())),
-    }
-}
-
-fn format_rfc3339_z(t: SystemTime) -> String {
-    // Tries the clock; on any failure (pre-epoch clock, year-9999
-    // overflow on the time crate side, format-string error) falls
-    // back to the epoch. The caller stores this value verbatim into
-    // the on-disk `enrolled_at` field — better to record a wrong
-    // timestamp than to abort an otherwise-successful enroll.
-    let secs = t
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let formatted = i64::try_from(secs)
-        .ok()
-        .and_then(|s| time::OffsetDateTime::from_unix_timestamp(s).ok())
-        .and_then(|dt| {
-            dt.format(&time::format_description::well_known::Rfc3339)
-                .ok()
-        });
-    match formatted {
-        Some(s) => s,
-        None => {
-            tracing::warn!(
-                evt = "rfc3339_format_failed",
-                secs = secs,
-                "falling back to epoch for enrolled_at timestamp"
-            );
-            "1970-01-01T00:00:00Z".to_string()
-        }
-    }
 }
 
 // Returns false (denial) only on a definitive non-root, non-self UID.
@@ -911,34 +699,6 @@ mod tests {
         assert!(!crate::transport::Identity::is_valid("has\nlf"));
         assert!(!crate::transport::Identity::is_valid("has\rcr"));
         assert!(!crate::transport::Identity::is_valid("över-äscii"));
-    }
-
-    #[compio::test]
-    async fn atomic_write_round_trip_with_mode() {
-        let dir = std::env::temp_dir().join(format!("symbolon-aw-{}", ulid::Ulid::new()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test.bin");
-        atomic_write(&path, b"hello\n".to_vec(), 0o600)
-            .await
-            .unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"hello\n");
-        let metadata = std::fs::metadata(&path).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-        // Overwrite.
-        atomic_write(&path, b"world\n".to_vec(), 0o640)
-            .await
-            .unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"world\n");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn format_rfc3339_z_is_z_suffixed() {
-        let t = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let s = format_rfc3339_z(t);
-        assert!(s.ends_with('Z'), "got {s}");
-        assert_eq!(s.len(), 20, "expected fixed-width 20, got {s}");
     }
 
     #[test]

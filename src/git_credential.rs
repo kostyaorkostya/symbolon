@@ -39,6 +39,20 @@ pub struct Response {
     pub password_expiry_utc: SystemTime,
 }
 
+impl Response {
+    /// Render `password_expiry_utc` as seconds-since-epoch for the
+    /// admin/log wire shape. Saturates to `0` on pre-epoch input —
+    /// GitHub never returns a `expires_at` before 1970, so the
+    /// saturating arm is dead in practice; it exists only to keep
+    /// callers from needing their own `Option` plumbing.
+    pub fn password_expiry_unix_secs(&self) -> u64 {
+        self.password_expiry_utc
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum GitCredentialError {
     #[error("request block is not terminated by an empty line")]

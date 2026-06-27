@@ -30,7 +30,7 @@ use crate::git_credential;
 use crate::identity::{Identity, IdentityError};
 use crate::ids::{OutReqId, ReqId};
 use crate::providers::github::{GitHubProvider, GithubError};
-use crate::providers::{Provider, ProviderError, ProviderReqId};
+use crate::providers::{Provider, ProviderError, ProviderKind, ProviderReqId};
 use crate::psk_store::{PskStore, PskStoreError};
 use crate::sandbox::{self, SandboxError, SandboxPaths, SandboxStatus};
 use crate::transport::{Phase, Responder, SessionError, Step};
@@ -137,7 +137,7 @@ pub struct SharedState {
     /// dispatch iterates `.values()` and matches on `provider.host()`.
     /// Cardinality is 1 today; when GitLab/Gitea land, add a sibling
     /// module + `ProviderKind` variant and insert here.
-    pub(crate) providers: HashMap<crate::providers::ProviderKind, Box<dyn Provider>>,
+    pub(crate) providers: HashMap<ProviderKind, Box<dyn Provider>>,
     pub(crate) psk_file_path: PathBuf,
     pub(crate) clients_file_path: PathBuf,
     pub(crate) admin_socket_path: PathBuf,
@@ -194,7 +194,7 @@ impl SharedState {
     pub(crate) async fn enroll_client(
         &self,
         client: Identity,
-        provider: crate::providers::ProviderKind,
+        provider: ProviderKind,
         note: Option<String>,
     ) -> Result<EnrolledClient, StateMutationError> {
         if self.clients.borrow().contains_key(&client) {
@@ -472,12 +472,11 @@ impl Service {
         // Keyed by `ProviderKind` at the registration site so the
         // `Provider` trait itself doesn't need to know its own kind —
         // the daemon owns the (kind, impl) pairing.
-        let mut providers: HashMap<crate::providers::ProviderKind, Box<dyn Provider>> =
-            HashMap::new();
+        let mut providers: HashMap<ProviderKind, Box<dyn Provider>> = HashMap::new();
         if let Some(gh) = &cfg.provider.github {
             let key = github_key.expect("github_key loaded above when gh is Some");
             let provider = GitHubProvider::new(gh, key, cpu_worker.clone(), shutdown.clone())?;
-            providers.insert(crate::providers::ProviderKind::Github, Box::new(provider));
+            providers.insert(ProviderKind::Github, Box::new(provider));
         }
 
         let state = Rc::new(SharedState {
@@ -664,7 +663,7 @@ impl SharedState {
     /// git-credential `host=` match) lives in `handle_connection`
     /// and uses `provider.host()` instead.
     pub fn lookup_provider(&self, name: &str) -> Option<&(dyn crate::providers::Provider + '_)> {
-        let kind: crate::providers::ProviderKind = name.parse().ok()?;
+        let kind: ProviderKind = name.parse().ok()?;
         self.providers.get(&kind).map(|b| b.as_ref())
     }
 

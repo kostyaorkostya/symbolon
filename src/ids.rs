@@ -33,10 +33,6 @@ impl ReqId {
     pub fn new() -> Self {
         Self(ulid::Ulid::new().to_string())
     }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
 impl From<&str> for ReqId {

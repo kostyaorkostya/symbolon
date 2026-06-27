@@ -114,7 +114,7 @@ pub enum DaemonError {
 pub(crate) struct ResolvedClient {
     pub(crate) providers: Vec<ProviderKind>,
     pub(crate) enrolled_at: time::OffsetDateTime,
-    pub(crate) note: Option<String>,
+    pub(crate) note: Option<crate::note::Note>,
 }
 
 /// Shared between the listen-side accept loop and the admin-side
@@ -184,7 +184,7 @@ impl SharedState {
         client: Identity,
         psk: crate::psk::Psk,
         provider: ProviderKind,
-        note: Option<String>,
+        note: Option<crate::note::Note>,
     ) -> Result<(), StateMutationError> {
         if self.clients.borrow().contains_key(&client) {
             return Err(StateMutationError::ClientAlreadyEnrolled(client));

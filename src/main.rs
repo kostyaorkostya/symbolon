@@ -10,7 +10,7 @@ use hex::FromHex;
 
 use symbolon::CliCommand;
 use symbolon::EventKind;
-use symbolon::Psk;
+use symbolon::{Identity, Note, Psk};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/symbolon/config.toml";
 
@@ -44,6 +44,20 @@ async fn main() -> ExitCode {
         Subcommand::Github(g) => {
             let cmd = match g.cmd {
                 GithubSub::Enroll(a) => {
+                    let client = match Identity::parse(&a.client) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            eprintln!("symbolon: <client> invalid: {e}");
+                            return ExitCode::from(2);
+                        }
+                    };
+                    let note = match a.note.as_deref().map(Note::parse).transpose() {
+                        Ok(n) => n,
+                        Err(e) => {
+                            eprintln!("symbolon: --note invalid: {e}");
+                            return ExitCode::from(2);
+                        }
+                    };
                     let psk = match a.psk.as_deref() {
                         Some(hex) => match Psk::from_hex(hex) {
                             Ok(p) => p,
@@ -61,17 +75,31 @@ async fn main() -> ExitCode {
                             Psk::from(bytes)
                         }
                     };
-                    CliCommand::GithubEnroll {
-                        client: a.client,
-                        note: a.note,
-                        psk,
+                    CliCommand::GithubEnroll { client, note, psk }
+                }
+                GithubSub::Revoke(a) => {
+                    let client = match Identity::parse(&a.client) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            eprintln!("symbolon: <client> invalid: {e}");
+                            return ExitCode::from(2);
+                        }
+                    };
+                    CliCommand::GithubRevoke { client }
+                }
+                GithubSub::Mint(a) => {
+                    let client = match Identity::parse(&a.client) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            eprintln!("symbolon: <client> invalid: {e}");
+                            return ExitCode::from(2);
+                        }
+                    };
+                    CliCommand::GithubMint {
+                        client,
+                        path: a.repo,
                     }
                 }
-                GithubSub::Revoke(a) => CliCommand::GithubRevoke { client: a.client },
-                GithubSub::Mint(a) => CliCommand::GithubMint {
-                    client: a.client,
-                    path: a.repo,
-                },
                 GithubSub::Selfcheck(_) => CliCommand::GithubSelfcheck,
             };
             run_cli(config_path, cmd).await

@@ -34,8 +34,29 @@ pub enum IdentityError {
 /// rule was applied.
 ///
 /// `Debug` is redacted on purpose — see the module doc.
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Display)]
+///
+/// Serde uses `try_from`/`into` so deserialise re-runs
+/// `Identity::parse` (rejecting bad identities at JSON-parse time)
+/// and serialise emits the bare string the rest of the codebase
+/// expects on the wire and on disk.
+#[derive(
+    Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Display, serde::Serialize, serde::Deserialize,
+)]
+#[serde(into = "String", try_from = "String")]
 pub struct Identity(String);
+
+impl From<Identity> for String {
+    fn from(id: Identity) -> Self {
+        id.0
+    }
+}
+
+impl TryFrom<String> for Identity {
+    type Error = IdentityError;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        Self::parse(&s)
+    }
+}
 
 impl Identity {
     /// Maximum identity byte length. Bounds the on-wire prelude so a

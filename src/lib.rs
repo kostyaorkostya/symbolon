@@ -37,6 +37,7 @@ pub(crate) mod ids;
 pub(crate) mod loader;
 pub(crate) mod logging;
 pub(crate) mod mlock;
+pub(crate) mod note;
 pub(crate) mod providers;
 pub(crate) mod psk;
 pub(crate) mod psk_store;
@@ -76,6 +77,8 @@ pub use crate::loader::load_config;
 pub use crate::logging::{ErrorChain, setup_tracing};
 #[doc(hidden)]
 pub use crate::mlock::{MlockRequiredFailed, apply as mlock_apply};
+#[doc(hidden)]
+pub use crate::note::{Note, NoteError};
 #[doc(hidden)]
 pub use crate::providers::ProviderReqId;
 #[doc(hidden)]

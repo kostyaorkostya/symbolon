@@ -229,7 +229,7 @@ pub struct ClientEntry {
     /// `OffsetDateTime` rejects malformed strings at load time.
     #[serde(with = "time::serde::rfc3339")]
     pub enrolled_at: time::OffsetDateTime,
-    pub note: Option<String>,
+    pub note: Option<crate::note::Note>,
 }
 
 /// Abstract parse error. Boxed so callers can render the

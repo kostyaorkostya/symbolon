@@ -36,7 +36,7 @@
 //! client identity is being used, but without the PSK they can't impersonate
 //! or decrypt anything.
 
-use snow::{Builder, HandshakeState, TransportState, params::NoiseParams};
+use snow::{params::NoiseParams, Builder, HandshakeState, TransportState};
 
 use crate::identity::{Identity, IdentityError};
 use crate::psk::Psk;
@@ -196,20 +196,19 @@ fn parse_prelude_body(body: &[u8]) -> Result<Identity, PreludeError> {
 /// Streaming callers should use [`Responder`] instead; it sees bytes
 /// as they arrive and validates the head before reading the body.
 pub fn parse_prelude(input: &[u8]) -> Result<(Identity, usize), PreludeError> {
-    if input.len() < 6 {
-        return Err(PreludeError::Incomplete {
+    let head = input
+        .first_chunk::<6>()
+        .ok_or_else(|| PreludeError::Incomplete {
             needed: 6 - input.len(),
-        });
-    }
-    let head: &[u8; 6] = input[0..6].try_into().expect("slice of length 6");
+        })?;
     let id_len = parse_prelude_head(head)?;
     let total = prelude_size(id_len as usize);
-    if input.len() < total {
-        return Err(PreludeError::Incomplete {
+    let body = input
+        .get(6..total)
+        .ok_or_else(|| PreludeError::Incomplete {
             needed: total - input.len(),
-        });
-    }
-    let identity = parse_prelude_body(&input[6..total])?;
+        })?;
+    let identity = parse_prelude_body(body)?;
     Ok((identity, total))
 }
 
@@ -454,6 +453,17 @@ impl SessionError {
             Err(Self::RecvLen { expected, got })
         }
     }
+
+    /// Const-length variant: returns the bytes as an owned `[u8; N]`
+    /// so the caller skips the `try_into().expect(...)` dance. Use
+    /// when the expected length is a compile-time constant (prelude
+    /// head = 6, frame-length prefix = 2).
+    fn recv_chunk<const N: usize>(bytes: &[u8]) -> Result<[u8; N], Self> {
+        bytes.try_into().map_err(|_| Self::RecvLen {
+            expected: N,
+            got: bytes.len(),
+        })
+    }
 }
 
 // --- Responder -----------------------------------------------------------
@@ -675,8 +685,7 @@ impl Responder {
         let state_name: &str = (&self.state).into();
         match std::mem::replace(&mut self.state, RState::Failed) {
             RState::WantPreludeHead => {
-                SessionError::check_recv_len(6, bytes.len())?;
-                let head: [u8; 6] = bytes.try_into().expect("len 6");
+                let head = SessionError::recv_chunk::<6>(bytes)?;
                 // Validate magic+version+id_len BEFORE asking for the
                 // body. A hostile peer can't make us pull `id_len` more
                 // bytes unless the head is well-formed.
@@ -699,8 +708,7 @@ impl Responder {
                 Ok(())
             }
             RState::WantHsLen { hs } => {
-                SessionError::check_recv_len(2, bytes.len())?;
-                let len_buf: [u8; 2] = bytes.try_into().expect("len 2");
+                let len_buf = SessionError::recv_chunk::<2>(bytes)?;
                 let body_len = read_frame_length(&len_buf)?;
                 self.state = RState::WantHsBody { hs, body_len };
                 Ok(())
@@ -715,8 +723,7 @@ impl Responder {
                 Ok(())
             }
             RState::WantReqLen { ts } => {
-                SessionError::check_recv_len(2, bytes.len())?;
-                let len_buf: [u8; 2] = bytes.try_into().expect("len 2");
+                let len_buf = SessionError::recv_chunk::<2>(bytes)?;
                 let body_len = read_frame_length(&len_buf)?;
                 self.state = RState::WantReqBody { ts, body_len };
                 Ok(())
@@ -983,8 +990,7 @@ impl Initiator {
         let state_name: &str = (&self.state).into();
         match std::mem::replace(&mut self.state, IState::Failed) {
             IState::WantHs2Len { hs, request } => {
-                SessionError::check_recv_len(2, bytes.len())?;
-                let len_buf: [u8; 2] = bytes.try_into().expect("len 2");
+                let len_buf = SessionError::recv_chunk::<2>(bytes)?;
                 let body_len = read_frame_length(&len_buf)?;
                 self.state = IState::WantHs2Body {
                     hs,
@@ -1008,8 +1014,7 @@ impl Initiator {
                 Ok(())
             }
             IState::WantRespLen { ts } => {
-                SessionError::check_recv_len(2, bytes.len())?;
-                let len_buf: [u8; 2] = bytes.try_into().expect("len 2");
+                let len_buf = SessionError::recv_chunk::<2>(bytes)?;
                 let body_len = read_frame_length(&len_buf)?;
                 self.state = IState::WantRespBody { ts, body_len };
                 Ok(())

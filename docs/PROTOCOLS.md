@@ -108,7 +108,6 @@ state-file writes.
 
 ```json
 {
-  "version": 1,
   "clients": [
     {
       "name": "dev-vm-1",
@@ -120,11 +119,11 @@ state-file writes.
 }
 ```
 
-`version` is a literal integer the daemon checks at parse time
-(currently must be `1`); it exists so a future on-disk format
-change can be detected and migrated rather than silently
-mis-parsed. The `providers` array allows multi-provider
-enrolment per client.
+`#[serde(deny_unknown_fields)]` is set on the parser, so any
+extra top-level key (or extra field on a client entry) is a hard
+parse failure — schema drift surfaces immediately instead of
+silently dropping data. The `providers` array allows
+multi-provider enrolment per client.
 
 ### `/var/lib/symbolon/psks`: machine-authored
 

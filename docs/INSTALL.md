@@ -155,7 +155,7 @@ chmod 0600    /etc/symbolon/config.toml
 ### 3.6 Initialize state files
 
 ```sh
-echo '{"version":1,"clients":[]}' > /var/lib/symbolon/clients.json
+echo '{"clients":[]}' > /var/lib/symbolon/clients.json
 chown symbolon:symbolon /var/lib/symbolon/clients.json
 chmod 0600    /var/lib/symbolon/clients.json
 

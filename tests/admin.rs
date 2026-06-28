@@ -74,7 +74,6 @@ async fn admin_enroll_persists_to_clients_json_and_psk_file() {
 
     let clients_text = std::fs::read_to_string(&paths.clients).unwrap();
     assert!(clients_text.contains("\"name\": \"vm-1\""));
-    // v2 clients.json carries no `ip` field.
     assert!(!clients_text.contains("\"ip\""));
     let cl_mode = std::fs::metadata(&paths.clients)
         .unwrap()
@@ -279,8 +278,8 @@ async fn admin_selfcheck_against_wiremock() {
         serde_json::json!(true),
         "selfcheck failed: {resp:?}"
     );
-    // GitHub-specific selfcheck fields now nest under `details`
-    // (the abstract `SelfcheckOutcome` carries only the generalizable
-    // ones at the top level).
+    // GitHub-specific selfcheck fields nest under `details`; the
+    // abstract `SelfcheckOutcome` carries only the generalisable
+    // ones at the top level.
     assert_eq!(resp["details"]["client_id"], CLIENT_ID);
 }

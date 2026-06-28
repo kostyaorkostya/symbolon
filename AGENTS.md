@@ -142,8 +142,13 @@ and permission set per provider live in `docs/providers/<name>.md`.
    fsync parent).
 9. **Admin surface = Unix-domain socket.** No HTTP admin endpoints.
 10. **Daemon is the sole writer** of state files. CLI commands talk
-    to the daemon via the admin socket; the daemon serializes them.
-    Therefore no file locks are required.
+    to the daemon via the admin socket; the daemon serialises
+    concurrent enroll/revoke through `SharedState.mutation_lock`
+    (single-permit async mutex) so on-disk writes can't race across
+    `atomic_write` `.await`s. Both `psks` and `clients` in-memory
+    tables are updated *before* the disk write so a concurrent mint
+    on the wire path never sees a half-enrolled client. In-memory is
+    the truth — no read-merge dance.
 11. **Host dispatch is byte-exact.** `host=` in a git-credential
     request must match a configured `[provider.X].host` exactly.
     No suffix matching, no case-folding, no default.
@@ -363,32 +368,30 @@ Pinned in `Cargo.toml`:
   top-level dep so the audit surface is explicit.)
 - `ulid` (request IDs)
 - `thiserror` (errors)
-- `rustix` with features `net,process`. `process` for `geteuid` on
-  the admin path (used by the SO_PEERCRED gate in `admin.rs`).
-  `net` for `socket_peercred` on the admin UDS, the SO_PEERCRED
-  check that rejects connections from UIDs other than root or
-  the daemon's own (defense in depth against a loose
-  `/run/symbolon/` ACL).
 - `signal-hook-registry` (long-lived OS-level signal handler
   installed once at startup; the kernel disposition stays bound
   to our handler for the process lifetime. `compio::signal` would
   be the obvious alternative but its `signal()` is one-shot — it
-  reverts to `SigDfl` on listener drop, and a SIGHUP delivered in
-  that gap would kill the daemon. We register synchronous handlers
-  per signal that set an AtomicBool + call `AtomicWaker::wake` on
-  a `SignalNotifier`; the compio task loop awaits a re-armable
+  reverts to `SigDfl` on listener drop, and a SIGTERM delivered in
+  that gap would kill the daemon without giving the shutdown loop
+  a chance to drain. We register synchronous handlers per signal
+  that set an AtomicBool + call `AtomicWaker::wake` on a
+  `SignalNotifier`; the compio task loop awaits a re-armable
   `Notified` future. Both the AtomicBool store and the
   AtomicWaker wake are lock-free, alloc-free, reentrant, and
   async-signal-safe.)
-- `synchrony` with features `async_flag,event` (sync primitives for
-  `compio`. `sync::event::Event` is the re-armable wakeup used by
+- `synchrony` with features `async_flag,event,mutex` (sync primitives
+  for `compio`. `sync::event::Event` is the re-armable wakeup used by
   `ConnectionTracker`'s "drain empty" notification and by the
-  singleflight cache in `providers::github`. The signal-handler
-  notifier uses raw `AtomicBool` + `futures_util::task::AtomicWaker`
-  directly rather than `AsyncFlag` because `AsyncFlag::wait` is
-  consume-on-wait, which doesn't fit the permanent handler loop.
-  `async_flag` feature stays enabled because synchrony co-builds
-  the two primitives.)
+  singleflight cache in `providers::github`. `unsync::mutex::Mutex<()>`
+  is the single-permit async mutex on `SharedState.mutation_lock`
+  that serialises concurrent `enroll_client`/`revoke_client` so
+  their on-disk writes can't race across `atomic_write` `.await`s.
+  The signal-handler notifier uses raw `AtomicBool` +
+  `futures_util::task::AtomicWaker` directly rather than `AsyncFlag`
+  because `AsyncFlag::wait` is consume-on-wait, which doesn't fit
+  the permanent handler loop. `async_flag` feature stays enabled
+  because synchrony co-builds the primitives.)
 - `url` (parse `api_base` to extract its host string once at
   provider construction. The same-origin redirect policy on
   `cyper::ClientBuilder` compares `attempt.url().host_str()`
@@ -440,7 +443,11 @@ Addenda:
 - `thiserror` for library error types (one enum per module,
   `<Module>Error`). `anyhow` only at the binary's `main` boundary.
 - No `#[allow(...)]` without an explanatory comment.
-- Default visibility is `pub(crate)`. Only `lib.rs` re-exports `pub`.
+- Default to `pub` for items reachable across modules; mark items
+  not used outside their module as private (no qualifier). `pub(crate)`
+  is not used — this crate ships only as the daemon + client binaries
+  (no external library consumer), so the lib/binary boundary is
+  internal-only and the extra `(crate)` is ceremony without value.
 - Default to no comments. Add a doc comment only when the *why* or
   the contract isn't obvious from the name and signature: hidden
   invariants, surprising edge cases, security-load-bearing rules
@@ -491,22 +498,27 @@ src/
   bin/
     git_credential_symbolon.rs  # client-side git-credential helper
   lib.rs               # crate-level docs, pub re-exports
+  admin.rs             # admin Unix socket + CLI dispatch (enroll/revoke/etc.)
+  atomic_fs.rs         # tempfile + fsync + rename + fsync-parent write
   config.rs            # config.toml + clients.json parsing
   connection_tracker.rs# spawn / drain abstraction for accept loops
   cpu_worker.rs        # dedicated OS thread for CPU-bound work
+  daemon.rs            # TCP accept loop, per-connection driver, Service shape
   events.rs            # closed-set EventKind enum for structured logs
   git_credential.rs    # protocol parse/emit; CR/LF rejection mandatory
-  transport.rs         # Responder/Initiator sans-IO state machines, framing, prelude
-  psk_store.rs         # in-memory identity → PSK store, file-backed
-  daemon.rs            # TCP accept loop, per-connection driver, Service shape
-  admin.rs             # admin Unix socket + CLI dispatch (enroll/revoke/etc.)
-  signals.rs           # signal-hook-registry handlers → CancelToken
-  ready.rs             # sd_notify + pidfile (atomic) at startup
+  identity.rs          # validated PSK identity newtype
+  ids.rs               # ReqId / OutReqId correlation-id newtypes
   loader.rs            # async config/clients.json file reads
   logging.rs           # tracing-subscriber JSON setup (stdout/stderr split)
   mlock.rs             # mlockall(MCL_CURRENT|MCL_FUTURE) wrapper
+  note.rs              # validated operator-note newtype
+  psk.rs               # 32-byte PSK newtype (redacted Debug, LowerHex)
+  psk_store.rs         # in-memory identity → PSK store, file-backed
+  ready.rs             # sd_notify + pidfile (atomic) at startup
   sandbox.rs           # landlock (FS + TCP + UDS scope + signal scope)
+  signals.rs           # signal-hook-registry handlers → CancelToken
   singleflight_cache.rs# generic TTL cache + singleflight coordinator
+  transport.rs         # Responder/Initiator sans-IO state machines, framing, prelude
   providers/
     mod.rs             # `Provider` trait + abstract `ProviderError` / outcomes
     github.rs          # GitHub: JWT, repo-ID resolution + mint

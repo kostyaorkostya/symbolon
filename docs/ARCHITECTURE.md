@@ -125,6 +125,28 @@ matching, no default) against the `host` values in configured
 `evt=mint_denied reason=unknown_host`. See
 [`PROTOCOLS.md` § Host dispatch](PROTOCOLS.md#host-dispatch-byte-exact).
 
+## Supervisor handoff
+
+The daemon does **not** bind its listening sockets — both the
+inbound TCP wire socket and the admin Unix socket are obtained
+from a supervisor via the systemd-defined `LISTEN_FDS` env
+protocol. Two supported deployments:
+
+- **systemd:** a `.socket` unit with `Sockets=symbolon.socket` on
+  the `.service`. systemd binds the sockets, sets `SocketMode=0600`
+  for the UDS, and hands the fds to the daemon at start.
+- **non-systemd (OpenRC, runit, s6, …):** the
+  [`systemfd`](https://github.com/mitsuhiko/systemfd) wrapper:
+  `systemfd --no-pid -s tcp::… -s unix::… -- symbolon daemon`.
+  systemfd binds, sets `LISTEN_FDS`/`LISTEN_PID`, and execs.
+
+Slot ordering is fixed: slot 0 = TCP wire, slot 1 = admin UDS.
+A plain `symbolon daemon` invocation with no supervisor exits
+immediately with `DaemonError::EnvFdTake`. The supervisor owns
+the socket inode lifecycle (perms, unlink); the daemon never
+binds, chmods, or unlinks. See [`INSTALL.md`](INSTALL.md) §§ 3.8–3.10
+for the unit / init-script recipes.
+
 ## State and atomic writes
 
 State lives in two files on the broker:
@@ -144,8 +166,10 @@ Wire and file schemas in
 
 ## Sandbox model
 
-At startup, after sockets are bound and the provider private key
-is loaded, the broker applies Landlock at ABI 6 to itself:
+At startup, after sockets are inherited via `LISTEN_FDS` (the daemon
+does not bind — see [Supervisor handoff](#supervisor-handoff)) and the
+provider private key is loaded, the broker applies Landlock at ABI 6
+to itself:
 
 - **FS allowlist.** Only the state directory
   (`/var/lib/symbolon/`, read-write), `/dev/urandom`, the CA

@@ -12,11 +12,13 @@ See also:
 - [`../AGENTS.md`](../AGENTS.md): design and style notes for
   contributors.
 
-CLI commands talk to the daemon over its admin Unix socket. The
-socket is SO_PEERCRED-gated to root or the daemon's UID, so the
-commands need to run as one of those. How you arrange that
-(invoking as root, `sudo -u`, `machinectl shell`, etc.) is up to
-your local convention.
+CLI commands talk to the daemon over its admin Unix socket.
+Access is gated entirely by filesystem permissions on the socket's
+parent directory (`/run/symbolon/` mode `0o750`, group `symbolon`)
+and the socket inode itself (mode `0o600` under systemd's
+`SocketMode=`; under `systemfd` + OpenRC the dir mode is the only
+gate — see [INSTALL.md](INSTALL.md) §3.10). Run the commands as
+root or as a user in the `symbolon` group.
 
 ## Commands
 
@@ -120,7 +122,9 @@ which.
 
 ```sh
 ss -tlnp | grep ':9418'          # symbolon should be listening here
-ls -l /run/symbolon/admin.sock   # admin UDS, owner symbolon:symbolon, mode 0600
+ls -l /run/symbolon/admin.sock   # admin UDS, owner+mode set by supervisor:
+                                 #   systemd: SocketMode=0600 + SocketUser/Group
+                                 #   systemfd: inherits umask; dir mode is the gate
 ```
 
 If the admin socket is missing after a reboot: `/run` is tmpfs,
@@ -172,6 +176,11 @@ Find the `req_id` of the failing request and trace it from
 
 ### Common failure causes
 
+- **Daemon exits immediately with `EnvFdTake` and "LISTEN_FDS unset"**:
+  you ran `symbolon daemon` without a supervisor. The daemon does
+  not bind sockets itself — it expects pre-bound fds from systemd's
+  `.socket` unit or from the `systemfd` wrapper. See [INSTALL.md
+  §§ 3.8–3.10](INSTALL.md). For dev, prefix with `systemfd -s tcp::… -s unix::… --`.
 - **`mint_denied reason=client_unknown`**: the PSK identity from
   the Noise prelude didn't match any enrolled client. Either the
   client's `--identity` flag is wrong, the client was revoked, or

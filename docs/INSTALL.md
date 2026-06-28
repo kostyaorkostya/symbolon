@@ -76,8 +76,11 @@ ruleset grants write access to `/var/lib/symbolon/`; putting the
 provider key under that dir would defeat the sandbox's protection
 of the key.
 
-The `/run/symbolon` directory is recreated on every boot; see
-§3.8/§3.9.
+The `/run/symbolon` directory is recreated on every boot — under
+systemd by the `.service` unit's `RuntimeDirectory=symbolon` (§3.9),
+under OpenRC by the init script's `start_pre` + `checkpath` (§3.10).
+The `install -d` above seeds it for the first start before either
+supervisor is wired up.
 
 ### 3.3 Fetch and verify the binary
 
@@ -369,7 +372,7 @@ manages PIDs from the supervisor side. A daemon-side pidfile
 would be redundant and would force the pidfile's parent directory
 into the Landlock write-allowlist for no benefit.
 
-### 3.10 Verify
+### 3.11 Verify
 
 ```sh
 symbolon status

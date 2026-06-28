@@ -21,13 +21,17 @@ See also:
 
 ```toml
 [listen]
-# TCP address the daemon binds for inbound client connections.
-# Symbolon terminates Noise NNpsk0 in-process; no TLS proxy.
+# Informational — the daemon does NOT bind sockets itself; the
+# supervisor (systemd `.socket` unit or `systemfd` wrapper) hands
+# pre-bound fds via the `LISTEN_FDS` env protocol. Slot 0 = TCP
+# wire, slot 1 = admin UDS. See INSTALL.md §§3.8–3.10.
 bind = "0.0.0.0:9418"
 # Symbolon-owned PSK store. Mutated atomically on enroll/revoke.
 psk_file = "/var/lib/symbolon/psks"
 
 [admin]
+# Path the CLI connects to. The supervisor binds + chmods this
+# socket; the daemon never touches the inode.
 socket_path = "/run/symbolon/admin.sock"
 
 [clients]
@@ -130,9 +134,10 @@ Symbolon-owned PSK store. One identity per line:
 client-name:hex-encoded-32-byte-key
 ```
 
-The daemon parses this file at startup and on `SIGHUP` reload,
-and rewrites it atomically on every `enroll` / `revoke`. Owner is
-the `symbolon` user, mode `0600`.
+The daemon parses this file once at startup and rewrites it
+atomically on every `enroll` / `revoke`. Owner is the `symbolon`
+user, mode `0600`. There is no in-process hot-reload — config
+changes require a restart.
 
 ## Atomic writes
 
@@ -314,8 +319,11 @@ one response and closes.
 
 **Response on success:** `{"ok":true, …op-specific fields}\n`
 
-**Response on failure:** `{"ok":false, "error":"<message>",
-"code":"<machine-code>"}\n`
+**Response on failure:** `{"ok":false, "error":"<message>"}\n`
+
+No `code` tag — operators key on the human-readable `error`
+message (or follow the matching log line via `req_id`); the wire
+isn't a programmatic-discrimination surface.
 
 Op fields (request → response):
 
@@ -323,7 +331,7 @@ Op fields (request → response):
 |---|---|---|
 | `status` | — | `uptime_sec`, `providers`, `client_count` |
 | `list` | — | `clients` (array of `{name, providers, enrolled_at, note}`) |
-| `enroll` | `provider`, `client`, `note` (nullable) | `identity`, `psk_hex` (64 hex chars), `client_name` |
+| `enroll` | `provider`, `client`, `psk` (32-byte array; client-generated), `note` (nullable) | — (daemon response is bare `{"ok":true}`; CLI then prints `{"ok":true,"psk_hex":"…"}` synthesised locally so the PSK can be piped to the client host) |
 | `revoke` | `provider`, `client` | — |
 | `mint` | `provider`, `client`, `path` | `username`, `password`, `expires_at_unix`, `out_req_id`, `provider_req_id` |
 | `selfcheck` | `provider` | `clock_skew_sec`, `out_req_id`, `provider_req_id`, `details` |
@@ -336,14 +344,11 @@ diagnostic fields (e.g. for GitHub: `client_id`,
 `provider_req_id` is the provider's own upstream correlation id
 (e.g. GitHub's `X-GitHub-Request-Id`), if any.
 
-Error codes:
-`bad_request | unknown_provider | unknown_client |
-client_already_enrolled | internal | repo_not_accessible |
-provider_4xx`.
-
-The daemon serialises admin requests, so file writes to
-`clients.json` / `psks` do not race the listen-side accept loop
-(AGENTS.md invariant #10).
+The daemon serialises concurrent enroll/revoke through a
+single-permit async mutex (`SharedState.mutation_lock`) so on-disk
+writes can't race across `atomic_write` `.await`s (AGENTS.md
+invariant #10). Reads (`status`/`list`/`mint`/`selfcheck`) bypass
+the lock — they don't mutate.
 
 CR or embedded LF inside any string field is rejected (same
 Clone2Leak-class defence applied to the admin path).
@@ -364,43 +369,45 @@ Currently:
 1. Parse `config.toml`. Fail fast on schema errors.
 2. Load each configured provider's private key file into memory.
    Fail fast on parse error.
-3. Unlink any stale `admin.socket_path`.
-4. Bind the TCP listen socket and the admin Unix socket; set
-   admin socket mode `0600`, owner `symbolon:symbolon`.
-5. Load `clients.json`. Fail fast on schema errors.
-6. Apply sandbox (Landlock at ABI 6). Per `[security] sandbox`:
+3. **Reclaim the listening sockets from the supervisor** via the
+   `LISTEN_FDS` env protocol. Slot 0 = TCP wire, slot 1 = admin
+   UDS. Plain `symbolon daemon` invocation with no supervisor
+   exits immediately with `DaemonError::EnvFdTake`. The daemon
+   never binds, chmods, or unlinks these sockets — that's the
+   supervisor's job. See INSTALL.md §§3.8–3.10.
+4. Load `clients.json`. Fail fast on schema errors.
+5. Apply sandbox (Landlock at ABI 6). Per `[security] sandbox`:
    `required` aborts on missing kernel features; `best_effort`
    degrades and emits `evt=sandbox_applied` at `warn` lvl; `off`
    skips. After this step the provider key dir is unreachable;
    only the small allowlist (state dirs, `/dev/urandom`,
    `/etc/ssl/certs`, nameservice files, TCP-connect to port 443,
    intra-process signals) remains permitted.
-7. Run per-provider selfcheck (provider-specific: verifies the
+6. Run per-provider selfcheck (provider-specific: verifies the
    provider identity claim and reachability; see
    [providers/](providers/)).
-8. Enter the accept loop.
+7. Enter the accept loop.
 
 ### Shutdown
 
 On `SIGTERM` or `SIGINT`:
 1. Stop accepting new connections on the listen socket.
 2. Drain in-flight handlers with a **5-second deadline**.
-3. Unlink and close the admin Unix socket; close the TCP
-   listen socket (no unlink; it's not a filesystem node).
+3. Close the listener fds (drop on scope exit). The admin Unix
+   socket inode is NOT unlinked — the supervisor owns it.
 4. Exit 0.
 
 Log `evt=shutdown signal=<sig> inflight_drained=<n> drain_ms=<ms>`.
 
-On any other signal except SIGHUP: terminate fast; do not drain.
+Any other signal (including SIGHUP, which is unhandled and
+defaults to `Term`): kernel terminates the process; no drain.
 
 ### Hot reload
 
-| File | Reload mechanism |
-|---|---|
-| `clients.json` | SIGHUP re-reads from disk. |
-| `psks` | Read AND written by daemon: per-provider `enroll`/`revoke` commands route through the admin socket; the daemon parses, mutates the in-memory `PskStore`, and atomically rewrites the file. No external process to notify. Symbolon owns the responder side of Noise NNpsk0 directly. |
-| `config.toml` | Restart required. |
-| Provider private key | Restart required. |
+There is none. `clients.json` and `psks` are rewritten in-process
+on every admin `enroll`/`revoke`; the in-memory tables are the
+truth and the file is just their serialisation. `config.toml`
+and the provider private key require a restart.
 
 ## Logging schema
 
@@ -441,20 +448,17 @@ extending the enum and adding a row below.
 | `selfcheck` | `provider`, `ok`, `clock_skew_sec` |
 | `enroll` | `provider`, `client` |
 | `revoke` | `provider`, `client` |
-| `config_reload` | `triggered_by` (`sighup`) |
 | `cache_invalidated` | `provider`, `repo`, `cause` (`404` \| `ttl_expired`) |
 | `sandbox_applied` | `policy` (`required` \| `best_effort` \| `off`), `abi` (Landlock ABI requested; `0` if off), `status` (`fully_enforced` \| `partially_enforced` \| `not_enforced` \| `off`), `fs`, `tcp`, `scope` (bool per Landlock layer actually engaged) |
 | `sandbox_path_skipped` | `path`, `reason` (`enoent` \| `open_failed`), `error` (when applicable): emitted at `debug` for nameservice / CA-bundle paths absent on this host |
-| `prepare` | `version`, `config_path`, `listen_addr`, `admin_socket`: emitted by `Service::prepare` once config is loaded and sockets are bound (before selfcheck and readiness) |
+| `prepare` | `version`, `config_path`: emitted by `Service::prepare` once config is loaded and the listening fds have been reclaimed from the supervisor (before selfcheck and readiness) |
 | `ready` | `pid`: emitted by `main` after `service.selfcheck()` returns and `ready::notify` has sent `READY=1` to systemd (if applicable) and written the pidfile (if configured) |
 | `run_failed` | `signal`, `error`: emitted at `error` lvl by `main` when `Service::run` returns `Err`. Mutually exclusive with `shutdown` (one or the other fires) |
 | `ready_pidfile_write_failed` | `path`, `error`: emitted at `warn` lvl by `ready::notify` if the configured pidfile can't be written (typically a sandbox or permission issue) |
-| `admin_denied` | `peer_uid`, `peer_pid`: emitted at `warn` lvl when SO_PEERCRED on the admin socket shows a UID that is neither root nor the daemon's own |
-| `admin_peercred_failed` | `error`: emitted at `warn` lvl when SO_PEERCRED itself fails; the connection is still admitted (refusing on a transient kernel error would be a self-DoS) |
 | `prelude_invalid` | `peer`, `reason` (`bad_magic` \| `bad_version` \| `bad_identity_len` \| `invalid_charset` \| `eof_before_prelude_head` \| `eof_before_identity`): emitted when the identity prelude is malformed; connection dropped |
 | `handshake_failed` | `client`, `reason` (`handshake_read_failed` \| `handshake_write_failed` \| `handshake_into_transport_failed` \| `decrypt_failed` \| `frame_too_big`): Noise handshake or transport error; connection dropped |
 | `drain_incomplete` | `inflight_drained`, `drain_ms`: emitted at `warn` lvl when the per-connection drain deadline elapses with handlers still in flight at shutdown |
-| `signal_registration_failed` | `signal`, `error`: emitted at `error` lvl by `main` when `signal-hook-registry::register` fails at startup. Treated as fatal (exit 1). Without it the daemon cannot honour SIGTERM/SIGINT/SIGHUP |
+| `signal_registration_failed` | `signal`, `error`: emitted at `error` lvl by `main` when `signal-hook-registry::register` fails at startup. Treated as fatal (exit 1). Without it the daemon cannot honour SIGTERM/SIGINT |
 | `mlock` | `status` (`applied` \| `skipped` \| `failed` \| `off`), `policy` (`required` \| `best_effort` \| `off`), `flags` (when applied) or `error` (when skipped/failed): emitted once at startup by `main::run_daemon` after `setup_tracing`. `required` failure surfaces as the separate `mlock_required_failed` error event before exit |
 | `mlock_required_failed` | `error`: emitted at `error` lvl by `main` when `[security] mlock = "required"` and `mlockall` failed. Fatal (exit 1); operator should add `LimitMEMLOCK=infinity` to the systemd unit |
 | `admin_request` | `req_id`, `op`: emitted by the admin loop at entry of each request. The `req_id` (ULID) ties downstream `provider_call` / `mint` / `selfcheck` events back to this admin invocation |

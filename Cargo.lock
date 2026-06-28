@@ -2354,7 +2354,6 @@ dependencies = [
  "libc",
  "listenfd",
  "rsa",
- "rustix",
  "sd-notify",
  "serde",
  "serde_json",

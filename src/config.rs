@@ -488,8 +488,8 @@ selfcheck_timeout = "5s"
 
     #[test]
     fn clients_unknown_top_level_field_rejected() {
-        // A leftover schema field from a prior release should fail to
-        // parse, surfacing the mismatch instead of silently dropping data.
+        // Unknown top-level fields must surface the schema mismatch,
+        // not be silently dropped.
         let json = r#"{"version":1,"clients":[]}"#;
         assert!(ClientsFile::parse(json).is_err());
     }

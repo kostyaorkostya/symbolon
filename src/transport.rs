@@ -36,7 +36,7 @@
 //! client identity is being used, but without the PSK they can't impersonate
 //! or decrypt anything.
 
-use snow::{Builder, HandshakeState, TransportState, params::NoiseParams};
+use snow::{params::NoiseParams, Builder, HandshakeState, TransportState};
 
 use crate::identity::{Identity, IdentityError};
 use crate::psk::Psk;
@@ -1191,9 +1191,6 @@ mod tests {
         ));
     }
 
-    // encode_prelude rejection tests removed: validation now lives in
-    // `Identity::parse`, covered by `identity::tests::parse_rejects_*`.
-
     /// End-to-end Noise NNpsk0 handshake + a transport-mode message round-trip,
     /// driven entirely in-memory.
     #[test]
@@ -1248,9 +1245,6 @@ mod tests {
         let res = handshake_read(&mut responder_hs, &buf[..n], &mut out);
         assert!(res.is_err(), "responder must reject mismatched PSK");
     }
-
-    // `builder_rejects_short_psk` removed: `responder`/`initiator`
-    // now take `&Psk`, which enforces the 32-byte invariant by type.
 
     #[test]
     fn frame_round_trip() {
@@ -1425,8 +1419,4 @@ mod tests {
             "got {err:?}"
         );
     }
-
-    // Bad-identity rejection at Initiator::new is impossible by
-    // construction now — the parameter is `Identity`, validated at
-    // `Identity::parse` (see `identity::tests::parse_rejects_*`).
 }

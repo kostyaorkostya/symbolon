@@ -342,7 +342,6 @@ pub struct Service {
 }
 
 impl Service {
-    /// Sequencing matters here: PEM bytes, the TCP listen bind, the
     /// Sequencing matters here: PEM bytes, the initial PSK file read,
     /// and the env-fd handoff all need access the sandbox would deny,
     /// so they happen first. `apply_sandbox` then closes the gate.

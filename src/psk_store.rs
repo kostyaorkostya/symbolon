@@ -19,6 +19,7 @@
 //! past the load.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
 use hex::FromHex;
 
@@ -131,17 +132,13 @@ impl PskStore {
     /// Render the store to the on-disk file format. Identities are emitted in
     /// sorted order so the file is deterministic (helps diff-based audit).
     pub fn render(&self) -> String {
-        let mut keys: Vec<&Identity> = self.entries.keys().collect();
-        keys.sort_unstable();
-        // identity (≤64) + ':' + 64 hex + '\n' = ≤130 per line.
-        let mut out = String::with_capacity(keys.len() * 130);
-        for k in keys {
-            let psk = self.entries.get(k).expect("key from same map");
-            let hex = psk.to_hex();
-            out.push_str(k.as_str());
-            out.push(':');
-            out.push_str(std::str::from_utf8(&hex).expect("Psk::to_hex returns ASCII"));
-            out.push('\n');
+        let mut entries: Vec<(&Identity, &Psk)> = self.entries.iter().collect();
+        entries.sort_unstable_by_key(|(k, _)| *k);
+        // Per-line upper bound: identity + ':' + hex(psk) + '\n'.
+        const LINE_MAX: usize = Identity::MAX_LEN + 1 + Psk::HEX_LEN + 1;
+        let mut out = String::with_capacity(entries.len() * LINE_MAX);
+        for (k, psk) in entries {
+            writeln!(out, "{}:{psk:x}", k.as_str()).expect("write into String is infallible");
         }
         out
     }
@@ -156,7 +153,7 @@ mod tests {
     }
 
     fn hex_str(p: Psk) -> String {
-        String::from_utf8(p.to_hex().to_vec()).expect("Psk::to_hex returns ASCII")
+        format!("{p:x}")
     }
 
     fn psk_a() -> Psk {

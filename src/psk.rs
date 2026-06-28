@@ -33,7 +33,27 @@ impl std::fmt::Debug for Psk {
     }
 }
 
-/// Hex decoding via the standard `hex::FromHex` trait. Callers need
+/// Hex *output* via the standard `{:x}` formatter. Hex is the on-disk
+/// file format (see `psk_store::render`) and the CLI's enroll-success
+/// JSON field; both go through `format!("{:x}", psk)` /
+/// `write!(out, "{:x}", psk)`. The corresponding `Display` (`{}`) is
+/// deliberately NOT implemented so a stray `{}` formatter can't
+/// leak the secret — `{:x}` is the opt-in form.
+impl std::fmt::LowerHex for Psk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut buf = [0u8; Self::HEX_LEN];
+        hex::encode_to_slice(self.0, &mut buf).expect("output buffer sized for 2× input length");
+        // SAFETY: `hex::encode_to_slice` writes only ASCII bytes in the
+        // sets `b'0'..=b'9'` and `b'a'..=b'f'`, each of which is valid
+        // single-byte UTF-8. Skipping `from_utf8`'s validation pass over
+        // 64 known-ASCII bytes is the only reason to reach for `unsafe`
+        // here — the alternative `expect("ascii")` is morally identical
+        // but pays for a redundant scan on every PSK render.
+        f.write_str(unsafe { std::str::from_utf8_unchecked(&buf) })
+    }
+}
+
+/// Hex *input* via the standard `hex::FromHex` trait. Callers need
 /// `use hex::FromHex;` in scope to invoke `Psk::from_hex(...)`. The
 /// input is `T: AsRef<[u8]>` — accepts `&str`, `&[u8]`, `String`, etc.
 impl hex::FromHex for Psk {
@@ -51,6 +71,12 @@ impl Psk {
     /// protocol — see `NOISE_PATTERN` in `transport.rs`.
     pub const LEN: usize = 32;
 
+    /// Length of the ASCII hex rendering produced by `{:x}` (two
+    /// chars per byte). Exported so callers sizing buffers can
+    /// express their capacity as a sum of named constants instead of
+    /// hardcoding `64`.
+    pub const HEX_LEN: usize = Self::LEN * 2;
+
     /// Borrow the raw bytes. Use when handing the PSK to a lower-level
     /// API (e.g. snow's `Builder::psk`) that doesn't need ownership.
     pub fn as_bytes(&self) -> &[u8; Self::LEN] {
@@ -61,21 +87,5 @@ impl Psk {
     /// owned `[u8; 32]` and the caller has no further need for the Psk.
     pub fn into_bytes(self) -> [u8; Self::LEN] {
         self.0
-    }
-
-    /// Render to the 64-byte ASCII hex form used by the on-disk PSK
-    /// file. Returns a fixed-size array (no heap allocation) since
-    /// the output length is statically known. Callers that need a
-    /// `&str` convert via `std::str::from_utf8(&out).expect("ascii")`
-    /// — the bytes are ASCII by construction (`[0-9a-f]`).
-    ///
-    /// The explicit method (rather than `impl Display`) keeps the
-    /// secret bytes from accidentally leaking through `{}`
-    /// formatters. `self` by value because `Psk` is `Copy`; clippy's
-    /// `wrong_self_convention` expects this for `to_*` on Copy types.
-    pub fn to_hex(self) -> [u8; Self::LEN * 2] {
-        let mut out = [0u8; Self::LEN * 2];
-        hex::encode_to_slice(self.0, &mut out).expect("output buffer sized for 2× input length");
-        out
     }
 }

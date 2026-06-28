@@ -476,9 +476,7 @@ pub async fn cli_dispatch(socket_path: &Path, command: CliCommand) -> Result<i32
     // the daemon's `{"ok": true}` ack.
     match &command {
         CliCommand::GithubEnroll { psk, .. } => {
-            let hex = psk.to_hex();
-            let hex_str = std::str::from_utf8(&hex).expect("Psk::to_hex is ASCII");
-            let synth = OkEnvelope::new(serde_json::json!({ "psk_hex": hex_str }));
+            let synth = OkEnvelope::new(serde_json::json!({ "psk_hex": format!("{psk:x}") }));
             let mut bytes = serde_json::to_vec(&synth).map_err(AdminError::ResponseParse)?;
             bytes.push(b'\n');
             std::io::Write::write_all(&mut std::io::stdout(), &bytes).map_err(AdminError::Io)?;

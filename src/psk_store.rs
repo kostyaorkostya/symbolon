@@ -108,9 +108,7 @@ impl PskStore {
     }
 
     /// Look up a PSK by identity. Returns `None` if the identity is not enrolled.
-    /// Accepts `&str` via `Identity: Borrow<str>` so the hot path can pass the
-    /// raw identity string from `Step::NeedPsk` without re-allocating.
-    pub fn lookup(&self, identity: &str) -> Option<&Psk> {
+    pub fn lookup(&self, identity: &Identity) -> Option<&Psk> {
         self.entries.get(identity)
     }
 
@@ -120,7 +118,7 @@ impl PskStore {
     }
 
     /// Remove an identity. Returns whether anything was removed.
-    pub fn remove(&mut self, identity: &str) -> bool {
+    pub fn remove(&mut self, identity: &Identity) -> bool {
         self.entries.remove(identity).is_some()
     }
 
@@ -178,8 +176,8 @@ mod tests {
         let rendered = store.render();
 
         let reparsed = PskStore::parse(&rendered).unwrap();
-        assert_eq!(reparsed.lookup("alpha"), Some(&psk_a()));
-        assert_eq!(reparsed.lookup("beta"), Some(&psk_b()));
+        assert_eq!(reparsed.lookup(&id("alpha")), Some(&psk_a()));
+        assert_eq!(reparsed.lookup(&id("beta")), Some(&psk_b()));
         assert_eq!(reparsed.len(), 2);
     }
 
@@ -210,7 +208,7 @@ mod tests {
     fn parse_handles_crlf_line_endings() {
         let text = format!("alpha:{}\r\n", hex_str(psk_a()));
         let store = PskStore::parse(&text).unwrap();
-        assert_eq!(store.lookup("alpha"), Some(&psk_a()));
+        assert_eq!(store.lookup(&id("alpha")), Some(&psk_a()));
     }
 
     #[test]
@@ -280,18 +278,20 @@ mod tests {
     #[test]
     fn insert_then_remove_then_lookup() {
         let mut s = PskStore::new();
-        s.insert(id("x"), psk_a());
-        assert_eq!(s.lookup("x"), Some(&psk_a()));
-        assert!(s.remove("x"));
-        assert_eq!(s.lookup("x"), None);
-        assert!(!s.remove("x"));
+        let x = id("x");
+        s.insert(x.clone(), psk_a());
+        assert_eq!(s.lookup(&x), Some(&psk_a()));
+        assert!(s.remove(&x));
+        assert_eq!(s.lookup(&x), None);
+        assert!(!s.remove(&x));
     }
 
     #[test]
     fn insert_replaces() {
         let mut s = PskStore::new();
-        s.insert(id("x"), psk_a());
-        s.insert(id("x"), psk_b());
-        assert_eq!(s.lookup("x"), Some(&psk_b()));
+        let x = id("x");
+        s.insert(x.clone(), psk_a());
+        s.insert(x.clone(), psk_b());
+        assert_eq!(s.lookup(&x), Some(&psk_b()));
     }
 }

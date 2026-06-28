@@ -393,7 +393,7 @@ async fn handle_revoke(
     if state.lookup_provider(provider).is_none() {
         return Err(ErrorResponse::unknown_provider(provider));
     }
-    state.revoke_client(client.as_str()).await?;
+    state.revoke_client(client).await?;
     Ok(Ack {})
 }
 

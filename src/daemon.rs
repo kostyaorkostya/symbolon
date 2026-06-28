@@ -29,8 +29,10 @@ use crate::events::EventKind;
 use crate::git_credential;
 use crate::identity::{Identity, IdentityError};
 use crate::ids::{OutReqId, ReqId};
+use crate::note::Note;
 use crate::providers::github::{GitHubProvider, GithubError};
 use crate::providers::{Provider, ProviderError, ProviderKind, ProviderReqId};
+use crate::psk::Psk;
 use crate::psk_store::{PskStore, PskStoreError};
 use crate::sandbox::{self, SandboxError, SandboxPaths, SandboxStatus};
 use crate::transport::{Phase, Responder, SessionError, Step};
@@ -114,7 +116,7 @@ pub enum DaemonError {
 pub(crate) struct ResolvedClient {
     pub(crate) providers: Vec<ProviderKind>,
     pub(crate) enrolled_at: time::OffsetDateTime,
-    pub(crate) note: Option<crate::note::Note>,
+    pub(crate) note: Option<Note>,
 }
 
 /// Shared between the listen-side accept loop and the admin-side
@@ -182,9 +184,9 @@ impl SharedState {
     pub(crate) async fn enroll_client(
         &self,
         client: Identity,
-        psk: crate::psk::Psk,
+        psk: Psk,
         provider: ProviderKind,
-        note: Option<crate::note::Note>,
+        note: Option<Note>,
     ) -> Result<(), StateMutationError> {
         if self.clients.borrow().contains_key(&client) {
             return Err(StateMutationError::ClientAlreadyEnrolled(client));
@@ -195,13 +197,13 @@ impl SharedState {
         // doesn't reach `commit_client = None`), Drop removes the
         // PSK entry so the two in-memory tables stay in lockstep.
         struct Rollback<'a> {
-            psks: &'a std::cell::RefCell<crate::psk_store::PskStore>,
+            psks: &'a std::cell::RefCell<PskStore>,
             client: Option<Identity>,
         }
         impl Drop for Rollback<'_> {
             fn drop(&mut self) {
                 if let Some(c) = self.client.take() {
-                    self.psks.borrow_mut().remove(c.as_str());
+                    self.psks.borrow_mut().remove(&c);
                 }
             }
         }
@@ -255,14 +257,14 @@ impl SharedState {
     /// PSK file write fails, the orphan PSK entry on disk is
     /// harmless (unreachable on next start because clients.json no
     /// longer carries the identity).
-    pub(crate) async fn revoke_client(&self, client: &str) -> Result<(), StateMutationError> {
+    pub(crate) async fn revoke_client(&self, client: &Identity) -> Result<(), StateMutationError> {
         if !self.clients.borrow().contains_key(client) {
             return Err(StateMutationError::UnknownClient(client.to_string()));
         }
         let mut clients_doc = read_clients_doc(&self.clients_file_path)
             .await
             .map_err(StateMutationError::ReadClients)?;
-        clients_doc.clients.retain(|c| c.name != client);
+        clients_doc.clients.retain(|c| c.name != client.as_str());
         let clients_bytes =
             serde_json::to_vec_pretty(&clients_doc).map_err(StateMutationError::EncodeClients)?;
         crate::atomic_fs::atomic_write(&self.clients_file_path, clients_bytes, CLIENTS_FILE_MODE)
@@ -924,7 +926,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite>(
             }
 
             Step::NeedPsk { identity } => {
-                let psk = match state.psks.borrow().lookup(identity.as_str()) {
+                let psk = match state.psks.borrow().lookup(&identity) {
                     Some(p) => *p,
                     None => {
                         warn!(

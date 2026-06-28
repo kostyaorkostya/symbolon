@@ -30,12 +30,12 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::connection_tracker::ConnectionTracker;
-use crate::daemon::SharedState;
+use crate::daemon::{SharedState, StateMutationError};
 use crate::events::EventKind;
 use crate::identity::Identity;
 use crate::ids::{OutReqId, ReqId};
 use crate::note::Note;
-use crate::providers::{ProviderKind, ProviderReqId, SelfcheckOutcome};
+use crate::providers::{ProviderError, ProviderKind, ProviderReqId, SelfcheckOutcome};
 use crate::psk::Psk;
 
 /// Admin requests are operator-driven JSON, not adversarial
@@ -137,6 +137,22 @@ impl ErrorResponse {
             ok: false,
             error: error.into(),
         }
+    }
+
+    fn unknown_provider(provider: ProviderKind) -> Self {
+        Self::new(format!("provider '{provider}' not configured"))
+    }
+}
+
+impl From<StateMutationError> for ErrorResponse {
+    fn from(e: StateMutationError) -> Self {
+        Self::new(e.to_string())
+    }
+}
+
+impl From<ProviderError> for ErrorResponse {
+    fn from(e: ProviderError) -> Self {
+        Self::new(crate::logging::ErrorChain(&e).to_string())
     }
 }
 
@@ -284,15 +300,14 @@ async fn handle_admin(mut stream: UnixStream, state: Rc<SharedState>) {
         Ok(bytes) if !bytes.is_empty() => bytes,
         _ => return,
     };
-    let request: Request = match serde_json::from_slice(&raw) {
+    let parsed: Result<Request, _> = serde_json::from_slice(&raw);
+    let request = match parsed {
         Ok(r) => r,
         Err(e) => {
             info!(evt = %EventKind::AdminRequest, ok = false, error = %e);
-            let _ = write_err(
-                &mut stream,
-                &ErrorResponse::new(format!("request parse failed: {e}")),
-            )
-            .await;
+            let resp: Result<Ack, _> =
+                Err(ErrorResponse::new(format!("request parse failed: {e}")));
+            let _ = write_response(&mut stream, resp).await;
             return;
         }
     };
@@ -306,30 +321,30 @@ async fn dispatch_and_write(
     stream: &mut UnixStream,
 ) -> std::io::Result<()> {
     match request {
-        Request::Status => write_ok(stream, &handle_status(state)).await,
-        Request::List => write_ok(stream, &handle_list(state)).await,
+        Request::Status => write_response::<StatusResponse>(stream, Ok(handle_status(state))).await,
+        Request::List => write_response::<ListResponse>(stream, Ok(handle_list(state))).await,
         Request::Enroll {
             provider,
             client,
             note,
             psk,
         } => {
-            write_result(
+            write_response(
                 stream,
                 handle_enroll(state, *provider, client.clone(), note.clone(), *psk).await,
             )
             .await
         }
         Request::Revoke { provider, client } => {
-            write_result(stream, handle_revoke(state, *provider, client).await).await
+            write_response(stream, handle_revoke(state, *provider, client).await).await
         }
         Request::Mint {
             provider,
             client,
             path,
-        } => write_result(stream, handle_mint(state, *provider, client, path).await).await,
+        } => write_response(stream, handle_mint(state, *provider, client, path).await).await,
         Request::Selfcheck { provider } => {
-            write_result(stream, handle_selfcheck(state, *provider).await).await
+            write_response(stream, handle_selfcheck(state, *provider).await).await
         }
     }
 }
@@ -369,16 +384,11 @@ async fn handle_enroll(
     note: Option<Note>,
     psk: Psk,
 ) -> Result<Ack, ErrorResponse> {
-    match state
+    state
         .enroll_client(client.clone(), psk, provider, note)
-        .await
-    {
-        Ok(()) => {
-            info!(evt = %EventKind::Enroll, provider = %provider, client = %client);
-            Ok(Ack {})
-        }
-        Err(e) => Err(ErrorResponse::new(e.to_string())),
-    }
+        .await?;
+    info!(evt = %EventKind::Enroll, provider = %provider, client = %client);
+    Ok(Ack {})
 }
 
 async fn handle_revoke(
@@ -387,12 +397,10 @@ async fn handle_revoke(
     client: &Identity,
 ) -> Result<Ack, ErrorResponse> {
     if state.lookup_provider(provider).is_none() {
-        return Err(unknown_provider_error(provider));
+        return Err(ErrorResponse::unknown_provider(provider));
     }
-    match state.revoke_client(client.as_str()).await {
-        Ok(()) => Ok(Ack {}),
-        Err(e) => Err(ErrorResponse::new(e.to_string())),
-    }
+    state.revoke_client(client.as_str()).await?;
+    Ok(Ack {})
 }
 
 async fn handle_mint(
@@ -402,39 +410,31 @@ async fn handle_mint(
     path: &str,
 ) -> Result<MintResponse, ErrorResponse> {
     if !state.clients.borrow().contains_key(client) {
-        return Err(ErrorResponse::new(format!(
-            "no enrolled client named '{client}'"
-        )));
+        return Err(StateMutationError::UnknownClient(client.to_string()).into());
     }
-    match state
+    let outcome = state
         .lookup_provider(provider)
-        .ok_or_else(|| unknown_provider_error(provider))?
+        .ok_or_else(|| ErrorResponse::unknown_provider(provider))?
         .mint(path)
-        .await
-    {
-        Ok(outcome) => Ok(MintResponse {
-            expires_at_unix: outcome.response.password_expiry_unix_secs(),
-            username: outcome.response.username,
-            password: outcome.response.password,
-            out_req_id: outcome.out_req_id,
-            provider_req_id: outcome.provider_req_id,
-        }),
-        Err(e) => Err(ErrorResponse::new(
-            crate::logging::ErrorChain(&e).to_string(),
-        )),
-    }
+        .await?;
+    Ok(MintResponse {
+        expires_at_unix: outcome.response.password_expiry_unix_secs(),
+        username: outcome.response.username,
+        password: outcome.response.password,
+        out_req_id: outcome.out_req_id,
+        provider_req_id: outcome.provider_req_id,
+    })
 }
 
 async fn handle_selfcheck(
     state: &Rc<SharedState>,
     provider: ProviderKind,
 ) -> Result<SelfcheckOutcome, ErrorResponse> {
-    state
+    Ok(state
         .lookup_provider(provider)
-        .ok_or_else(|| unknown_provider_error(provider))?
+        .ok_or_else(|| ErrorResponse::unknown_provider(provider))?
         .selfcheck()
-        .await
-        .map_err(|e| ErrorResponse::new(crate::logging::ErrorChain(&e).to_string()))
+        .await?)
 }
 
 // ---------------------------------------------------------------------------
@@ -508,10 +508,6 @@ fn is_ok_response(bytes: &[u8]) -> Result<bool, AdminError> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn unknown_provider_error(provider: ProviderKind) -> ErrorResponse {
-    ErrorResponse::new(format!("provider '{provider}' not configured"))
-}
-
 // Returns false (denial) only on a definitive non-root, non-self UID.
 // On `socket_peercred` syscall failure we admit the connection and
 // log; refusing on syscall error would be a denial-of-service
@@ -576,26 +572,15 @@ async fn read_line(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
     }
 }
 
-async fn write_ok<T: Serialize>(stream: &mut UnixStream, data: &T) -> std::io::Result<()> {
-    write_json(stream, &OkEnvelope { ok: true, data }).await
-}
-
-async fn write_err(stream: &mut UnixStream, err: &ErrorResponse) -> std::io::Result<()> {
-    write_json(stream, err).await
-}
-
-async fn write_result<T: Serialize>(
+async fn write_response<T: Serialize>(
     stream: &mut UnixStream,
     result: Result<T, ErrorResponse>,
 ) -> std::io::Result<()> {
-    match result {
-        Ok(data) => write_ok(stream, &data).await,
-        Err(err) => write_err(stream, &err).await,
+    let mut payload = match &result {
+        Ok(data) => serde_json::to_vec(&OkEnvelope::new(data)),
+        Err(err) => serde_json::to_vec(err),
     }
-}
-
-async fn write_json<T: Serialize>(stream: &mut UnixStream, value: &T) -> std::io::Result<()> {
-    let mut payload = serde_json::to_vec(value).map_err(std::io::Error::other)?;
+    .map_err(std::io::Error::other)?;
     payload.push(b'\n');
     let BufResult(res, _) = stream.write_all(payload).await;
     res?;

@@ -204,3 +204,10 @@ jobs:
           files: dist/*
           fail_on_unmatched_files: true
           generate_release_notes: true
+          # SemVer pre-release tags (`v0.1.0-rc.1`, `v0.1.0-beta.2`,
+          # …) carry a `-` after the version core. Flag those so
+          # GitHub keeps them out of the "Latest release" pin on the
+          # repo homepage and fires `release.prereleased` to webhooks
+          # instead of `release.released`. Stable tags (`v0.1.0`,
+          # `v0.2.0`) have no `-` and publish normally.
+          prerelease: ${{ contains(github.ref_name, '-') }}

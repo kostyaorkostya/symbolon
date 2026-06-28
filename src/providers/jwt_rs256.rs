@@ -22,16 +22,11 @@ pub enum JwtError {
     SerializeClaims(#[source] serde_json::Error),
 }
 
-#[derive(Serialize)]
-struct Header {
-    typ: &'static str,
-    alg: &'static str,
-}
-
-const HEADER_RS256: Header = Header {
-    typ: "JWT",
-    alg: "RS256",
-};
+/// Base64url-no-pad encoding of the fixed JWT header
+/// `{"typ":"JWT","alg":"RS256"}`. The bytes never change, so the
+/// JSON-serialise + base64-encode work is moved to compile time.
+/// Cross-verified by the `known_vector_round_trip` test below.
+const HEADER_B64: &str = "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9";
 
 /// Pre-built RS256 signing key. Construction parses the PEM and
 /// precomputes the inner state; subsequent `sign` calls are
@@ -54,29 +49,28 @@ impl JwtSigningKey {
     /// Produce a compact JWS:
     /// `base64url(header).base64url(payload).base64url(signature)`.
     /// `claims` is serialised to JSON via serde; the header is
-    /// fixed at `{"typ":"JWT","alg":"RS256"}`. RSASSA-PKCS1-v1_5
-    /// is deterministic, so the output is reproducible for any
-    /// given (claims, key) pair.
+    /// fixed at `{"typ":"JWT","alg":"RS256"}` and precomputed as
+    /// [`HEADER_B64`]. RSASSA-PKCS1-v1_5 is deterministic, so the
+    /// output is reproducible for any given (claims, key) pair.
+    ///
+    /// The whole token is built in one `String` buffer: the
+    /// `header.payload` prefix doubles as the RS256 signing input,
+    /// so no intermediate `Vec` / `String` allocations are needed
+    /// per call beyond `payload_json` and the boxed signature bytes
+    /// `rsa`'s `SignatureEncoding::to_bytes` returns.
     pub fn sign_rs256<C: Serialize>(&self, claims: &C) -> Result<String, JwtError> {
-        let header_json = serde_json::to_vec(&HEADER_RS256).map_err(JwtError::SerializeClaims)?;
         let payload_json = serde_json::to_vec(claims).map_err(JwtError::SerializeClaims)?;
-
-        let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
-        let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
-
-        // Build the signing input as bytes directly; an intermediate
-        // `String::format!` would allocate twice for no gain.
-        let mut signing_input = Vec::with_capacity(header_b64.len() + 1 + payload_b64.len());
-        signing_input.extend_from_slice(header_b64.as_bytes());
-        signing_input.push(b'.');
-        signing_input.extend_from_slice(payload_b64.as_bytes());
-
-        let signature = self.0.sign(&signing_input);
-        let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
-
-        let mut token = String::from_utf8(signing_input).expect("base64 is ASCII");
+        // Rough upper bound: header + '.' + b64(payload) + '.' + b64(sig).
+        // For 2048-bit RS256 the signature is 256 bytes → 342 base64 chars.
+        let payload_b64_len = payload_json.len().div_ceil(3) * 4;
+        let mut token = String::with_capacity(HEADER_B64.len() + 1 + payload_b64_len + 1 + 350);
+        token.push_str(HEADER_B64);
         token.push('.');
-        token.push_str(&sig_b64);
+        URL_SAFE_NO_PAD.encode_string(&payload_json, &mut token);
+        // `header_b64.payload_b64` IS the RS256 signing input.
+        let signature = self.0.sign(token.as_bytes());
+        token.push('.');
+        URL_SAFE_NO_PAD.encode_string(signature.to_bytes(), &mut token);
         Ok(token)
     }
 }

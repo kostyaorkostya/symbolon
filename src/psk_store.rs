@@ -138,7 +138,7 @@ impl PskStore {
         const LINE_MAX: usize = Identity::MAX_LEN + 1 + Psk::HEX_LEN + 1;
         let mut out = String::with_capacity(entries.len() * LINE_MAX);
         for (k, psk) in entries {
-            writeln!(out, "{}:{psk:x}", k.as_str()).expect("write into String is infallible");
+            writeln!(out, "{k}:{psk:x}").expect("write into String is infallible");
         }
         out
     }

@@ -261,12 +261,11 @@ pub(crate) async fn run_admin_loop(
     listener: UnixListener,
     state: Rc<SharedState>,
 ) -> Result<(), AdminError> {
-    // Cache effective UID once. Peer connections from this UID or
-    // root are admitted; everything else is rejected with
-    // evt=admin_denied. AGENTS.md invariant #9: the admin socket is
-    // the sole admin surface, so this is the choke point.
-    let my_uid = rustix::process::geteuid();
-
+    // Access control lives entirely in the filesystem: `INSTALL.md` pins
+    // the parent dir (`/run/symbolon`) to 0o750 root:symbolon and the
+    // socket inode is born 0o600 via the umask sandwich at bind-time
+    // (see daemon::prepare). Operators who deviate from that setup own
+    // the resulting exposure — the daemon does not second-guess them.
     let tracker = ConnectionTracker::new(PER_CONNECTION_TIMEOUT, Duration::from_secs(5));
     loop {
         // `select_biased!` with shutdown listed first: when both arms
@@ -277,9 +276,6 @@ pub(crate) async fn run_admin_loop(
             _ = state.shutdown.clone().wait().fuse() => break,
             accept_res = listener.accept().fuse() => {
                 let (stream, _peer) = accept_res.map_err(AdminError::Accept)?;
-                if !check_peer_uid(&stream, my_uid) {
-                    continue;
-                }
                 let state = state.clone();
                 let span = tracing::info_span!("admin", req_id = %ReqId::new());
                 tracker.spawn(async move || {
@@ -504,37 +500,6 @@ fn is_ok_response(bytes: &[u8]) -> Result<bool, AdminError> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-// Returns false (denial) only on a definitive non-root, non-self UID.
-// On `socket_peercred` syscall failure we admit the connection and
-// log; refusing on syscall error would be a denial-of-service
-// against the operator if the kernel ever returns a transient EINVAL
-// or similar.
-fn check_peer_uid(stream: &UnixStream, my_uid: rustix::process::Uid) -> bool {
-    use std::os::fd::AsFd;
-    match rustix::net::sockopt::socket_peercred(stream.as_fd()) {
-        Ok(cred) => {
-            if cred.uid.is_root() || cred.uid == my_uid {
-                true
-            } else {
-                tracing::warn!(
-                    evt = %EventKind::AdminDenied,
-                    peer_uid = %cred.uid,
-                    peer_pid = %cred.pid,
-                );
-                false
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                evt = %EventKind::AdminPeercredFailed,
-                error = %e,
-                "admitting connection; peer credentials unavailable",
-            );
-            true
-        }
-    }
-}
 
 async fn read_line<R: AsyncRead>(stream: &mut R) -> std::io::Result<Vec<u8>> {
     let mut accumulated = Vec::new();

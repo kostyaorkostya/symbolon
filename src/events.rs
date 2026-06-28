@@ -15,8 +15,6 @@ use strum::{Display, IntoStaticStr};
 #[strum(serialize_all = "snake_case")]
 pub enum EventKind {
     Accept,
-    AdminDenied,
-    AdminPeercredFailed,
     AdminRequest,
     CacheInvalidated,
     ConfigReload,

@@ -401,7 +401,9 @@ impl Service {
         // bind(2) and chmod() where the inode briefly carries umask-
         // default perms; INSTALL.md pins the parent dir (`/run/symbolon`)
         // 0o750 owned by group `symbolon`, so a world-mode socket inside
-        // is still unreachable from outside that group.
+        // is still unreachable from outside that group. That dir-mode
+        // gate is the only access control — there is no in-process
+        // peer-credential check.
         let admin_path = &cfg.admin.socket_path;
         unlink_stale(admin_path).await?;
         let admin_listener =
@@ -417,8 +419,6 @@ impl Service {
         // does best-effort cleanup on Drop. Disarmed on the success
         // path below so the socket lives.
         let admin_bind_guard = AdminBindGuard::new(admin_path.clone());
-        // 0600: only root and the daemon UID can talk to admin.
-        // SO_PEERCRED in run_admin_loop is the second gate.
         chmod_socket(admin_path, 0o600)?;
 
         // Sandbox gate closes here.

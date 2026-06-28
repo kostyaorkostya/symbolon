@@ -38,7 +38,7 @@ jobs:
           - aarch64-unknown-linux-musl
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       # The GitHub-hosted ubuntu-latest runner ships rustup + a recent
       # stable rustc pre-installed.  rust-toolchain.toml in the repo
       # tells rustup which toolchain to use; we just need to add the
@@ -162,7 +162,7 @@ jobs:
       # uploads under a unique artifact name; the release job
       # collects them all via `pattern: release-*`.
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: release-${{ matrix.target }}
           path: |
@@ -181,7 +181,7 @@ jobs:
       contents: write
     steps:
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: release-*
           path: dist
@@ -193,17 +193,26 @@ jobs:
       # maintained, but pin to a commit SHA so an upstream tag
       # move can't quietly change behavior. Bump deliberately.
       #
-      # v2.6.x is the first line that uploads assets BEFORE
-      # publishing the release (the bug-class fix for Immutable
-      # Releases). Combined with the single-publisher pattern
-      # above, the asset-upload happens before the "publish event"
-      # locks the release.
-      - name: Publish release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+      # Two-step publish (draft → flip) instead of one-shot:
+      # the action's upload-before-publish trick covers standard
+      # releases under Immutable Releases, but it publishes
+      # prereleases immediately rather than uploading-then-publishing
+      # — which collides with the immutable-release lock on
+      # prerelease tags (`v0.1.0-rc.1` etc.). softprops's own error
+      # message recommends the workaround: keep as draft, then flip
+      # via `gh release edit --draft=false`. The dance is uniform
+      # for stable and prerelease tags, and idempotent across
+      # re-runs: a failed previous attempt leaves a draft, the next
+      # run finds it, re-uploads under `overwrite_files: true`, and
+      # the flip step publishes.
+      - name: Create draft release and upload assets
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           files: dist/*
           fail_on_unmatched_files: true
           generate_release_notes: true
+          draft: true
+          overwrite_files: true
           # SemVer pre-release tags (`v0.1.0-rc.1`, `v0.1.0-beta.2`,
           # …) carry a `-` after the version core. Flag those so
           # GitHub keeps them out of the "Latest release" pin on the
@@ -211,3 +220,10 @@ jobs:
           # instead of `release.released`. Stable tags (`v0.1.0`,
           # `v0.2.0`) have no `-` and publish normally.
           prerelease: ${{ contains(github.ref_name, '-') }}
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "${{ github.ref_name }}" \
+            --draft=false \
+            --repo "${{ github.repository }}"

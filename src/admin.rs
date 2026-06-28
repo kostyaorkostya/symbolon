@@ -265,7 +265,7 @@ pub(crate) async fn run_admin_loop(
     // root are admitted; everything else is rejected with
     // evt=admin_denied. AGENTS.md invariant #9: the admin socket is
     // the sole admin surface, so this is the choke point.
-    let my_uid = rustix::process::geteuid().as_raw();
+    let my_uid = rustix::process::geteuid();
 
     let tracker = ConnectionTracker::new(PER_CONNECTION_TIMEOUT, Duration::from_secs(5));
     loop {
@@ -281,8 +281,6 @@ pub(crate) async fn run_admin_loop(
                     continue;
                 }
                 let state = state.clone();
-                // `req_id` carried via `tracing::Span` — `info!`/`warn!`
-                // inside the handler inherits it via current-span.
                 let span = tracing::info_span!("admin", req_id = %ReqId::new());
                 tracker.spawn(async move || {
                     use tracing::Instrument;
@@ -511,18 +509,17 @@ fn is_ok_response(bytes: &[u8]) -> Result<bool, AdminError> {
 // log; refusing on syscall error would be a denial-of-service
 // against the operator if the kernel ever returns a transient EINVAL
 // or similar.
-fn check_peer_uid(stream: &UnixStream, my_uid: u32) -> bool {
+fn check_peer_uid(stream: &UnixStream, my_uid: rustix::process::Uid) -> bool {
     use std::os::fd::AsFd;
     match rustix::net::sockopt::socket_peercred(stream.as_fd()) {
         Ok(cred) => {
-            let uid = cred.uid.as_raw();
-            if uid == 0 || uid == my_uid {
+            if cred.uid.is_root() || cred.uid == my_uid {
                 true
             } else {
                 tracing::warn!(
                     evt = %EventKind::AdminDenied,
-                    peer_uid = uid,
-                    peer_pid = cred.pid.as_raw_nonzero().get(),
+                    peer_uid = %cred.uid,
+                    peer_pid = %cred.pid,
                 );
                 false
             }

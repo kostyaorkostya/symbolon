@@ -89,28 +89,57 @@ default. See [`../PROTOCOLS.md`](../PROTOCOLS.md) § "Host dispatch".
 
 ## Commands
 
+All commands accept the global `--config <path>` flag. Output is
+JSON on stdout; errors are JSON on stderr; exit code is `0` on
+success, `1` on any error.
+
 ```
-symbolon github enroll <client> [--note <text>]
-    Generate a per-client 32-byte PSK, append to the symbolon-owned
-    `psks` file and `clients.json` (both atomic), and print a
-    paste-ready provisioning snippet to stdout.
+symbolon github enroll <client> [--note <text>] [--psk <64-hex>]
+    Generate (or accept via --psk) a 32-byte PSK, append it to
+    the symbolon-owned `psks` file and `clients.json` (both
+    atomic), and print:
+      {"ok":true,"psk_hex":"<64 hex chars>"}
+    The PSK is generated client-side by the CLI, then handed to
+    the daemon — the daemon never sees raw entropy. Pipe through
+    `jq -r .psk_hex` to extract the bare hex for provisioning,
+    e.g.:
+      symbolon github enroll dev-vm-1 --note "lab box" \
+        | jq -r .psk_hex \
+        | ssh dev-vm-1 'tee /etc/symbolon/psk >/dev/null && chmod 0400 /etc/symbolon/psk'
+    Use --psk to bring your own pre-generated hex (key rotation,
+    backup restore, deterministic test setups).
 
 symbolon github revoke <client>
-    Remove the client's GitHub enrollment. If the client has no
-    remaining provider enrollments, also remove it from
-    `clients.json` and `psks`.
+    Remove <client>'s entry from both the in-memory PSK store /
+    clients table AND the on-disk `psks` / `clients.json` files
+    (atomic). Subsequent handshakes from that identity are
+    rejected with `evt=mint_denied reason=client_unknown` before
+    the handshake completes.
 
     Outstanding tokens minted in the previous hour are NOT
     revoked. They live their full TTL; see § "Hard cutoff" below.
 
 symbolon github mint <client> <owner/repo>
     Test path: run the full mint flow as if <client> requested a
-    token for <owner/repo>. Prints token + expiry to stdout.
+    token for <owner/repo>. Prints:
+      {"ok":true,
+       "username":"x-access-token",
+       "password":"<token>",
+       "expires_at_unix":<u64>,
+       "out_req_id":"<ULID>",
+       "provider_req_id":"<X-GitHub-Request-Id or null>"}
 
 symbolon github selfcheck
     Verify the App private key parses, the App ID matches the
     JWT, api.github.com (or your GHES api_base) is reachable, and
-    clock skew is bounded. Exits non-zero on any failed check.
+    clock skew is bounded. Exit code `0` on success, `1` on any
+    failed check. Prints:
+      {"ok":true,
+       "clock_skew_sec":<i64>,
+       "out_req_id":"<ULID>",
+       "provider_req_id":"<X-GitHub-Request-Id or null>",
+       "details":{<provider-specific diagnostic blob —
+                   see § "Admin response shape: selfcheck details">}}
 ```
 
 ## Outbound API contract

@@ -22,19 +22,37 @@ root or as a user in the `symbolon` group.
 
 ## Commands
 
+All subcommands accept a global `--config <path>` flag (default
+`/etc/symbolon/config.toml`). Non-daemon subcommands talk to the
+daemon over the admin Unix socket at `[admin] socket_path` from
+that config. **Output is machine-readable JSON on stdout**; errors
+go to stderr; exit code is `0` on success, `1` on any error.
+
 ### Cross-provider
 
 ```
-symbolon daemon [--config /etc/symbolon/config.toml]
-    Run the broker daemon.
+symbolon daemon
+    Run the broker daemon. Expects pre-bound listeners via the
+    LISTEN_FDS env protocol (systemd .socket unit or systemfd
+    wrapper) — see INSTALL.md §§3.8–3.10.
 
 symbolon status
-    Print daemon health: uptime, last successful mint, last error,
-    cached-repo-id count, configured providers.
+    Print daemon liveness:
+      {"ok":true,
+       "uptime_sec":<seconds since prepare>,
+       "providers":["github", …],
+       "client_count":<int>}
 
 symbolon list
-    Print all enrolled clients across providers, with the providers
-    each is enrolled for and the enrollment timestamp.
+    Print the enrolled-clients table:
+      {"ok":true,
+       "clients":[{"name":"<id>",
+                   "providers":["github", …],
+                   "enrolled_at":"<RFC3339>",
+                   "note":<string or null>},
+                  …]}
+    Order is HashMap-iteration order — pipe through `jq` if you
+    want it sorted.
 ```
 
 ### Per-provider

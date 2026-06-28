@@ -22,8 +22,22 @@ set -euo pipefail
 # metapackage; Clang-installed-via-apt brings in `llvm-strip-N`
 # only. Try the unversioned name first; fall back to common
 # versioned names. Fail-fast with an actionable hint otherwise.
-LLVM_STRIP="$(command -v llvm-strip llvm-strip-18 llvm-strip-19 llvm-strip-17 2>/dev/null | head -n1)"
-LLVM_READELF="$(command -v llvm-readelf llvm-readelf-18 llvm-readelf-19 llvm-readelf-17 2>/dev/null | head -n1)"
+#
+# `|| true` defends against `set -e` + `pipefail`: when none of the
+# candidates exist, `command -v` exits 1 and pipefail propagates;
+# without the swallow, the script dies silently HERE — before reaching
+# the diagnostic check below.
+find_first_cmd() {
+	for cand in "$@"; do
+		if command -v "$cand" >/dev/null 2>&1; then
+			printf '%s\n' "$cand"
+			return 0
+		fi
+	done
+	return 1
+}
+LLVM_STRIP="$(find_first_cmd llvm-strip llvm-strip-21 llvm-strip-20 llvm-strip-19 llvm-strip-18 llvm-strip-17 || true)"
+LLVM_READELF="$(find_first_cmd llvm-readelf llvm-readelf-21 llvm-readelf-20 llvm-readelf-19 llvm-readelf-18 llvm-readelf-17 || true)"
 for var in LLVM_STRIP LLVM_READELF; do
 	if [ -z "${!var}" ]; then
 		echo "release-build.sh: no ${var,,} binary found on \$PATH." >&2

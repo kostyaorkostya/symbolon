@@ -1,5 +1,5 @@
 //! Daemon: TCP accept loop driving `transport::Responder` per
-//! connection, plus the admin UDS loop and SIGHUP reload glue.
+//! connection, plus the admin UDS loop.
 //!
 //! Per-connection errors do not propagate: each failure point logs
 //! a structured event (`evt=prelude_invalid` /
@@ -170,9 +170,9 @@ pub struct SharedState {
     pub(crate) admin_socket_path: PathBuf,
     pub(crate) start_time: Instant,
     /// Cancelled by `crate::signals` watchers on SIGTERM/SIGINT. The
-    /// main accept loop and the admin loop both race `wait()` on it;
-    /// the SIGHUP loop does too. Loops exit cleanly on cancel,
-    /// letting their `JoinHandle`s be joined.
+    /// main accept loop and the admin loop both race `wait()` on it.
+    /// Loops exit cleanly on cancel, letting their `JoinHandle`s be
+    /// joined.
     pub(crate) shutdown: CancelToken,
 }
 
@@ -352,27 +352,6 @@ pub struct Service {
     admin_listener: UnixListener,
 }
 
-/// Cloneable, opaque handle to a running `Service`. External code
-/// uses this for operator-visible actions (e.g. reloading
-/// `clients.json` from a SIGHUP handler) without holding a
-/// reference to `Service` itself — `Service` is consumed by
-/// `run()`, so the handle is what survives across the spawn
-/// boundary. Internal state remains private.
-#[derive(Clone)]
-pub struct ServiceHandle {
-    state: Rc<SharedState>,
-}
-
-impl ServiceHandle {
-    /// Reload `clients.json` from the path configured at
-    /// `Service::prepare` time and atomically swap the in-memory
-    /// table. Logs the outcome as `evt=config_reload`.
-    pub async fn reload_clients(&self) {
-        let path = self.state.clients_file_path.clone();
-        self.state.reload_clients(&path).await
-    }
-}
-
 impl Service {
     /// Sequencing matters here: PEM bytes, the TCP listen bind, the
     /// admin Unix-socket bind, and the initial PSK file read all need
@@ -500,16 +479,6 @@ impl Service {
             listener,
             admin_listener,
         })
-    }
-
-    /// Returns an opaque cloneable handle to the running service.
-    /// Use it from outside code to drive operator-visible actions
-    /// (e.g. SIGHUP-triggered `reload_clients`) without holding a
-    /// reference to `Service` itself (which is consumed by `run`).
-    pub fn handle(&self) -> ServiceHandle {
-        ServiceHandle {
-            state: self.state.clone(),
-        }
     }
 
     /// Per-provider startup selfcheck. Logs `evt=selfcheck` once per
@@ -665,55 +634,6 @@ impl SharedState {
         self.providers.get(&kind).map(|b| b.as_ref())
     }
 
-    /// Reload `clients.json` and atomically swap the in-memory
-    /// table. Public so the SIGHUP handler installed by `main` can
-    /// drive a reload through the state handle without importing
-    /// daemon-internal helpers.
-    pub async fn reload_clients(&self, path: &Path) {
-        let file = match crate::loader::load_clients_file(path).await {
-            Ok(f) => f,
-            Err(e) => {
-                warn!(
-                    evt = %EventKind::ConfigReload,
-                    triggered_by = "sighup",
-                    ok = false,
-                    path = %path.display(),
-                    error = %crate::logging::ErrorChain(&e),
-                );
-                return;
-            }
-        };
-        let new_table = match HashMap::try_from(file) {
-            Ok(t) => t,
-            Err(e) => {
-                warn!(evt = %EventKind::ConfigReload, triggered_by = "sighup", ok = false, error = %crate::logging::ErrorChain(&e));
-                return;
-            }
-        };
-        // Reload the PSK store alongside clients.json so hand-edits to
-        // the on-disk roster (rare; admin enroll/revoke is the normal
-        // path) are picked up coherently.
-        let new_psks = match load_psk_store(&self.psk_file_path).await {
-            Ok(store) => store,
-            Err(e) => {
-                warn!(evt = %EventKind::ConfigReload, triggered_by = "sighup", ok = false, error = %crate::logging::ErrorChain(&e));
-                return;
-            }
-        };
-        let client_count = new_table.len();
-        let psk_count = new_psks.len();
-        // No `.await` between these two assignments: the single-threaded
-        // compio runtime means no other task observes a split where
-        // `clients` has been swapped but `psks` hasn't (or vice-versa).
-        *self.clients.borrow_mut() = new_table;
-        *self.psks.borrow_mut() = new_psks;
-        info!(
-            evt = %EventKind::ConfigReload,
-            triggered_by = "sighup",
-            client_count = client_count,
-            psk_count = psk_count,
-        );
-    }
 }
 
 /// Read the on-disk PSK file and parse it into a `PskStore`. Treats
@@ -1351,7 +1271,6 @@ async fn write_all_bytes<W: AsyncWrite>(stream: &mut W, payload: Vec<u8>) -> std
 mod tests {
     use super::*;
     use crate::config::ClientEntry;
-    use synchrony::unsync::mutex::Mutex;
 
     fn fixture_time() -> time::OffsetDateTime {
         time::OffsetDateTime::parse(
@@ -1402,51 +1321,4 @@ mod tests {
         assert_eq!(HashMap::try_from(file).unwrap().len(), 0);
     }
 
-    // The previous `empty_state()` helper is gone; the one remaining
-    // test that needs a SharedState builds one inline so its setup
-    // is local and explicit.
-
-    #[compio::test]
-    async fn reload_clients_swaps_in_place() {
-        let clients_path =
-            std::env::temp_dir().join(format!("symbolon-reload-test-{}.json", ulid::Ulid::new()));
-        std::fs::write(
-            &clients_path,
-            r#"{"clients":[{"name":"new","providers":["github"],"enrolled_at":"2026-05-31T00:00:00Z","note":null}]}"#,
-        )
-        .unwrap();
-        // psk_file_path points at a nonexistent file; load_psk_store
-        // treats ENOENT as "fresh deployment" → empty PSK store.
-        let nonexistent_psk =
-            std::env::temp_dir().join(format!("symbolon-reload-test-psks-{}", ulid::Ulid::new()));
-        let state = Rc::new(SharedState {
-            mutation_lock: Mutex::new(()),
-            clients: RefCell::new({
-                let mut m = HashMap::new();
-                m.insert(
-                    Identity::parse("old").unwrap(),
-                    ResolvedClient {
-                        providers: Vec::new(),
-                        enrolled_at: fixture_time(),
-                        note: None,
-                    },
-                );
-                m
-            }),
-            psks: RefCell::new(PskStore::new()),
-            providers: HashMap::new(),
-            psk_file_path: nonexistent_psk,
-            clients_file_path: clients_path.clone(),
-            admin_socket_path: PathBuf::new(),
-            start_time: Instant::now(),
-            shutdown: CancelToken::new(),
-        });
-        state.reload_clients(&clients_path).await;
-        let borrow = state.clients.borrow();
-        assert_eq!(borrow.len(), 1);
-        assert!(borrow.contains_key("new"));
-        assert!(!borrow.contains_key("old"));
-        drop(borrow);
-        let _ = std::fs::remove_file(&clients_path);
-    }
 }

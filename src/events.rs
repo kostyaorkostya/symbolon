@@ -17,7 +17,6 @@ pub enum EventKind {
     Accept,
     AdminRequest,
     CacheInvalidated,
-    ConfigReload,
     DrainIncomplete,
     Enroll,
     HandshakeFailed,

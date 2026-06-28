@@ -144,21 +144,6 @@ async fn run_daemon(config_path: PathBuf) -> ExitCode {
         }
     };
 
-    let handle = service.handle();
-    let sighup = match symbolon::spawn_sighup_handler(
-        move || {
-            let h = handle.clone();
-            async move { h.reload_clients().await }
-        },
-        shutdown.clone(),
-    ) {
-        Ok(h) => h,
-        Err(e) => {
-            tracing::error!(evt = %EventKind::SignalRegistrationFailed, signal = "SIGHUP", error = %e);
-            return ExitCode::from(1);
-        }
-    };
-
     service.selfcheck().await;
 
     // Lifecycle order: Service::prepare above already loaded
@@ -175,7 +160,6 @@ async fn run_daemon(config_path: PathBuf) -> ExitCode {
 
     let run_result = service.run().await;
     let signal_name = shutdown_watcher.await.unwrap_or("SIGTERM");
-    let _ = sighup.await;
 
     match run_result {
         Ok(stats) => {

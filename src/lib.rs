@@ -64,7 +64,7 @@ pub use crate::config::{
 #[doc(hidden)]
 pub use crate::cpu_worker::CpuWorker;
 #[doc(hidden)]
-pub use crate::daemon::{Service, ServiceHandle, run as run_daemon};
+pub use crate::daemon::{Service, run as run_daemon};
 #[doc(hidden)]
 pub use crate::events::EventKind;
 #[doc(hidden)]
@@ -88,7 +88,7 @@ pub use crate::psk::Psk;
 #[doc(hidden)]
 pub use crate::ready::notify as ready_notify;
 #[doc(hidden)]
-pub use crate::signals::{spawn_shutdown_watcher, spawn_sighup_handler};
+pub use crate::signals::spawn_shutdown_watcher;
 
 // Fuzz harnesses call these parser entry points directly.
 #[doc(hidden)]

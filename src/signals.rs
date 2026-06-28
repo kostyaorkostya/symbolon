@@ -1,7 +1,6 @@
-//! Signal-to-cancellation glue. Demuxes kernel signal deliveries
-//! to async-friendly outputs: SIGTERM/SIGINT cancel a
-//! `CancelToken`; SIGHUP invokes a caller-supplied async closure.
-//! The module is intentionally ignorant of what the closure does.
+//! Signal-to-cancellation glue. SIGTERM/SIGINT cancel a
+//! `CancelToken`; the module is intentionally ignorant of what
+//! downstream code does with that cancellation.
 //!
 //! Implementation: a single long-lived OS signal handler is
 //! installed once at startup via `signal-hook-registry`, and stays
@@ -14,14 +13,14 @@
 //! AsyncFlag is consume-on-wait).
 //!
 //! A compio task awaits the notifier and translates wakeups into
-//! shutdown-token cancellation or clients.json reloads.
+//! shutdown-token cancellation.
 //!
 //! Why not `compio-signal`: its `signal()` future re-registers the
 //! handler per call and unregisters on drop, reverting the kernel
-//! disposition to SigDfl between iterations. SIGHUP's default is
-//! `Term` — a signal arriving in that gap would kill the daemon.
-//! See `compio/compio-signal/src/unix/mod.rs:39-52` for the
-//! unregister path.
+//! disposition to SigDfl between iterations — a SIGTERM arriving in
+//! that gap would kill the daemon without giving the shutdown loop
+//! a chance to drain. See `compio/compio-signal/src/unix/mod.rs:39-52`
+//! for the unregister path.
 
 use std::future::Future;
 use std::io;
@@ -31,7 +30,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
 use compio::runtime::{CancelToken, JoinHandle};
-use futures_util::FutureExt;
 use futures_util::task::AtomicWaker;
 
 /// Long-lived signal notifier: signal handler calls `notify()`,
@@ -105,41 +103,6 @@ pub fn spawn_shutdown_watcher(shutdown: CancelToken) -> io::Result<JoinHandle<&'
                 return "SIGINT";
             }
             notifier.clone().notified().await;
-        }
-    }))
-}
-
-/// Install a long-lived handler for SIGHUP, spawn the task that
-/// calls `on_sighup` on each delivery. Exits cleanly when
-/// `shutdown` fires.
-///
-/// The handler body is supplied by the caller, so this module
-/// doesn't depend on what SIGHUP means in any given binary. To
-/// drive multiple reload-targets, compose them inside the closure
-/// (`async move { reload_a().await; reload_b().await; }`).
-pub fn spawn_sighup_handler<F, Fut>(
-    on_sighup: F,
-    shutdown: CancelToken,
-) -> io::Result<JoinHandle<()>>
-where
-    F: Fn() -> Fut + 'static,
-    Fut: Future<Output = ()> + 'static,
-{
-    let notifier = Arc::new(SignalNotifier::default());
-    let pending = Arc::new(AtomicBool::new(false));
-
-    register_async_signal(libc::SIGHUP, pending.clone(), notifier.clone())?;
-
-    Ok(compio::runtime::spawn(async move {
-        loop {
-            if pending.swap(false, Ordering::Acquire) {
-                on_sighup().await;
-                continue;
-            }
-            futures_util::select_biased! {
-                _ = notifier.clone().notified().fuse() => {}
-                _ = shutdown.clone().wait().fuse() => return,
-            }
         }
     }))
 }

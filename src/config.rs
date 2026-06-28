@@ -51,8 +51,7 @@ pub struct ListenConfig {
     /// in-process.
     pub bind: SocketAddr,
     /// Path to the symbolon-owned PSK store (`identity:hex_psk` per line).
-    /// Read at startup and re-read on SIGHUP. Atomically rewritten by
-    /// enroll/revoke.
+    /// Loaded once at startup; atomically rewritten by enroll/revoke.
     pub psk_file: PathBuf,
 }
 

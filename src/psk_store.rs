@@ -122,11 +122,6 @@ impl PskStore {
         self.entries.remove(identity).is_some()
     }
 
-    /// Number of enrolled identities.
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
     /// Render the store to the on-disk file format. Order is whatever
     /// `HashMap` iteration gives us — non-deterministic across writes.
     /// Operators who want sorted output can `sort` the file themselves.
@@ -164,7 +159,7 @@ mod tests {
     #[test]
     fn parse_empty_returns_empty_store() {
         let store = PskStore::parse("").unwrap();
-        assert_eq!(store.len(), 0);
+        assert!(store.lookup(&id("anything")).is_none());
     }
 
     #[test]
@@ -177,7 +172,6 @@ mod tests {
         let reparsed = PskStore::parse(&rendered).unwrap();
         assert_eq!(reparsed.lookup(&id("alpha")), Some(&psk_a()));
         assert_eq!(reparsed.lookup(&id("beta")), Some(&psk_b()));
-        assert_eq!(reparsed.len(), 2);
     }
 
     #[test]
@@ -188,7 +182,8 @@ mod tests {
             hex_str(psk_b())
         );
         let store = PskStore::parse(&text).unwrap();
-        assert_eq!(store.len(), 2);
+        assert_eq!(store.lookup(&id("alpha")), Some(&psk_a()));
+        assert_eq!(store.lookup(&id("beta")), Some(&psk_b()));
     }
 
     #[test]

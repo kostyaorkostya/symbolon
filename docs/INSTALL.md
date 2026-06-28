@@ -207,65 +207,67 @@ permission error. For Incus: `security.ipv4_filtering=true` /
 default bridge anti-spoof behaviour. For raw LXC: whatever your
 bridge driver supports.
 
-### 3.8 Install and start the daemon (OpenRC)
+### 3.8 Socket activation: the supervisor binds, the daemon inherits
 
-`/etc/init.d/symbolon`:
+**`symbolon daemon` does NOT bind sockets itself.** Both the inbound
+TCP listener (`:9418`) and the admin UDS (`/run/symbolon/admin.sock`)
+are obtained via the `LISTEN_FDS` env protocol from a supervisor:
 
-```sh
-#!/sbin/openrc-run
-name="symbolon"
-command="/usr/local/bin/symbolon"
-command_args="daemon"
-command_user="symbolon:symbolon"
-command_background=yes
-pidfile="/run/symbolon/symbolon.pid"
-output_log="/var/log/symbolon.log"
-error_log="/var/log/symbolon.log"
+- under **systemd**, via a `.socket` unit (§3.9);
+- under **OpenRC** (or any non-systemd init), via the
+  [`systemfd`](https://github.com/mitsuhiko/systemfd) wrapper (§3.10).
 
-depend() {
-    need net
-    after net
-}
+A plain `symbolon daemon` invocation with no supervisor exits
+immediately with `evt=run_failed` and an `EnvFdTake` error message
+naming the missing `LISTEN_FDS` env var. This is by design — the
+supervisor owns socket lifecycle, perms, and unlink; the daemon owns
+the per-connection logic.
 
-# /run is tmpfs and is cleared at every boot; re-create the daemon's
-# runtime directory before starting. checkpath is idempotent.
-start_pre() {
-    checkpath -d -m 0750 -o symbolon:symbolon /run/symbolon
-}
+### 3.9 systemd (`.socket` + `.service`)
+
+The runtime directory is created by systemd via the `.service`
+unit's `RuntimeDirectory=` (no `tmpfiles.d` needed).
+
+**`/etc/systemd/system/symbolon.socket`:**
+
+```ini
+[Unit]
+Description=git credentials broker sockets
+
+[Socket]
+ListenStream=0.0.0.0:9418
+ListenStream=/run/symbolon/admin.sock
+SocketMode=0600
+SocketUser=symbolon
+SocketGroup=symbolon
+Backlog=128
+BindIPv6Only=both
+
+[Install]
+WantedBy=sockets.target
 ```
 
-```sh
-chmod +x /etc/init.d/symbolon
-rc-update add symbolon default
-rc-service symbolon start
-```
+The two `ListenStream=` entries must appear in this order — the
+daemon takes slot 0 as the TCP wire and slot 1 as the admin UDS.
+`SocketMode=0600` applies only to the UDS (TCP sockets ignore it).
 
-### 3.9 systemd alternative
-
-If you deploy under systemd instead, the equivalent of `start_pre +
-checkpath` is `tmpfiles.d`. Drop `/usr/lib/tmpfiles.d/symbolon.conf`:
-
-```
-d /run/symbolon 0750 symbolon symbolon -
-```
-
-systemd-tmpfiles creates the directory at boot and on demand.
-Without this entry, the daemon will fail to start after a reboot
-with a permission error when binding its socket.
-
-A minimal systemd unit (`/etc/systemd/system/symbolon.service`):
+**`/etc/systemd/system/symbolon.service`:**
 
 ```ini
 [Unit]
 Description=git credentials broker
-After=network-online.target
+Requires=symbolon.socket
+After=symbolon.socket network-online.target
 Wants=network-online.target
 
 [Service]
 Type=notify
+Sockets=symbolon.socket
 ExecStart=/usr/local/bin/symbolon daemon
 User=symbolon
 Group=symbolon
+RuntimeDirectory=symbolon
+RuntimeDirectoryMode=0750
 # Required for `[security] mlock = "best_effort"` (the default).
 # Without it, mlockall fails with EAGAIN under the per-user
 # 64 KB default ulimit; daemon logs `evt=mlock status=skipped`
@@ -283,6 +285,70 @@ LimitCORE=0
 WantedBy=multi-user.target
 ```
 
+Enable both units; systemd will start the daemon on first connection
+(socket activation) or at boot if you `systemctl enable` the service:
+
+```sh
+systemctl enable --now symbolon.socket symbolon.service
+```
+
+### 3.10 OpenRC + `systemfd`
+
+OpenRC has no native socket-activation analogue, so the daemon runs
+under the [`systemfd`](https://github.com/mitsuhiko/systemfd) wrapper.
+`systemfd` binds the sockets, sets `LISTEN_FDS` / `LISTEN_PID`, and
+execs the daemon — same `LISTEN_FDS` protocol the daemon already
+understands.
+
+Install `systemfd` (cargo or your distro's package):
+
+```sh
+cargo install systemfd
+# or, on Alpine: apk add systemfd  (when packaged)
+```
+
+**`/etc/init.d/symbolon`:**
+
+```sh
+#!/sbin/openrc-run
+name="symbolon"
+description="git credentials broker"
+command="/usr/local/bin/systemfd"
+command_args="--no-pid -b 128 -s tcp::0.0.0.0:9418 -s unix::/run/symbolon/admin.sock -- /usr/local/bin/symbolon daemon"
+command_user="symbolon:symbolon"
+supervisor="supervise-daemon"
+output_log="/var/log/symbolon.log"
+error_log="/var/log/symbolon.log"
+
+depend() {
+    need net
+    after net
+}
+
+# /run is tmpfs and is cleared at every boot; re-create the daemon's
+# runtime directory before starting. checkpath is idempotent.
+start_pre() {
+    checkpath -d -m 0750 -o symbolon:symbolon /run/symbolon
+}
+```
+
+The `-s` flag arguments must appear in this order — the daemon takes
+slot 0 as the TCP wire and slot 1 as the admin UDS.
+
+**Caveat: socket mode under OpenRC.** Unlike systemd's
+`SocketMode=0600`, `systemfd` does not chmod the UDS — it inherits
+the daemon process's umask (typically `0o755` for sockets). Access
+control falls entirely on the `/run/symbolon/` directory mode
+(`0o750 root:symbolon`, per `start_pre`'s `checkpath`). This matches
+the broker's threat model — the directory mode is the primary gate —
+but is worth knowing if you ever loosen the directory perms.
+
+```sh
+chmod +x /etc/init.d/symbolon
+rc-update add symbolon default
+rc-service symbolon start
+```
+
 **Primary anti-swap defence: disable swap on the broker host.**
 This is industry standard for daemons holding long-lived secrets
 (nginx, haproxy, envoy all assume it). `symbolon`'s
@@ -296,14 +362,10 @@ swapoff -a
 
 `Type=notify` makes systemd wait for the daemon's
 `sd_notify(READY=1)` call before marking the service active.
-**Leave `[runtime] pidfile` unset in `config.toml` under
-systemd.** `Type=notify` covers readiness; modern systemd man
-pages discourage pidfiles when notify is available.
-
-**OpenRC: also leave `[runtime] pidfile` unset.**
-`command_background=yes` + `pidfile=...` in the init script tells
-OpenRC's `start-stop-daemon` to create and manage the pidfile via
-`--make-pidfile` from the supervisor side. A daemon-side pidfile
+**Leave `[runtime] pidfile` unset in `config.toml`** under both
+systemd and OpenRC. Modern systemd man pages discourage pidfiles
+when `Type=notify` is available, and OpenRC's `supervise-daemon`
+manages PIDs from the supervisor side. A daemon-side pidfile
 would be redundant and would force the pidfile's parent directory
 into the Landlock write-allowlist for no benefit.
 
@@ -316,9 +378,9 @@ symbolon github selfcheck
 
 `selfcheck` should report the provider reachable and clock skew
 small. Exit code 0 means everything's good. (CLI commands talk to
-the daemon over its admin Unix socket, which is locked down by
-SO_PEERCRED to root or the daemon's UID; run the commands as one
-of those.)
+the daemon over its admin Unix socket; access is gated by the
+`/run/symbolon/` directory mode — group `symbolon` only. Run the
+commands as a user in that group, or as root.)
 
 ## 4. Enroll a client
 

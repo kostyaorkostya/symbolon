@@ -167,6 +167,19 @@ and permission set per provider live in `docs/providers/<name>.md`.
     complements (per docs/INSTALL.md): disable swap on the
     broker host, and set `LimitCORE=0` in the systemd unit so
     coredumps can't leak page contents via dump files.
+15. **Socket activation is mandatory.** The daemon does NOT bind
+    its listeners. Both the TCP wire (`:9418` by convention) and
+    the admin UDS (`/run/symbolon/admin.sock`) are obtained via the
+    `LISTEN_FDS` env protocol — from a systemd `.socket` unit (with
+    `Sockets=symbolon.socket` on the `.service`), or from the
+    [`systemfd`](https://github.com/mitsuhiko/systemfd) wrapper
+    under non-systemd inits (`systemfd --no-pid -s tcp::… -s unix::… --
+    symbolon daemon`). Slot 0 = TCP wire, slot 1 = admin UDS. Plain
+    `symbolon daemon` exits with `evt=run_failed` +
+    `DaemonError::EnvFdTake` when no supervisor is present. The
+    supervisor owns the socket inode lifecycle, perms, and unlink.
+    See `docs/INSTALL.md` §3.8–3.10. Consumed via the `listenfd`
+    crate.
 
 ## Hard NOTs
 
@@ -260,6 +273,16 @@ Pinned in `Cargo.toml`:
   `src/admin.rs`, and the client binary's PSK file load in
   `src/bin/git_credential_symbolon.rs`. Pure-Rust, zero runtime
   deps, dual MIT/Apache.)
+- `listenfd` (consumer side of the systemd `LISTEN_FDS` env
+  protocol — used in `src/daemon.rs::take_env_listeners` to reclaim
+  the TCP wire socket + admin UDS that the supervisor (systemd
+  `.socket` unit or `systemfd` wrapper) pre-bound. Returns `std`
+  socket types which compio wraps via `from_std` with no `unsafe`
+  at our call site. Apache-2.0, by the same author as `systemfd`.
+  Pulls `uuid` as a transitive (Windows code path; unused on our
+  musl targets but in the dep graph regardless). Picked over
+  rolling our own ~50-LOC env reader for the PID-check correctness
+  and the consume-on-read env-var hygiene listenfd does for free.)
 - `landlock` (Linux LSM sandboxing at ABI 6: FS allowlist +
   outbound TCP-connect to port 443 + abstract-UDS scope +
   `Scope::Signal` (Linux 6.12+) denying cross-domain
@@ -628,10 +651,6 @@ Known omissions, not oversights:
   UDP stub resolver on `compio-net` (~150–250 LOC, A/AAAA only).
   DoT/DoH are out of scope for our threat model regardless. See
   PROTOCOLS.md for the rationale.
-- **Socket activation via `listen-fds` / `listenfd`.** systemd can
-  hand pre-bound sockets to the daemon; would eliminate our own
-  `UnixListener::bind` step under systemd. Real lifecycle redesign,
-  deferred.
 - **DNS re-resolution under IP rotation.** cyper's connection pool
   caches established TLS connections; when GitHub's IPs rotate, a
   pooled connection eventually fails, we surface `evt=provider_error`,

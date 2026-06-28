@@ -435,8 +435,29 @@ pub async fn spawn_daemon(paths: &TempPaths, api_base: String) {
 
 pub async fn spawn_daemon_with_bind(paths: &TempPaths, api_base: String, bind: SocketAddr) {
     let cfg = build_full_config(paths, api_base, bind);
+    // Production uses LISTEN_FDS handoff via systemd/systemfd; tests
+    // pre-bind here and feed the listeners through the test-only
+    // `prepare_with_listeners` constructor. Env vars are process-global,
+    // so we can't use the real listenfd path across parallel #[compio::test]
+    // runtimes.
+    let listener = compio::net::TcpListener::bind(&cfg.listen.bind)
+        .await
+        .expect("bind test TCP listener");
+    let admin_listener = compio::net::UnixListener::bind(&cfg.admin.socket_path)
+        .await
+        .expect("bind test admin UDS");
     compio::runtime::spawn(async move {
-        let _ = symbolon::run_daemon(&cfg, std::path::Path::new("/test/config.toml")).await;
+        let shutdown = compio::runtime::CancelToken::new();
+        let service = symbolon::Service::prepare_with_listeners(
+            &cfg,
+            std::path::Path::new("/test/config.toml"),
+            shutdown,
+            listener,
+            admin_listener,
+        )
+        .await
+        .expect("prepare test service");
+        let _ = service.run().await;
     })
     .detach();
     wait_for_socket(&paths.admin).await;

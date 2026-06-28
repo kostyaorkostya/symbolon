@@ -64,7 +64,7 @@ pub use crate::config::{
 #[doc(hidden)]
 pub use crate::cpu_worker::CpuWorker;
 #[doc(hidden)]
-pub use crate::daemon::{Service, run as run_daemon};
+pub use crate::daemon::Service;
 #[doc(hidden)]
 pub use crate::events::EventKind;
 #[doc(hidden)]

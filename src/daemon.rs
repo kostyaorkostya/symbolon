@@ -70,26 +70,14 @@ pub enum DaemonError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to bind listen socket")]
-    Bind {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to chmod admin socket at {}", path.display())]
-    Chmod {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to unlink stale socket at {}", path.display())]
-    Unlink {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
     #[error("I/O error during accept")]
     Accept(#[source] std::io::Error),
+    #[error("LISTEN_FDS env handoff failed: {reason}")]
+    EnvFdTake {
+        reason: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("clients.json contains duplicate identity {0}")]
     DuplicateClientName(Identity),
     #[error("clients.json contains invalid identity {name:?}")]
@@ -167,7 +155,6 @@ pub struct SharedState {
     pub(crate) providers: HashMap<ProviderKind, Box<dyn Provider>>,
     pub(crate) psk_file_path: PathBuf,
     pub(crate) clients_file_path: PathBuf,
-    pub(crate) admin_socket_path: PathBuf,
     pub(crate) start_time: Instant,
     /// Cancelled by `crate::signals` watchers on SIGTERM/SIGINT. The
     /// main accept loop and the admin loop both race `wait()` on it.
@@ -354,24 +341,48 @@ pub struct Service {
 
 impl Service {
     /// Sequencing matters here: PEM bytes, the TCP listen bind, the
-    /// admin Unix-socket bind, and the initial PSK file read all need
-    /// access the sandbox would deny, so they happen first.
-    /// `apply_sandbox` then closes the gate. The shared `CpuWorker`
-    /// is spawned AFTER the sandbox so its thread inherits the
-    /// Landlock ruleset — spawning it before would leak an
-    /// unsandboxed thread into the process.
+    /// Sequencing matters here: PEM bytes, the initial PSK file read,
+    /// and the env-fd handoff all need access the sandbox would deny,
+    /// so they happen first. `apply_sandbox` then closes the gate.
+    /// The shared `CpuWorker` is spawned AFTER the sandbox so its
+    /// thread inherits the Landlock ruleset — spawning it before would
+    /// leak an unsandboxed thread into the process.
+    ///
+    /// **The daemon does not bind sockets itself.** Both the inbound
+    /// TCP listener and the admin UDS are obtained via the
+    /// `LISTEN_FDS` env protocol — either from a systemd `.socket`
+    /// unit (`Sockets=symbolon.socket` on the `.service`) or via the
+    /// `systemfd` wrapper under non-systemd inits. Slot 0 = TCP wire,
+    /// slot 1 = admin UDS. Plain `symbolon daemon` invocation without
+    /// a supervisor fails with `DaemonError::EnvFdTake`. See
+    /// `INSTALL.md` for the unit / wrapper recipes.
     pub async fn prepare(
         cfg: &Config,
         config_path: &Path,
         shutdown: CancelToken,
     ) -> Result<Self, DaemonError> {
-        // Race the whole preparation against shutdown so an early
-        // SIGTERM (e.g. during a hung PEM read on a stale NFS mount)
-        // returns cleanly without binding sockets we'd then have to
-        // unlink.
+        let (listener, admin_listener) = take_env_listeners()?;
+        Self::prepare_with_listeners(cfg, config_path, shutdown, listener, admin_listener).await
+    }
+
+    /// Test-only entry point: skip the `LISTEN_FDS` handoff and run
+    /// against caller-supplied listeners. Integration tests spawn
+    /// many parallel daemon instances in one process; env vars are
+    /// process-global, so they bind their own sockets and pass them
+    /// in here. Not part of the operator-visible API.
+    #[doc(hidden)]
+    pub async fn prepare_with_listeners(
+        cfg: &Config,
+        config_path: &Path,
+        shutdown: CancelToken,
+        listener: TcpListener,
+        admin_listener: UnixListener,
+    ) -> Result<Self, DaemonError> {
+        // Race preparation against shutdown so an early SIGTERM (e.g.
+        // during a hung PEM read on a stale NFS mount) returns cleanly.
         futures_util::select_biased! {
             _ = shutdown.clone().wait().fuse() => Err(DaemonError::Cancelled),
-            r = Self::prepare_inner(cfg, config_path, shutdown.clone()).fuse() => r,
+            r = Self::prepare_inner(cfg, config_path, shutdown.clone(), listener, admin_listener).fuse() => r,
         }
     }
 
@@ -379,6 +390,8 @@ impl Service {
         cfg: &Config,
         config_path: &Path,
         shutdown: CancelToken,
+        listener: TcpListener,
+        admin_listener: UnixListener,
     ) -> Result<Self, DaemonError> {
         let clients_file = crate::loader::load_clients_file(&cfg.clients.file)
             .await
@@ -399,40 +412,9 @@ impl Service {
             None
         };
 
-        // Pre-sandbox: bind the inbound TCP listener directly. The
-        // daemon terminates Noise NNpsk0 in-process.
-        let listen_addr = cfg.listen.bind;
-        let listener =
-            TcpListener::bind(&listen_addr)
-                .await
-                .map_err(|source| DaemonError::Bind {
-                    path: PathBuf::from(listen_addr.to_string()),
-                    source,
-                })?;
-
-        // Admin UDS bind. There is a microsecond-scale race between
-        // bind(2) and chmod() where the inode briefly carries umask-
-        // default perms; INSTALL.md pins the parent dir (`/run/symbolon`)
-        // 0o750 owned by group `symbolon`, so a world-mode socket inside
-        // is still unreachable from outside that group. That dir-mode
-        // gate is the only access control — there is no in-process
-        // peer-credential check.
-        let admin_path = &cfg.admin.socket_path;
-        unlink_stale(admin_path).await?;
-        let admin_listener =
-            UnixListener::bind(admin_path)
-                .await
-                .map_err(|source| DaemonError::Bind {
-                    path: admin_path.clone(),
-                    source,
-                })?;
-        // RAII: the next several `?` steps (chmod, sandbox, CpuWorker,
-        // provider construction) all happen AFTER the UDS bind. Any
-        // failure there leaves an orphaned socket on disk; this guard
-        // does best-effort cleanup on Drop. Disarmed on the success
-        // path below so the socket lives.
-        let admin_bind_guard = AdminBindGuard::new(admin_path.clone());
-        chmod_socket(admin_path, 0o600)?;
+        // Sockets are already bound — by the caller (production: via
+        // `take_env_listeners`; tests: pre-bound and passed in). The
+        // supervisor owns the inode lifecycle, perms, and unlink.
 
         // Sandbox gate closes here.
         apply_sandbox(cfg)?;
@@ -460,7 +442,6 @@ impl Service {
             providers,
             psk_file_path: cfg.listen.psk_file.clone(),
             clients_file_path: cfg.clients.file.clone(),
-            admin_socket_path: cfg.admin.socket_path.clone(),
             start_time: Instant::now(),
             shutdown,
         });
@@ -469,11 +450,8 @@ impl Service {
             evt = %EventKind::Prepare,
             version = env!("CARGO_PKG_VERSION"),
             config_path = %config_path.display(),
-            listen_addr = %listen_addr,
-            admin_socket = %admin_path.display(),
         );
 
-        admin_bind_guard.disarm();
         Ok(Self {
             state,
             listener,
@@ -594,10 +572,10 @@ impl Service {
             );
         }
 
-        // PROTOCOLS.md shutdown step: unlink the admin Unix socket.
-        // The listen socket is a TCP listener — closing the file
-        // descriptor (when `listener` drops below) is sufficient.
-        let _ = compio::fs::remove_file(&state.admin_socket_path).await;
+        // The supervisor (systemd / systemfd) owns the admin socket
+        // inode lifecycle. Closing the listener fds (via drop below
+        // and the implicit drop of `admin_listener` as `state` falls
+        // out of scope) is all the daemon does at shutdown.
         drop(listener);
 
         Ok(RunStats {
@@ -608,17 +586,6 @@ impl Service {
     }
 }
 
-/// Convenience wrapper: prepare the service with a fresh
-/// `CancelToken`, then run until the token fires. The daemon itself
-/// does NOT install signal handlers — production code (main) wires
-/// signals into the token via `crate::signals`. This wrapper is for
-/// tests and other callers that want to drive the lifecycle by
-/// dropping the spawned task.
-pub async fn run(cfg: &Config, config_path: &Path) -> Result<RunStats, DaemonError> {
-    let shutdown = CancelToken::new();
-    let service = Service::prepare(cfg, config_path, shutdown).await?;
-    service.run().await
-}
 
 impl SharedState {
     /// Look up the configured provider whose wire-protocol kind
@@ -654,15 +621,6 @@ async fn load_psk_store(path: &Path) -> Result<PskStore, DaemonError> {
         source: PskStoreError::Utf8(source),
     })?;
     PskStore::parse(text).map_err(|source| DaemonError::LoadPsks {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-fn chmod_socket(path: &Path, mode: u32) -> Result<(), DaemonError> {
-    use std::os::unix::fs::PermissionsExt;
-    let perms = std::fs::Permissions::from_mode(mode);
-    std::fs::set_permissions(path, perms).map_err(|source| DaemonError::Chmod {
         path: path.to_path_buf(),
         source,
     })
@@ -704,6 +662,9 @@ fn apply_sandbox(cfg: &Config) -> Result<(), DaemonError> {
         // getservbyname which we don't use (we pass numeric 443).
         resolv_files: nameservice_files().iter().map(PathBuf::from).collect(),
         write_parent_dirs: {
+            // The admin socket's parent dir is deliberately NOT in
+            // this list: the supervisor (systemd / systemfd) owns the
+            // socket inode lifecycle; the daemon never unlinks it.
             let mut v = vec![
                 cfg.clients
                     .file
@@ -714,15 +675,6 @@ fn apply_sandbox(cfg: &Config) -> Result<(), DaemonError> {
                     .psk_file
                     .parent()
                     .ok_or(DaemonError::NoParentDir("listen.psk_file"))?
-                    .to_path_buf(),
-                // Shutdown unlinks the admin Unix socket; without
-                // its parent in the allowlist, the remove_file would
-                // silently fail post-sandbox and leave a stale socket
-                // for the next start.
-                cfg.admin
-                    .socket_path
-                    .parent()
-                    .ok_or(DaemonError::NoParentDir("admin.socket_path"))?
                     .to_path_buf(),
             ];
             // ready::notify writes the pidfile post-sandbox; its
@@ -769,44 +721,50 @@ fn apply_sandbox(cfg: &Config) -> Result<(), DaemonError> {
     Ok(())
 }
 
-async fn unlink_stale(path: &Path) -> Result<(), DaemonError> {
-    match compio::fs::remove_file(path).await {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(DaemonError::Unlink {
-            path: path.to_path_buf(),
+/// Reclaim the two pre-bound listeners that the supervisor (systemd or
+/// `systemfd`) handed us via the `LISTEN_FDS` env protocol. Slot 0 =
+/// TCP wire (`:9418` per convention); slot 1 = admin UDS. Errors with
+/// `EnvFdTake` if the env is absent, the slot count doesn't match, or
+/// a slot has the wrong socket type — all of which mean the daemon was
+/// launched without the supervisor wiring. See `INSTALL.md`.
+fn take_env_listeners() -> Result<(TcpListener, UnixListener), DaemonError> {
+    let mut lfd = listenfd::ListenFd::from_env();
+    if lfd.len() == 0 {
+        return Err(DaemonError::EnvFdTake {
+            reason: "LISTEN_FDS unset — daemon requires systemd .socket or systemfd wrapper",
+            source: std::io::Error::other("no env fds available"),
+        });
+    }
+    let tcp_std = lfd
+        .take_tcp_listener(0)
+        .map_err(|source| DaemonError::EnvFdTake {
+            reason: "slot 0 (TCP wire) take failed",
             source,
-        }),
-    }
-}
-
-/// RAII guard: unlinks the admin UDS on Drop unless explicitly
-/// disarmed. Used during `prepare_inner` so any failure between
-/// `UnixListener::bind` and the success return doesn't leave an
-/// orphaned socket on disk. After the sandbox closes, the unlink
-/// will silently fail (Landlock blocks the syscall) — that's
-/// acceptable because the next `prepare_inner` cleans it via
-/// `unlink_stale`.
-struct AdminBindGuard {
-    path: Option<PathBuf>,
-}
-
-impl AdminBindGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path: Some(path) }
-    }
-
-    fn disarm(mut self) {
-        self.path = None;
-    }
-}
-
-impl Drop for AdminBindGuard {
-    fn drop(&mut self) {
-        if let Some(p) = self.path.take() {
-            let _ = std::fs::remove_file(&p);
-        }
-    }
+        })?
+        .ok_or_else(|| DaemonError::EnvFdTake {
+            reason: "slot 0 (TCP wire) missing or wrong socket type",
+            source: std::io::Error::other("expected TCP listener at LISTEN_FDS slot 0"),
+        })?;
+    let listener = TcpListener::from_std(tcp_std).map_err(|source| DaemonError::EnvFdTake {
+        reason: "slot 0 (TCP wire) compio wrap failed",
+        source,
+    })?;
+    let uds_std = lfd
+        .take_unix_listener(1)
+        .map_err(|source| DaemonError::EnvFdTake {
+            reason: "slot 1 (admin UDS) take failed",
+            source,
+        })?
+        .ok_or_else(|| DaemonError::EnvFdTake {
+            reason: "slot 1 (admin UDS) missing or wrong socket type",
+            source: std::io::Error::other("expected Unix listener at LISTEN_FDS slot 1"),
+        })?;
+    let admin_listener =
+        UnixListener::from_std(uds_std).map_err(|source| DaemonError::EnvFdTake {
+            reason: "slot 1 (admin UDS) compio wrap failed",
+            source,
+        })?;
+    Ok((listener, admin_listener))
 }
 
 impl TryFrom<ClientsFile> for HashMap<Identity, ResolvedClient> {

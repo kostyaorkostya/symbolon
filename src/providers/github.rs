@@ -26,7 +26,7 @@ use tracing::info;
 use url::Url;
 
 use async_trait::async_trait;
-use derive_more::{AsRef, Display, From, Into};
+use derive_more::{Display, From};
 use serde_json::json;
 
 use crate::config::ProviderGithub;
@@ -41,45 +41,11 @@ use crate::providers::{
 };
 use crate::singleflight_cache::SingleflightCache;
 
-/// GitHub App **installation** numeric id (the `installation_id`
-/// path parameter on `/app/installations/{id}/access_tokens` etc.).
-/// Distinct from `RepoId` so a swap is a compile error.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    AsRef,
-    Display,
-    From,
-    Into,
-    serde::Deserialize,
-    serde::Serialize,
-)]
-#[as_ref(u64)]
-#[from(u64)]
-#[serde(transparent)]
-pub struct InstallationId(u64);
+pub use crate::config::InstallationId;
 
 /// GitHub **repository** numeric id (the `id` field on the repo
 /// REST resource; used in the mint body's `repository_ids` array).
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    AsRef,
-    Display,
-    From,
-    Into,
-    serde::Deserialize,
-    serde::Serialize,
-)]
-#[as_ref(u64)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, From, Deserialize, Serialize)]
 #[from(u64)]
 #[serde(transparent)]
 pub struct RepoId(u64);
@@ -317,7 +283,7 @@ impl GitHubProvider {
             host: cfg.host.clone(),
             api_base,
             client_id: cfg.client_id.clone(),
-            installation_id: InstallationId::from(cfg.installation_id),
+            installation_id: cfg.installation_id,
             signer: JwtSigner { worker, key },
             client,
             user_agent: cfg.user_agent.clone(),
@@ -889,7 +855,7 @@ impl GitHubProvider {
 /// `owner/repo` reference borrowed from a git-credential request,
 /// validated against the GitHub-allowed charset by [`Self::parse`]
 /// so downstream URL builders can paste it raw without escaping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 struct RepoPath<'a> {
     owner: &'a str,
     repo: &'a str,
@@ -1104,7 +1070,7 @@ mod tests {
             host: "github.com".to_string(),
             api_base: "https://api.github.com/".to_string(),
             client_id: "Iv1.test1".to_string(),
-            installation_id: 2,
+            installation_id: 2u64.into(),
             private_key_path: fixture_pem_path(),
             selfcheck_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(10),

@@ -20,31 +20,31 @@
 //! `symbolon` ships as a daemon binary, not as a library. The items
 //! re-exported below are needed by `src/main.rs`, `tests/`, and
 //! `fuzz/fuzz_targets/`, which Cargo treats as separate crates and
-//! therefore cannot see `pub(crate)` items. They are marked
+//! therefore cannot see `pub` items. They are marked
 //! `#[doc(hidden)]` to indicate they are NOT a public API — external
 //! code should not depend on them.
 
-pub(crate) mod admin;
-pub(crate) mod atomic_fs;
-pub(crate) mod config;
-pub(crate) mod connection_tracker;
-pub(crate) mod cpu_worker;
-pub(crate) mod daemon;
-pub(crate) mod events;
-pub(crate) mod git_credential;
-pub(crate) mod identity;
-pub(crate) mod ids;
-pub(crate) mod loader;
-pub(crate) mod logging;
-pub(crate) mod mlock;
-pub(crate) mod note;
-pub(crate) mod providers;
-pub(crate) mod psk;
-pub(crate) mod psk_store;
-pub(crate) mod ready;
-pub(crate) mod sandbox;
-pub(crate) mod signals;
-pub(crate) mod singleflight_cache;
+pub mod admin;
+pub mod atomic_fs;
+pub mod config;
+pub mod connection_tracker;
+pub mod cpu_worker;
+pub mod daemon;
+pub mod events;
+pub mod git_credential;
+pub mod identity;
+pub mod ids;
+pub mod loader;
+pub mod logging;
+pub mod mlock;
+pub mod note;
+pub mod providers;
+pub mod psk;
+pub mod psk_store;
+pub mod ready;
+pub mod sandbox;
+pub mod signals;
+pub mod singleflight_cache;
 #[doc(hidden)]
 pub mod transport;
 
@@ -70,19 +70,15 @@ pub use crate::events::EventKind;
 #[doc(hidden)]
 pub use crate::identity::{Identity, IdentityError};
 #[doc(hidden)]
-pub use crate::ids::{OutReqId, ReqId};
-#[doc(hidden)]
 pub use crate::loader::load_config;
 #[doc(hidden)]
 pub use crate::logging::{ErrorChain, setup_tracing};
 #[doc(hidden)]
-pub use crate::mlock::{MlockRequiredFailed, apply as mlock_apply};
+pub use crate::mlock::apply as mlock_apply;
 #[doc(hidden)]
-pub use crate::note::{Note, NoteError};
+pub use crate::note::Note;
 #[doc(hidden)]
-pub use crate::providers::ProviderReqId;
-#[doc(hidden)]
-pub use crate::providers::github::{GitHubProvider, GithubError, InstallationId, RepoId};
+pub use crate::providers::github::{GitHubProvider, GithubError};
 #[doc(hidden)]
 pub use crate::psk::Psk;
 #[doc(hidden)]

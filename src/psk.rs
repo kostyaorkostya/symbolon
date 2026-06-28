@@ -6,6 +6,7 @@
 //! and the lower-level Noise plumbing want it.
 
 use derive_more::From;
+use serde::{Deserialize, Serialize};
 
 /// 32-byte pre-shared key with a deliberately redacted `Debug` impl.
 /// Without the newtype, the raw `[u8; 32]` inside `PskStore` (which
@@ -23,7 +24,7 @@ use derive_more::From;
 /// wire ergonomics don't justify a hex-string adapter. The on-disk
 /// PSK file uses hex, but that path goes through `to_hex` /
 /// `hex::FromHex` explicitly, not serde.
-#[derive(Clone, Copy, PartialEq, Eq, From, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, From, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Psk([u8; Self::LEN]);
 
@@ -81,11 +82,5 @@ impl Psk {
     /// API (e.g. snow's `Builder::psk`) that doesn't need ownership.
     pub fn as_bytes(&self) -> &[u8; Self::LEN] {
         &self.0
-    }
-
-    /// Consume and return the raw bytes. Use when the receiver wants
-    /// owned `[u8; 32]` and the caller has no further need for the Psk.
-    pub fn into_bytes(self) -> [u8; Self::LEN] {
-        self.0
     }
 }

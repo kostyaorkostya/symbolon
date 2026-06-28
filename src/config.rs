@@ -9,7 +9,20 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use derive_more::{Display, From};
 use serde::{Deserialize, Serialize};
+
+use crate::note::Note;
+use crate::providers::ProviderKind;
+
+/// GitHub App **installation** numeric id (the `installation_id`
+/// path parameter on `/app/installations/{id}/access_tokens` etc.).
+/// Operator-supplied via `[provider.github]`; distinct newtype so a
+/// swap with `RepoId` is a compile error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, From, Deserialize, Serialize)]
+#[from(u64)]
+#[serde(transparent)]
+pub struct InstallationId(u64);
 
 /// Top-level parsed `config.toml`.
 #[derive(Debug, Deserialize)]
@@ -172,7 +185,7 @@ pub struct ProviderGithub {
     /// is the documented preferred form per GitHub's "Generating a
     /// JSON web token (JWT) for a GitHub App" guide.
     pub client_id: String,
-    pub installation_id: u64,
+    pub installation_id: InstallationId,
     /// PEM-encoded App private key; loaded once at startup.
     pub private_key_path: PathBuf,
     /// Startup self-check timeout (e.g. `"5s"`). Required — no
@@ -222,13 +235,13 @@ pub struct ClientsFile {
 #[serde(deny_unknown_fields)]
 pub struct ClientEntry {
     pub name: String,
-    pub providers: Vec<crate::providers::ProviderKind>,
+    pub providers: Vec<ProviderKind>,
     /// Enrollment timestamp. Round-trips through RFC 3339 on the
     /// wire (`2026-05-26T12:34:56Z` shape); typing as
     /// `OffsetDateTime` rejects malformed strings at load time.
     #[serde(with = "time::serde::rfc3339")]
     pub enrolled_at: time::OffsetDateTime,
-    pub note: Option<crate::note::Note>,
+    pub note: Option<Note>,
 }
 
 /// Abstract parse error. Boxed so callers can render the
@@ -296,7 +309,7 @@ selfcheck_timeout = "5s"
         assert_eq!(gh.host, "github.com");
         assert_eq!(gh.api_base, "https://api.github.com");
         assert_eq!(gh.client_id, "Iv23liABCDEFGHIJklmn");
-        assert_eq!(gh.installation_id, 789_012);
+        assert_eq!(gh.installation_id, InstallationId::from(789_012_u64));
         assert_eq!(
             gh.private_key_path,
             PathBuf::from("/etc/symbolon/github-app.pem")
@@ -425,7 +438,7 @@ selfcheck_timeout = "5s"
         assert_eq!(parsed.clients.len(), 1);
         let c = &parsed.clients[0];
         assert_eq!(c.name, "dev-vm-1");
-        assert_eq!(c.providers, vec![crate::providers::ProviderKind::Github]);
+        assert_eq!(c.providers, vec![ProviderKind::Github]);
         // 2026-05-26T12:34:56Z in unix seconds: parsed via the same
         // RFC3339 adapter the wire uses.
         assert_eq!(

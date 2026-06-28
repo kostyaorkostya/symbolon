@@ -15,7 +15,7 @@ use compio::BufResult;
 /// Write `content` to `path` atomically with file mode `mode`.
 /// Creates `path` if it doesn't exist; replaces it if it does.
 /// Cleans up the tempfile on rename failure.
-pub(crate) async fn atomic_write(path: &Path, content: Vec<u8>, mode: u32) -> std::io::Result<()> {
+pub async fn atomic_write(path: &Path, content: Vec<u8>, mode: u32) -> std::io::Result<()> {
     use compio::io::AsyncWriteAtExt;
     let dir = path
         .parent()

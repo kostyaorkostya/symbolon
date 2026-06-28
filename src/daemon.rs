@@ -23,6 +23,7 @@ use compio::runtime::CancelToken;
 use synchrony::unsync::mutex::Mutex;
 use tracing::{info, warn};
 
+use crate::atomic_fs::atomic_write;
 use crate::config::{ClientEntry, ClientsFile, Config};
 use crate::connection_tracker::ConnectionTracker;
 use crate::cpu_worker::CpuWorker;
@@ -30,6 +31,7 @@ use crate::events::EventKind;
 use crate::git_credential;
 use crate::identity::{Identity, IdentityError};
 use crate::ids::{OutReqId, ReqId};
+use crate::logging::ErrorChain;
 use crate::note::Note;
 use crate::providers::github::{GitHubProvider, GithubError};
 use crate::providers::{Provider, ProviderError, ProviderKind, ProviderReqId};
@@ -101,17 +103,17 @@ pub enum DaemonError {
 /// name lives in the key — duplicating it as a `name: String` field
 /// here would leak the value through any `{:?}` of a struct holding
 /// a `ResolvedClient` (Identity's `Debug` is deliberately redacted).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ResolvedClient {
-    pub(crate) providers: Vec<ProviderKind>,
-    pub(crate) enrolled_at: time::OffsetDateTime,
-    pub(crate) note: Option<Note>,
+#[derive(Debug, Clone)]
+pub struct ResolvedClient {
+    pub providers: Vec<ProviderKind>,
+    pub enrolled_at: time::OffsetDateTime,
+    pub note: Option<Note>,
 }
 
 /// Shared between the listen-side accept loop and the admin-side
 /// accept loop. `clients` is mutable so admin enroll/revoke can
 /// update it in place; `providers` is fixed at startup. Field
-/// visibility is `pub(crate)` so external callers see only an
+/// visibility is `pub` so external callers see only an
 /// opaque `Rc<SharedState>` — they can hold and pass it around but
 /// not peek at internals.
 pub struct SharedState {
@@ -127,7 +129,7 @@ pub struct SharedState {
     /// `atomic_write` `.await`s, race their on-disk writes, and leave
     /// the file out of sync with in-memory state. Reads (status /
     /// list / mint / selfcheck) bypass the lock — they don't mutate.
-    pub(crate) mutation_lock: Mutex<()>,
+    pub mutation_lock: Mutex<()>,
     /// Identity → metadata. Mutated by admin enroll/revoke. Lookup
     /// keyed on the PSK identity surfaced by the Noise prelude.
     ///
@@ -139,28 +141,28 @@ pub struct SharedState {
     /// Mutators must update this and `psks` together (in-memory) BEFORE
     /// releasing visibility to readers, so a concurrent mint never
     /// sees a half-enrolled client.
-    pub(crate) clients: RefCell<HashMap<Identity, ResolvedClient>>,
+    pub clients: RefCell<HashMap<Identity, ResolvedClient>>,
     /// Identity → 32-byte PSK. Same identities as `clients` (the
     /// `enroll`/`revoke` admin paths keep them in lock-step). Daemon
     /// reads this on every accepted connection to seed the Noise
     /// responder.
     ///
     /// **GUARDED_BY:** see [`Self::clients`] — same rule.
-    pub(crate) psks: RefCell<PskStore>,
+    pub psks: RefCell<PskStore>,
     /// One concrete provider per configured `[provider.<name>]`
     /// section. Admin dispatch looks up by `ProviderKind` key; wire
     /// dispatch iterates `.values()` and matches on `provider.host()`.
     /// Cardinality is 1 today; when GitLab/Gitea land, add a sibling
     /// module + `ProviderKind` variant and insert here.
-    pub(crate) providers: HashMap<ProviderKind, Box<dyn Provider>>,
-    pub(crate) psk_file_path: PathBuf,
-    pub(crate) clients_file_path: PathBuf,
-    pub(crate) start_time: Instant,
+    pub providers: HashMap<ProviderKind, Box<dyn Provider>>,
+    pub psk_file_path: PathBuf,
+    pub clients_file_path: PathBuf,
+    pub start_time: Instant,
     /// Cancelled by `crate::signals` watchers on SIGTERM/SIGINT. The
     /// main accept loop and the admin loop both race `wait()` on it.
     /// Loops exit cleanly on cancel, letting their `JoinHandle`s be
     /// joined.
-    pub(crate) shutdown: CancelToken,
+    pub shutdown: CancelToken,
 }
 
 const CLIENTS_FILE_MODE: u32 = 0o640;
@@ -170,7 +172,7 @@ const PSK_FILE_MODE: u32 = 0o600;
 /// `revoke_client`. The admin layer owns the variant→wire-code
 /// mapping so the wire vocabulary stays in one place.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum StateMutationError {
+pub enum StateMutationError {
     #[error("client '{0}' already enrolled")]
     ClientAlreadyEnrolled(Identity),
     #[error("no enrolled client named '{0}'")]
@@ -191,7 +193,7 @@ impl SharedState {
     /// whose PSK lookup fails). On any failure between the in-memory
     /// PSK insert and the in-memory clients insert, the RAII
     /// rollback removes the PSK entry so memory stays consistent.
-    pub(crate) async fn enroll_client(
+    pub async fn enroll_client(
         &self,
         client: Identity,
         psk: Psk,
@@ -244,7 +246,7 @@ impl SharedState {
         };
 
         let psk_content = self.psks.borrow().render();
-        crate::atomic_fs::atomic_write(
+        atomic_write(
             &self.psk_file_path,
             psk_content.into_bytes(),
             PSK_FILE_MODE,
@@ -257,7 +259,7 @@ impl SharedState {
         // (AGENTS.md invariant #10), so in-memory is the truth.
         let clients_bytes = render_clients_doc(&self.clients.borrow(), None)
             .map_err(StateMutationError::EncodeClients)?;
-        crate::atomic_fs::atomic_write(&self.clients_file_path, clients_bytes, CLIENTS_FILE_MODE)
+        atomic_write(&self.clients_file_path, clients_bytes, CLIENTS_FILE_MODE)
             .await
             .map_err(StateMutationError::WriteClients)?;
 
@@ -270,7 +272,7 @@ impl SharedState {
     /// PSK file write fails, the orphan PSK entry on disk is
     /// harmless (unreachable on next start because clients.json no
     /// longer carries the identity).
-    pub(crate) async fn revoke_client(&self, client: &Identity) -> Result<(), StateMutationError> {
+    pub async fn revoke_client(&self, client: &Identity) -> Result<(), StateMutationError> {
         let _guard = self.mutation_lock.lock().await;
         if !self.clients.borrow().contains_key(client) {
             return Err(StateMutationError::UnknownClient(client.to_string()));
@@ -279,13 +281,13 @@ impl SharedState {
         // entry. In-memory is the truth (AGENTS.md invariant #10).
         let clients_bytes = render_clients_doc(&self.clients.borrow(), Some(client))
             .map_err(StateMutationError::EncodeClients)?;
-        crate::atomic_fs::atomic_write(&self.clients_file_path, clients_bytes, CLIENTS_FILE_MODE)
+        atomic_write(&self.clients_file_path, clients_bytes, CLIENTS_FILE_MODE)
             .await
             .map_err(StateMutationError::WriteClients)?;
 
         self.psks.borrow_mut().remove(client);
         let psk_content = self.psks.borrow().render();
-        crate::atomic_fs::atomic_write(
+        atomic_write(
             &self.psk_file_path,
             psk_content.into_bytes(),
             PSK_FILE_MODE,
@@ -317,7 +319,7 @@ fn render_clients_doc(
             note: c.note.clone(),
         })
         .collect();
-    serde_json::to_vec_pretty(&crate::config::ClientsFile { clients: entries })
+    serde_json::to_vec_pretty(&ClientsFile { clients: entries })
 }
 
 /// Statistics returned from `Service::run` so main can log the
@@ -486,7 +488,7 @@ impl Service {
                             evt = %EventKind::Selfcheck,
                             provider = %provider.host(),
                             ok = false,
-                            error = %crate::logging::ErrorChain(&e),
+                            error = %ErrorChain(&e),
                         );
                     }
                 }
@@ -513,7 +515,7 @@ impl Service {
         let admin_state = state.clone();
         let admin_handle = compio::runtime::spawn(async move {
             if let Err(e) = crate::admin::run_admin_loop(admin_listener, admin_state).await {
-                tracing::error!(error = %crate::logging::ErrorChain(&e), "admin loop exited");
+                tracing::error!(error = %ErrorChain(&e), "admin loop exited");
             }
         });
 
@@ -595,7 +597,7 @@ impl SharedState {
     pub fn lookup_provider(
         &self,
         kind: ProviderKind,
-    ) -> Option<&(dyn crate::providers::Provider + '_)> {
+    ) -> Option<&(dyn Provider + '_)> {
         self.providers.get(&kind).map(|b| b.as_ref())
     }
 }
@@ -1176,7 +1178,7 @@ fn log_mint_error(client_name: &str, host: &str, path: &str, provider_ms: u64, e
                 provider = %host,
                 repo = %path,
                 provider_ms = provider_ms,
-                error = %crate::logging::ErrorChain(&err),
+                error = %ErrorChain(&err),
             );
         }
     }

@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use synchrony::sync::event::Event;
 use thin_cell::unsync::ThinCell;
 
-pub(crate) struct ConnectionTracker {
+pub struct ConnectionTracker {
     active: ThinCell<usize>,
     empty: Rc<Event>,
     per_handler_timeout: Duration,
@@ -54,13 +54,13 @@ impl Drop for Token {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct DrainStats {
+pub struct DrainStats {
     pub inflight_drained: usize,
     pub drain_complete: bool,
 }
 
 impl ConnectionTracker {
-    pub(crate) fn new(per_handler_timeout: Duration, drain_deadline: Duration) -> Self {
+    pub fn new(per_handler_timeout: Duration, drain_deadline: Duration) -> Self {
         Self {
             active: ThinCell::new(0),
             empty: Rc::new(Event::new()),
@@ -72,7 +72,7 @@ impl ConnectionTracker {
     /// Spawn a connection handler bounded by `per_handler_timeout`.
     /// The handler is detached; the tracker counts in-flight
     /// handlers and notifies `drain` when the count returns to zero.
-    pub(crate) fn spawn<F>(&self, handler: F)
+    pub fn spawn<F>(&self, handler: F)
     where
         F: AsyncFnOnce() + 'static,
     {
@@ -95,7 +95,7 @@ impl ConnectionTracker {
     /// outstanding handlers to finish. After the deadline, spawned
     /// tasks keep running until their own `per_handler_timeout`
     /// expires; they are not forcibly cancelled by `drain`.
-    pub(crate) async fn drain(self) -> DrainStats {
+    pub async fn drain(self) -> DrainStats {
         let start = Instant::now();
         let initial = *self.active.borrow();
         let drain_complete = loop {

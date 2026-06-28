@@ -49,10 +49,10 @@ const PER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 // Wire types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize, strum::IntoStaticStr)]
+#[derive(Debug, Serialize, Deserialize, strum::IntoStaticStr)]
 #[serde(tag = "op", rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
-pub(crate) enum Request {
+pub enum Request {
     Status,
     List,
     Enroll {
@@ -86,20 +86,20 @@ pub(crate) enum Request {
 // return `Result<TypedResponse, ErrorResponse>`; the top of `dispatch`
 // turns either side into wire bytes.
 
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct StatusResponse {
+#[derive(Debug, Serialize)]
+pub struct StatusResponse {
     uptime_sec: u64,
     providers: Vec<ProviderKind>,
     client_count: usize,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct ListResponse {
+#[derive(Debug, Serialize)]
+pub struct ListResponse {
     clients: Vec<ListEntry>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct ListEntry {
+#[derive(Debug, Serialize)]
+pub struct ListEntry {
     name: Identity,
     providers: Vec<ProviderKind>,
     #[serde(with = "time::serde::rfc3339")]
@@ -107,8 +107,8 @@ pub(crate) struct ListEntry {
     note: Option<Note>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct MintResponse {
+#[derive(Debug, Serialize)]
+pub struct MintResponse {
     username: String,
     password: String,
     expires_at_unix: u64,
@@ -118,15 +118,15 @@ pub(crate) struct MintResponse {
 
 /// Serializes to `{}`; combined with [`OkEnvelope`] yields the bare
 /// `{"ok": true}` ack used by `enroll` and `revoke`.
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct Ack {}
+#[derive(Debug, Serialize)]
+pub struct Ack {}
 
 /// `{"ok": false, "error": "…"}`. No `code` tag — operators key on
 /// the human-readable `error` message (or follow the matching log
 /// line via `req_id`); the wire isn't a programmatic-discrimination
 /// surface.
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct ErrorResponse {
+#[derive(Debug, Serialize)]
+pub struct ErrorResponse {
     ok: bool,
     error: String,
 }
@@ -171,7 +171,7 @@ impl<T> OkEnvelope<T> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum CliCommand {
     Status,
     List,
@@ -223,12 +223,6 @@ impl CliCommand {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdminError {
-    #[error("admin socket bind failed at {}", path.display())]
-    Bind {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
     #[error("admin accept failed")]
     Accept(#[source] std::io::Error),
     #[error("failed to connect to admin socket at {}", path.display())]
@@ -243,21 +237,13 @@ pub enum AdminError {
     RequestParse(#[source] serde_json::Error),
     #[error("malformed admin response")]
     ResponseParse(#[source] serde_json::Error),
-    #[error("admin response carried an error: {0}")]
-    RemoteError(String),
-    #[error("atomic write of {} failed", path.display())]
-    AtomicWrite {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
 }
 
 // ---------------------------------------------------------------------------
 // Daemon-side: accept loop
 // ---------------------------------------------------------------------------
 
-pub(crate) async fn run_admin_loop(
+pub async fn run_admin_loop(
     listener: UnixListener,
     state: Rc<SharedState>,
 ) -> Result<(), AdminError> {

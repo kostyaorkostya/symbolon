@@ -19,7 +19,7 @@
 use std::io::Write;
 use std::time::SystemTime;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Request {
     pub protocol: String,
     pub host: String,
@@ -33,7 +33,7 @@ pub struct Request {
     pub client_supports_authtype: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Response {
     pub username: String,
     pub password: String,
@@ -126,7 +126,7 @@ impl Request {
     /// Per-value byte cap. Real-world host/path values run hundreds of
     /// bytes at most; this defends against pathological values without
     /// restricting any plausible repo URL.
-    pub const MAX_VALUE_BYTES: usize = 4 * 1024;
+    const MAX_VALUE_BYTES: usize = 4 * 1024;
 
     /// Absolute parser ceiling for the entire request block. Direct
     /// callers (fuzz harnesses, in-process tests) hit this; the daemon
@@ -284,7 +284,7 @@ impl Response {
     ///   for our 1-hour-TTL installation tokens.
     /// - `username` is omitted: when `credential` is set, the
     ///   git-credential spec says `username` / `password` are not used.
-    pub(crate) fn encode(&self, out: &mut Vec<u8>, client_supports_authtype: bool) {
+    pub fn encode(&self, out: &mut Vec<u8>, client_supports_authtype: bool) {
         let expiry_secs = self.password_expiry_unix_secs();
 
         if client_supports_authtype {

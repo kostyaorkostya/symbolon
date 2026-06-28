@@ -24,7 +24,7 @@ use std::rc::Rc;
 
 use synchrony::sync::event::Event;
 
-pub(crate) struct SingleflightCache<K, V>(RefCell<HashMap<K, StoreEntry<V>>>);
+pub struct SingleflightCache<K, V>(RefCell<HashMap<K, StoreEntry<V>>>);
 
 impl<K, V> Default for SingleflightCache<K, V> {
     fn default() -> Self {
@@ -63,7 +63,7 @@ where
     /// most once per (key, resolution-cycle). Success populates
     /// the memo; failure invalidates the in-flight marker so the
     /// next caller re-resolves.
-    pub(crate) async fn with<E>(
+    pub async fn with<E>(
         &self,
         key: &K,
         resolve: impl AsyncFnOnce() -> Result<V, E>,
@@ -97,7 +97,7 @@ where
     /// GitHub provider calls this when a follow-up mint returns
     /// 404, meaning the cached repo-id no longer refers to a
     /// reachable repository.
-    pub(crate) fn invalidate(&self, key: &K) {
+    pub fn invalidate(&self, key: &K) {
         self.0.borrow_mut().remove(key);
     }
 

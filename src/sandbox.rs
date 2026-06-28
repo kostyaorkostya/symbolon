@@ -21,9 +21,8 @@ use std::io;
 use std::path::PathBuf;
 
 use landlock::{
-    ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath,
-    PathFd, PathFdError, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetError, RulesetStatus,
-    Scope,
+    Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath, PathFd,
+    PathFdError, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetError, RulesetStatus, Scope, ABI,
 };
 
 use crate::config::SandboxMode;
@@ -31,7 +30,7 @@ use crate::events::EventKind;
 
 /// Filesystem paths the daemon needs after restriction. Anything
 /// not listed here becomes unreachable.
-pub(crate) struct SandboxPaths {
+pub struct SandboxPaths {
     /// Files needing `ReadFile` only.
     pub read_files: Vec<PathBuf>,
     /// Dirs needing `ReadFile | ReadDir` (e.g. CA-bundle dirs).
@@ -51,8 +50,8 @@ pub(crate) struct SandboxPaths {
 
 /// What `apply` actually managed to put in place. Reported back so the
 /// daemon can log a structured `sandbox_applied` event.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct SandboxOutcome {
+#[derive(Debug)]
+pub struct SandboxOutcome {
     /// Landlock ABI we built the ruleset against (always 6 unless
     /// `Off`).
     pub requested_abi: u8,
@@ -67,7 +66,7 @@ pub(crate) struct SandboxOutcome {
 /// form for the `sandbox_applied` log event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::Display)]
 #[strum(serialize_all = "snake_case")]
-pub(crate) enum SandboxStatus {
+pub enum SandboxStatus {
     Off,
     FullyEnforced,
     PartiallyEnforced,
@@ -95,7 +94,7 @@ pub enum SandboxError {
 /// Apply Landlock to the calling thread. Effects persist for the
 /// lifetime of the thread and propagate to descendants. Only call
 /// once per process.
-pub(crate) fn apply(
+pub fn apply(
     level: SandboxMode,
     paths: &SandboxPaths,
 ) -> Result<SandboxOutcome, SandboxError> {

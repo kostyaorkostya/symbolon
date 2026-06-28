@@ -19,6 +19,7 @@
 use std::borrow::Borrow;
 
 use derive_more::Display;
+use serde::{Deserialize, Serialize};
 
 /// Validation failures from [`Identity::parse`].
 #[derive(Debug, thiserror::Error)]
@@ -39,9 +40,7 @@ pub enum IdentityError {
 /// `Identity::parse` (rejecting bad identities at JSON-parse time)
 /// and serialise emits the bare string the rest of the codebase
 /// expects on the wire and on disk.
-#[derive(
-    Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Display, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Clone, PartialEq, Eq, Hash, Display, Serialize, Deserialize)]
 #[serde(into = "String", try_from = "String")]
 pub struct Identity(String);
 

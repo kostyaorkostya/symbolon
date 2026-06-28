@@ -11,7 +11,7 @@
 
 use strum::{Display, IntoStaticStr};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoStaticStr, Display)]
+#[derive(Debug, IntoStaticStr, Display)]
 #[strum(serialize_all = "snake_case")]
 pub enum EventKind {
     Accept,

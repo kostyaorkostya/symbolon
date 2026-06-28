@@ -106,7 +106,7 @@ pub enum ProviderError {
 /// abstract outcome shapes and on the `provider_call_done`
 /// breadcrumb. For GitHub, this is `X-GitHub-Request-Id`. Other
 /// providers fill it from whatever their equivalent header is.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, AsRef, Display, From, Serialize, Deserialize)]
+#[derive(Debug, Clone, AsRef, Display, From, Serialize)]
 #[as_ref(str)]
 #[from(String)]
 #[serde(transparent)]
@@ -118,14 +118,14 @@ impl ProviderReqId {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct MintOutcome {
     pub response: crate::git_credential::Response,
     pub out_req_id: OutReqId,
     pub provider_req_id: Option<ProviderReqId>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 pub struct SelfcheckOutcome {
     pub out_req_id: OutReqId,
     pub provider_req_id: Option<ProviderReqId>,

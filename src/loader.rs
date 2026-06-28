@@ -19,7 +19,7 @@ pub async fn load_config(path: &Path) -> io::Result<Config> {
 
 /// Load and parse `clients.json`. Same wrapping convention as
 /// `load_config`.
-pub(crate) async fn load_clients_file(path: &Path) -> io::Result<ClientsFile> {
+pub async fn load_clients_file(path: &Path) -> io::Result<ClientsFile> {
     let text = read_utf8(path).await?;
     ClientsFile::parse(&text).map_err(io::Error::other)
 }

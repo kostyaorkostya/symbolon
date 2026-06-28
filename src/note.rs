@@ -15,7 +15,7 @@
 //! validation rule cannot drift between callers (CLI argv, admin
 //! wire deserialise, `clients.json` load).
 
-use derive_more::Display;
+use serde::{Deserialize, Serialize};
 
 /// Validation failures from [`Note::parse`].
 #[derive(Debug, thiserror::Error)]
@@ -31,7 +31,7 @@ pub enum NoteError {
 ///
 /// Serde uses `try_from`/`into` so deserialise re-runs `Note::parse`
 /// and serialise emits the bare string.
-#[derive(Clone, Debug, PartialEq, Eq, Display, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(into = "String", try_from = "String")]
 pub struct Note(String);
 

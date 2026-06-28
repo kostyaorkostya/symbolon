@@ -20,9 +20,10 @@ use compio::BufResult;
 use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use compio::net::{TcpListener, UnixListener};
 use compio::runtime::CancelToken;
+use synchrony::unsync::mutex::Mutex;
 use tracing::{info, warn};
 
-use crate::config::{ClientsFile, Config};
+use crate::config::{ClientEntry, ClientsFile, Config};
 use crate::connection_tracker::ConnectionTracker;
 use crate::cpu_worker::CpuWorker;
 use crate::events::EventKind;
@@ -126,13 +127,37 @@ pub(crate) struct ResolvedClient {
 /// opaque `Rc<SharedState>` — they can hold and pass it around but
 /// not peek at internals.
 pub struct SharedState {
-    /// Identity → metadata. Mutated by admin enroll/revoke. Lookup keyed
-    /// on the PSK identity surfaced by the Noise prelude.
+    /// Single-permit async mutex serialising `enroll_client` /
+    /// `revoke_client`. Listed first as a reminder that the `clients`
+    /// and `psks` fields below are mutator-serialised through it.
+    /// Rust has no compile-time `GUARDED_BY` analogue (clang's thread-
+    /// safety attributes don't exist in rustc); the field-level doc
+    /// comments are the convention.
+    ///
+    /// Without this, two admin handlers running concurrently can
+    /// interleave their `psks` / `clients` mutations across
+    /// `atomic_write` `.await`s, race their on-disk writes, and leave
+    /// the file out of sync with in-memory state. Reads (status /
+    /// list / mint / selfcheck) bypass the lock — they don't mutate.
+    pub(crate) mutation_lock: Mutex<()>,
+    /// Identity → metadata. Mutated by admin enroll/revoke. Lookup
+    /// keyed on the PSK identity surfaced by the Noise prelude.
+    ///
+    /// **GUARDED_BY:** writes MUST hold [`Self::mutation_lock`] across
+    /// the full enroll/revoke sequence. Reads are lock-free — both the
+    /// TCP hot path (`Step::NeedPsk` → `psks.lookup` immediately
+    /// followed by `clients.contains_key`) and the admin read ops
+    /// (status / list / mint / selfcheck) borrow without the lock.
+    /// Mutators must update this and `psks` together (in-memory) BEFORE
+    /// releasing visibility to readers, so a concurrent mint never
+    /// sees a half-enrolled client.
     pub(crate) clients: RefCell<HashMap<Identity, ResolvedClient>>,
     /// Identity → 32-byte PSK. Same identities as `clients` (the
     /// `enroll`/`revoke` admin paths keep them in lock-step). Daemon
     /// reads this on every accepted connection to seed the Noise
     /// responder.
+    ///
+    /// **GUARDED_BY:** see [`Self::clients`] — same rule.
     pub(crate) psks: RefCell<PskStore>,
     /// One concrete provider per configured `[provider.<name>]`
     /// section. Admin dispatch looks up by `ProviderKind` key; wire
@@ -167,8 +192,6 @@ pub(crate) enum StateMutationError {
     WritePsks(#[source] std::io::Error),
     #[error("write clients.json")]
     WriteClients(#[source] std::io::Error),
-    #[error("read clients.json: {0}")]
-    ReadClients(String),
     #[error("encode clients.json")]
     EncodeClients(#[source] serde_json::Error),
 }
@@ -188,30 +211,49 @@ impl SharedState {
         provider: ProviderKind,
         note: Option<Note>,
     ) -> Result<(), StateMutationError> {
+        // Serialise with other state mutations. Acquired first so the
+        // duplicate-check sees a stable snapshot — without this, two
+        // concurrent enrolls of the same identity could both pass the
+        // `contains_key` check and race their on-disk writes.
+        let _guard = self.mutation_lock.lock().await;
         if self.clients.borrow().contains_key(&client) {
             return Err(StateMutationError::ClientAlreadyEnrolled(client));
         }
 
-        // RAII rollback: insert into in-memory PSK store; if any of
-        // the on-disk writes fail (or the in-memory clients insert
-        // doesn't reach `commit_client = None`), Drop removes the
-        // PSK entry so the two in-memory tables stay in lockstep.
+        // RAII rollback: insert into BOTH in-memory tables atomically
+        // BEFORE any disk write. A concurrent mint (TCP path, lock-
+        // free reads) thus never sees a half-enrolled client — either
+        // both `psks` and `clients` are populated or neither. If any
+        // disk write fails (or the function unwinds), Drop removes
+        // both, restoring the pre-enroll state.
         struct Rollback<'a> {
-            psks: &'a std::cell::RefCell<PskStore>,
+            psks: &'a RefCell<PskStore>,
+            clients: &'a RefCell<HashMap<Identity, ResolvedClient>>,
             client: Option<Identity>,
         }
         impl Drop for Rollback<'_> {
             fn drop(&mut self) {
                 if let Some(c) = self.client.take() {
                     self.psks.borrow_mut().remove(&c);
+                    self.clients.borrow_mut().remove(&c);
                 }
             }
         }
 
+        let enrolled_at = time::OffsetDateTime::now_utc();
         self.psks.borrow_mut().insert(client.clone(), psk);
+        self.clients.borrow_mut().insert(
+            client.clone(),
+            ResolvedClient {
+                providers: vec![provider],
+                enrolled_at,
+                note: note.clone(),
+            },
+        );
         let mut rollback = Rollback {
             psks: &self.psks,
-            client: Some(client.clone()),
+            clients: &self.clients,
+            client: Some(client),
         };
 
         let psk_content = self.psks.borrow().render();
@@ -223,32 +265,16 @@ impl SharedState {
         .await
         .map_err(StateMutationError::WritePsks)?;
 
-        let enrolled_at = time::OffsetDateTime::now_utc();
-        let mut clients_doc = read_clients_doc(&self.clients_file_path)
-            .await
-            .map_err(StateMutationError::ReadClients)?;
-        clients_doc.clients.push(crate::config::ClientEntry {
-            name: client.to_string(),
-            providers: vec![provider],
-            enrolled_at,
-            note: note.clone(),
-        });
-        let clients_bytes =
-            serde_json::to_vec_pretty(&clients_doc).map_err(StateMutationError::EncodeClients)?;
+        // Render clients.json from in-memory state (which now includes
+        // the new entry). The daemon is the sole writer of state files
+        // (AGENTS.md invariant #10), so in-memory is the truth.
+        let clients_bytes = render_clients_doc(&self.clients.borrow(), None)
+            .map_err(StateMutationError::EncodeClients)?;
         crate::atomic_fs::atomic_write(&self.clients_file_path, clients_bytes, CLIENTS_FILE_MODE)
             .await
             .map_err(StateMutationError::WriteClients)?;
 
-        self.clients.borrow_mut().insert(
-            client,
-            ResolvedClient {
-                providers: vec![provider],
-                enrolled_at,
-                note,
-            },
-        );
         rollback.client = None; // commit
-
         Ok(())
     }
 
@@ -258,15 +284,14 @@ impl SharedState {
     /// harmless (unreachable on next start because clients.json no
     /// longer carries the identity).
     pub(crate) async fn revoke_client(&self, client: &Identity) -> Result<(), StateMutationError> {
+        let _guard = self.mutation_lock.lock().await;
         if !self.clients.borrow().contains_key(client) {
             return Err(StateMutationError::UnknownClient(client.to_string()));
         }
-        let mut clients_doc = read_clients_doc(&self.clients_file_path)
-            .await
-            .map_err(StateMutationError::ReadClients)?;
-        clients_doc.clients.retain(|c| c.name != client.as_str());
-        let clients_bytes =
-            serde_json::to_vec_pretty(&clients_doc).map_err(StateMutationError::EncodeClients)?;
+        // Render clients.json from in-memory state minus the revoked
+        // entry. In-memory is the truth (AGENTS.md invariant #10).
+        let clients_bytes = render_clients_doc(&self.clients.borrow(), Some(client))
+            .map_err(StateMutationError::EncodeClients)?;
         crate::atomic_fs::atomic_write(&self.clients_file_path, clients_bytes, CLIENTS_FILE_MODE)
             .await
             .map_err(StateMutationError::WriteClients)?;
@@ -286,19 +311,26 @@ impl SharedState {
     }
 }
 
-async fn read_clients_doc(path: &Path) -> Result<crate::config::ClientsFile, String> {
-    match compio::fs::read(path).await {
-        Ok(bytes) => {
-            let text = std::str::from_utf8(&bytes)
-                .map_err(|e| format!("non-utf8 {}: {e}", path.display()))?;
-            crate::config::ClientsFile::parse(text)
-                .map_err(|e| format!("parse {}: {e}", path.display()))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(crate::config::ClientsFile {
-            clients: Vec::new(),
-        }),
-        Err(e) => Err(format!("read {}: {e}", path.display())),
-    }
+/// Build the on-disk JSON for `clients.json` from the in-memory state.
+/// `skip` is set during a revoke (the revoked identity hasn't been
+/// removed from the in-memory map yet); `None` otherwise. The daemon
+/// is the sole writer of the file (AGENTS.md invariant #10), so the
+/// in-memory map is the source of truth — no read-merge dance.
+fn render_clients_doc(
+    clients: &HashMap<Identity, ResolvedClient>,
+    skip: Option<&Identity>,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let entries: Vec<ClientEntry> = clients
+        .iter()
+        .filter(|(id, _)| Some(*id) != skip)
+        .map(|(id, c)| ClientEntry {
+            name: id.to_string(),
+            providers: c.providers.clone(),
+            enrolled_at: c.enrolled_at,
+            note: c.note.clone(),
+        })
+        .collect();
+    serde_json::to_vec_pretty(&crate::config::ClientsFile { clients: entries })
 }
 
 /// Statistics returned from `Service::run` so main can log the
@@ -443,6 +475,7 @@ impl Service {
         }
 
         let state = Rc::new(SharedState {
+            mutation_lock: Mutex::new(()),
             clients: RefCell::new(clients_table),
             psks: RefCell::new(psk_store),
             providers,
@@ -1318,6 +1351,7 @@ async fn write_all_bytes<W: AsyncWrite>(stream: &mut W, payload: Vec<u8>) -> std
 mod tests {
     use super::*;
     use crate::config::ClientEntry;
+    use synchrony::unsync::mutex::Mutex;
 
     fn fixture_time() -> time::OffsetDateTime {
         time::OffsetDateTime::parse(
@@ -1386,6 +1420,7 @@ mod tests {
         let nonexistent_psk =
             std::env::temp_dir().join(format!("symbolon-reload-test-psks-{}", ulid::Ulid::new()));
         let state = Rc::new(SharedState {
+            mutation_lock: Mutex::new(()),
             clients: RefCell::new({
                 let mut m = HashMap::new();
                 m.insert(

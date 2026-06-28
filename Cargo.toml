@@ -55,7 +55,7 @@ snow = { version = "0.10", default-features = false, features = [
   "std",
 ] }
 strum = { version = "0.28.0", features = ["derive"] }
-synchrony = { version = "0.1.8", features = ["async_flag", "event"] }
+synchrony = { version = "0.1.8", features = ["async_flag", "event", "mutex"] }
 thin-cell = "0.2.1"
 thiserror = "2.0.18"
 time = { version = "0.3.47", default-features = false, features = [

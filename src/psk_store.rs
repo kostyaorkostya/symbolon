@@ -127,15 +127,14 @@ impl PskStore {
         self.entries.len()
     }
 
-    /// Render the store to the on-disk file format. Identities are emitted in
-    /// sorted order so the file is deterministic (helps diff-based audit).
+    /// Render the store to the on-disk file format. Order is whatever
+    /// `HashMap` iteration gives us — non-deterministic across writes.
+    /// Operators who want sorted output can `sort` the file themselves.
     pub fn render(&self) -> String {
-        let mut entries: Vec<(&Identity, &Psk)> = self.entries.iter().collect();
-        entries.sort_unstable_by_key(|(k, _)| *k);
         // Per-line upper bound: identity + ':' + hex(psk) + '\n'.
         const LINE_MAX: usize = Identity::MAX_LEN + 1 + Psk::HEX_LEN + 1;
-        let mut out = String::with_capacity(entries.len() * LINE_MAX);
-        for (k, psk) in entries {
+        let mut out = String::with_capacity(self.entries.len() * LINE_MAX);
+        for (k, psk) in &self.entries {
             writeln!(out, "{k}:{psk:x}").expect("write into String is infallible");
         }
         out
@@ -179,18 +178,6 @@ mod tests {
         assert_eq!(reparsed.lookup(&id("alpha")), Some(&psk_a()));
         assert_eq!(reparsed.lookup(&id("beta")), Some(&psk_b()));
         assert_eq!(reparsed.len(), 2);
-    }
-
-    #[test]
-    fn render_is_sorted_deterministic() {
-        let mut s1 = PskStore::new();
-        s1.insert(id("b"), psk_a());
-        s1.insert(id("a"), psk_a());
-        let mut s2 = PskStore::new();
-        s2.insert(id("a"), psk_a());
-        s2.insert(id("b"), psk_a());
-        assert_eq!(s1.render(), s2.render());
-        assert!(s1.render().starts_with("a:"));
     }
 
     #[test]

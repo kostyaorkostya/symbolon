@@ -316,6 +316,10 @@ git config --global \
    --endpoint broker.lan:9418 \
    --identity test-vm \
    --psk-file /etc/symbolon/psk"
+# Required so git sends `path=owner/repo` on credential queries —
+# the broker mints per-repo and rejects the request as
+# `malformed_request` without it.
+git config --global credential.https://github.com.useHttpPath true
 
 # 3. Clone — exercises the modern auth flow.
 git clone https://github.com/<owner>/<repo>.git /tmp/sb-test

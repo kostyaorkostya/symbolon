@@ -437,6 +437,14 @@ git config --global credential.https://github.com.helper \
    --endpoint <broker-host>:9418 \
    --identity dev-vm-1 \
    --psk-file /etc/symbolon/psk"
+
+# Required: the broker mints per-repo tokens, so it MUST know the
+# `owner/repo` from the request. Git omits the `path=` field on
+# credential queries by default; this flag tells it to send it.
+# Without it, the first clone fails with
+# `evt=mint_denied reason=malformed_request` because `path` is
+# absent from the request block.
+git config --global credential.https://github.com.useHttpPath true
 ```
 
 ### 4.3 Verify

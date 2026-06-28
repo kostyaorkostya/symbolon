@@ -8,16 +8,8 @@ description = "Daemon that mints short-lived, single-repository git credentials 
 [dependencies]
 argh = { version = "0.1.19", default-features = false, features = ["help"] }
 async-trait = "0.1.89"
-base64 = "0.22"
-compio = { version = "0.19", features = [
-  "fs",
-  "io-uring",
-  "macros",
-  "net",
-  "ring",
-  "runtime",
-  "time",
-] }
+base64 = "0.22.1"
+compio = { version = "0.19.1", features = ["fs", "io-uring", "macros", "net", "ring", "runtime", "time"] }
 cyper = { version = "0.9", default-features = false, features = [
   "rustls",
   "http2",
@@ -58,13 +50,7 @@ strum = { version = "0.28.0", features = ["derive"] }
 synchrony = { version = "0.1.8", features = ["async_flag", "event", "mutex"] }
 thin-cell = "0.2.1"
 thiserror = "2.0.18"
-time = { version = "0.3.47", default-features = false, features = [
-  "parsing",
-  "formatting",
-  "serde",
-  "serde-well-known",
-  "std",
-] }
+time = { version = "0.3.51", default-features = false, features = ["parsing", "formatting", "serde", "serde-well-known", "std"] }
 toml = "1.1.2"
 tracing = { version = "0.1.44", default-features = false, features = [
   "std",

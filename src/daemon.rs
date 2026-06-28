@@ -18,7 +18,7 @@ use futures_util::FutureExt;
 
 use compio::BufResult;
 use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use compio::net::{TcpListener, TcpStream, UnixListener};
+use compio::net::{TcpListener, UnixListener};
 use compio::runtime::CancelToken;
 use tracing::{info, warn};
 
@@ -549,7 +549,7 @@ impl Service {
             futures_util::select_biased! {
                 _ = state.shutdown.clone().wait().fuse() => break,
                 accept_res = listener.accept().fuse() => {
-                    let (stream, _peer) = accept_res.map_err(DaemonError::Accept)?;
+                    let (stream, peer) = accept_res.map_err(DaemonError::Accept)?;
                     let req_id = ReqId::new();
                     let state = state.clone();
                     // `req_id` carried via `tracing::Span` instead of
@@ -558,7 +558,7 @@ impl Service {
                     let span = tracing::info_span!("conn", req_id = %req_id);
                     tracker.spawn(async move || {
                         use tracing::Instrument;
-                        handle_connection(stream, state).instrument(span).await;
+                        handle_connection(stream, Some(peer), state).instrument(span).await;
                     });
                 }
             }
@@ -878,7 +878,11 @@ impl TryFrom<ClientsFile> for HashMap<Identity, ResolvedClient> {
     }
 }
 
-async fn handle_connection(mut stream: TcpStream, state: Rc<SharedState>) {
+async fn handle_connection<S: AsyncRead + AsyncWrite>(
+    mut stream: S,
+    peer: Option<std::net::SocketAddr>,
+    state: Rc<SharedState>,
+) {
     /// Cross-step state the driver needs to stash so the final
     /// `evt=mint` log event (emitted only after the encrypted
     /// response is on the wire) can see everything from the
@@ -892,7 +896,6 @@ async fn handle_connection(mut stream: TcpStream, state: Rc<SharedState>) {
         provider_ms: u64,
     }
 
-    let peer = stream.peer_addr().ok();
     let mut sess = Responder::new();
     let mut client_name: Option<String> = None;
     let mut mint_record: Option<MintRecord> = None;
@@ -1280,7 +1283,7 @@ fn log_mint_error(client_name: &str, host: &str, path: &str, provider_ms: u64, e
 /// `None` on EOF or I/O error. The chunk buffer is reused across
 /// short-read iterations within this call so a slow peer drips
 /// bytes into one allocation instead of one-per-poll.
-async fn read_exact_n(stream: &mut TcpStream, n: usize) -> Option<Vec<u8>> {
+async fn read_exact_n<R: AsyncRead>(stream: &mut R, n: usize) -> Option<Vec<u8>> {
     let mut out: Vec<u8> = Vec::with_capacity(n);
     let mut chunk: Vec<u8> = Vec::with_capacity(n);
     while out.len() < n {
@@ -1304,7 +1307,7 @@ async fn read_exact_n(stream: &mut TcpStream, n: usize) -> Option<Vec<u8>> {
 }
 
 /// Write all bytes in `payload`, returning Ok on full write.
-async fn write_all_bytes(stream: &mut TcpStream, payload: Vec<u8>) -> std::io::Result<()> {
+async fn write_all_bytes<W: AsyncWrite>(stream: &mut W, payload: Vec<u8>) -> std::io::Result<()> {
     let BufResult(res, _) = stream.write_all(payload).await;
     res.map(|_| ())
 }

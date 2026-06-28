@@ -293,7 +293,7 @@ pub(crate) async fn run_admin_loop(
     Ok(())
 }
 
-async fn handle_admin(mut stream: UnixStream, state: Rc<SharedState>) {
+async fn handle_admin<S: AsyncRead + AsyncWrite>(mut stream: S, state: Rc<SharedState>) {
     let raw = match read_line(&mut stream).await {
         Ok(bytes) if !bytes.is_empty() => bytes,
         _ => return,
@@ -313,14 +313,14 @@ async fn handle_admin(mut stream: UnixStream, state: Rc<SharedState>) {
     let _ = dispatch_and_write(&request, &state, &mut stream).await;
 }
 
-async fn dispatch_and_write(
+async fn dispatch_and_write<W: AsyncWrite>(
     request: &Request,
     state: &Rc<SharedState>,
-    stream: &mut UnixStream,
+    stream: &mut W,
 ) -> std::io::Result<()> {
     match request {
-        Request::Status => write_response::<StatusResponse>(stream, Ok(handle_status(state))).await,
-        Request::List => write_response::<ListResponse>(stream, Ok(handle_list(state))).await,
+        Request::Status => write_response(stream, Ok::<_, ErrorResponse>(handle_status(state))).await,
+        Request::List => write_response(stream, Ok::<_, ErrorResponse>(handle_list(state))).await,
         Request::Enroll {
             provider,
             client,
@@ -475,9 +475,10 @@ pub async fn cli_dispatch(socket_path: &Path, command: CliCommand) -> Result<i32
     match &command {
         CliCommand::GithubEnroll { psk, .. } => {
             let synth = OkEnvelope::new(serde_json::json!({ "psk_hex": format!("{psk:x}") }));
-            let mut bytes = serde_json::to_vec(&synth).map_err(AdminError::ResponseParse)?;
-            bytes.push(b'\n');
-            std::io::Write::write_all(&mut std::io::stdout(), &bytes).map_err(AdminError::Io)?;
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            serde_json::to_writer(&mut out, &synth).map_err(AdminError::ResponseParse)?;
+            std::io::Write::write_all(&mut out, b"\n").map_err(AdminError::Io)?;
         }
         _ => {
             let mut bytes = response_bytes;
@@ -535,7 +536,7 @@ fn check_peer_uid(stream: &UnixStream, my_uid: rustix::process::Uid) -> bool {
     }
 }
 
-async fn read_line(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
+async fn read_line<R: AsyncRead>(stream: &mut R) -> std::io::Result<Vec<u8>> {
     let mut accumulated = Vec::new();
     let mut chunk: Vec<u8> = Vec::with_capacity(1024);
     loop {
@@ -567,8 +568,8 @@ async fn read_line(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
     }
 }
 
-async fn write_response<T: Serialize>(
-    stream: &mut UnixStream,
+async fn write_response<T: Serialize, W: AsyncWrite>(
+    stream: &mut W,
     result: Result<T, ErrorResponse>,
 ) -> std::io::Result<()> {
     let mut payload = match &result {

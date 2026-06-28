@@ -372,7 +372,7 @@ pub async fn client_handshake_and_read_eof(
     }
 }
 
-async fn read_framed(stream: &mut TcpStream) -> Result<Vec<u8>, std::io::Error> {
+async fn read_framed<R: AsyncRead>(stream: &mut R) -> Result<Vec<u8>, std::io::Error> {
     let mut len_buf = read_exact_n(stream, 2).await?;
     let arr: [u8; 2] = len_buf
         .as_slice()
@@ -383,7 +383,7 @@ async fn read_framed(stream: &mut TcpStream) -> Result<Vec<u8>, std::io::Error> 
     read_exact_n(stream, len).await
 }
 
-async fn read_exact_n(stream: &mut TcpStream, n: usize) -> Result<Vec<u8>, std::io::Error> {
+async fn read_exact_n<R: AsyncRead>(stream: &mut R, n: usize) -> Result<Vec<u8>, std::io::Error> {
     let mut out: Vec<u8> = Vec::with_capacity(n);
     while out.len() < n {
         let remaining = n - out.len();

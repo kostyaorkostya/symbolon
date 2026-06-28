@@ -421,8 +421,7 @@ impl Service {
 
         // Post-sandbox: spawn the shared CPU worker (its OS thread
         // inherits the Landlock ruleset via TGID-wide application).
-        let cpu_worker =
-            Rc::new(CpuWorker::new("symbolon-cpu-worker").map_err(DaemonError::CpuWorker)?);
+        let cpu_worker = Rc::new(CpuWorker::new("cpu-worker").map_err(DaemonError::CpuWorker)?);
 
         // Post-sandbox: construct providers with pre-loaded keys.
         // Keyed by `ProviderKind` at the registration site so the
@@ -586,7 +585,6 @@ impl Service {
     }
 }
 
-
 impl SharedState {
     /// Look up the configured provider whose wire-protocol kind
     /// matches `name` (e.g. `"github"` → `ProviderKind::Github`).
@@ -600,7 +598,6 @@ impl SharedState {
     ) -> Option<&(dyn crate::providers::Provider + '_)> {
         self.providers.get(&kind).map(|b| b.as_ref())
     }
-
 }
 
 /// Read the on-disk PSK file and parse it into a `PskStore`. Treats
@@ -1278,5 +1275,4 @@ mod tests {
         let file = ClientsFile { clients: vec![] };
         assert_eq!(HashMap::try_from(file).unwrap().len(), 0);
     }
-
 }

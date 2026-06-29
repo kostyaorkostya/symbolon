@@ -90,7 +90,7 @@ impl Response {
 
 #[derive(Debug, thiserror::Error)]
 pub enum GitCredentialError {
-    #[error("request block is not terminated by an empty line")]
+    #[error("request block is not terminated by a blank line or EOF after a `\\n`")]
     UnterminatedBlock,
     #[error("trailing bytes after the empty terminator line")]
     TrailingBytes,
@@ -154,15 +154,29 @@ impl Request {
                 max: Self::PARSER_HARD_MAX,
             });
         }
-        let term_pos = input
-            .windows(2)
-            .position(|w| w == b"\n\n")
-            .ok_or(GitCredentialError::UnterminatedBlock)?;
-        if term_pos + 2 < input.len() {
-            return Err(GitCredentialError::TrailingBytes);
-        }
+        // Per `git/Documentation/git-credential.adoc` § "The format"
+        // and `git/credential.c::credential_read`, the attribute list
+        // is "terminated by a blank line or end-of-file". Git itself
+        // never writes the blank-line form — `credential_write` emits
+        // `key=value\n` lines then `fclose`s the helper's stdin —
+        // so EOF after a final `\n` is the shape we see in
+        // production. Accept both.
+        let block_end = match input.windows(2).position(|w| w == b"\n\n") {
+            Some(pos) => {
+                if pos + 2 < input.len() {
+                    return Err(GitCredentialError::TrailingBytes);
+                }
+                pos
+            }
+            None => {
+                if input.is_empty() || !input.ends_with(b"\n") {
+                    return Err(GitCredentialError::UnterminatedBlock);
+                }
+                input.len() - 1
+            }
+        };
 
-        let block = &input[..term_pos];
+        let block = &input[..block_end];
 
         let mut protocol: Option<String> = None;
         let mut host: Option<String> = None;
@@ -549,9 +563,28 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_unterminated_block() {
-        let input = b"protocol=https\nhost=github.com\npath=p\n";
+    fn parse_accepts_eof_terminator_no_blank_line() {
+        // The shape `git/credential.c::credential_write` actually
+        // emits — `key=value\n` lines then `fclose`. No blank line.
+        let input = b"protocol=https\nhost=github.com\npath=octocat/Spoon-Knife\n";
+        let req = Request::parse(input).expect("EOF after final \\n is a valid terminator");
+        assert_eq!(req.host, "github.com");
+        assert_eq!(req.path, "octocat/Spoon-Knife");
+    }
+
+    #[test]
+    fn parse_rejects_unterminated_block_no_final_newline() {
+        // Last line missing its trailing `\n` — would mean git was
+        // killed mid-write, or a hand-crafted attack. Not a valid
+        // terminator under either the blank-line or EOF spec form.
+        let input = b"protocol=https\nhost=github.com\npath=p";
         let err = Request::parse(input).unwrap_err();
+        assert!(matches!(err, GitCredentialError::UnterminatedBlock));
+    }
+
+    #[test]
+    fn parse_rejects_empty_input() {
+        let err = Request::parse(b"").unwrap_err();
         assert!(matches!(err, GitCredentialError::UnterminatedBlock));
     }
 

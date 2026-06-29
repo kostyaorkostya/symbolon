@@ -16,7 +16,7 @@ See also:
   contributors.
 
 ## 1. Prerequisites
- 
+
 - A trusted LAN where the broker and clients can reach each other.
   Client identity is proven cryptographically (Noise NNpsk0), so
   client IPs may change freely (DHCP is fine).

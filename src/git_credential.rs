@@ -281,45 +281,48 @@ impl Request {
 impl Response {
     /// Emit the response shape git-credential expects. Infallible by
     /// construction: [`Response::new`] has already validated all
-    /// fields. When `client_supports_authtype` is true (negotiated
-    /// via `capability[]=authtype` in the request), emit the modern
-    /// `authtype=Bearer` + `credential=<token>` + `ephemeral=true`
-    /// shape; otherwise emit the legacy `username`/`password` shape
-    /// for git ≤ 2.45.
+    /// fields.
     ///
-    /// The modern shape:
-    /// - **`authtype=Bearer` + `credential=<token>`** produces the
-    ///   `Authorization: Bearer <token>` header git constructs in
-    ///   `http.c::http_append_auth_header` — the same form GitHub's
-    ///   REST API documents (the git-HTTP frontend accepts it too,
-    ///   though that's not explicitly documented).
-    /// - **`ephemeral=true`** tells downstream credential helpers
-    ///   (cache, store) NOT to persist the credential — load-bearing
-    ///   for our 1-hour-TTL installation tokens.
-    /// - `username` is omitted: when `credential` is set, the
-    ///   git-credential spec says `username` / `password` are not used.
+    /// Always emits the legacy `username=x-access-token` +
+    /// `password=<token>` shape — the only auth scheme `github.com`'s
+    /// git-HTTP smart-HTTP backend accepts. The modern
+    /// `authtype=Bearer credential=<token>` shape (which
+    /// `git/http.c::http_append_auth_header` would render as
+    /// `Authorization: Bearer <token>`) is accepted by GitHub's REST
+    /// API at `api.github.com` but rejected by `github.com` git-HTTP
+    /// with HTTP 401, surfaced to the user as
+    /// `remote: invalid credentials`. Verified empirically (curl with
+    /// `-H "Authorization: Bearer …"` → 401, with `-u x-access-token:…`
+    /// → 200). `git-credential-manager` (Microsoft, bundled with
+    /// git-for-Windows) takes the same posture for the same reason.
+    ///
+    /// When the client advertised `capability[]=authtype` in the
+    /// request, we additionally:
+    /// - Echo `capability[]=authtype` so the response is allowed to
+    ///   carry the modern-only `ephemeral` attribute (per
+    ///   git-credential.adoc § "capability" gating).
+    /// - Emit `ephemeral=true` so downstream chained helpers
+    ///   (`credential.helper=cache` / `=store`) do NOT persist this
+    ///   one-hour token to disk / the in-memory cache.
+    ///
+    /// When the client did not advertise the capability, we omit
+    /// both — they would be silently ignored by pre-2.46 git anyway,
+    /// but emitting them outside the negotiated handshake is
+    /// spec-incorrect.
     pub fn encode(&self, out: &mut Vec<u8>, client_supports_authtype: bool) {
         let expiry_secs = self.password_expiry_unix_secs();
 
         if client_supports_authtype {
-            // Modern shape (git 2.46+ after authtype capability negotiation).
-            // The token in `self.password` IS the bearer credential.
             out.extend_from_slice(b"capability[]=authtype\n");
-            out.extend_from_slice(b"authtype=Bearer\n");
-            out.extend_from_slice(b"credential=");
-            out.extend_from_slice(self.password.as_bytes());
-            out.push(b'\n');
+        }
+        out.extend_from_slice(b"username=");
+        out.extend_from_slice(self.username.as_bytes());
+        out.push(b'\n');
+        out.extend_from_slice(b"password=");
+        out.extend_from_slice(self.password.as_bytes());
+        out.push(b'\n');
+        if client_supports_authtype {
             out.extend_from_slice(b"ephemeral=true\n");
-        } else {
-            // Legacy shape (git ≤ 2.45 or any client that didn't
-            // declare authtype capability). The `username` is always
-            // `x-access-token` for GitHub installation tokens.
-            out.extend_from_slice(b"username=");
-            out.extend_from_slice(self.username.as_bytes());
-            out.push(b'\n');
-            out.extend_from_slice(b"password=");
-            out.extend_from_slice(self.password.as_bytes());
-            out.push(b'\n');
         }
         // `write!` on Vec<u8> via io::Write formats `expiry_secs`
         // directly into the buffer with no intermediate String.
@@ -664,33 +667,56 @@ mod tests {
     }
 
     #[test]
-    fn emit_modern_shape_when_authtype_negotiated() {
+    fn encode_emits_basic_even_when_authtype_negotiated() {
+        // Regression: github.com's git-HTTP backend only accepts HTTP
+        // Basic — `Authorization: Bearer <token>` is rejected with
+        // 401 ("remote: invalid credentials"). So even when the
+        // client advertised `capability[]=authtype` (git 2.46+), we
+        // emit `username`/`password` for git to render as Basic via
+        // libcurl `CURLOPT_USERPWD`. The `authtype=Bearer` /
+        // `credential=` lines that would land in
+        // `http.c::http_append_auth_header` MUST NOT be present.
         let r = resp("x-access-token", "ghs_xxxxxxxxxxx", 1_700_000_000);
         let mut out = Vec::new();
         r.encode(&mut out, true);
-        assert_eq!(
-            out,
-            b"capability[]=authtype\n\
-              authtype=Bearer\n\
-              credential=ghs_xxxxxxxxxxx\n\
-              ephemeral=true\n\
-              password_expiry_utc=1700000000\n\
-              \n"
+        let body = std::str::from_utf8(&out).unwrap();
+        assert!(
+            body.contains("username=x-access-token\n"),
+            "Basic-auth username field missing; got: {body}"
+        );
+        assert!(
+            body.contains("password=ghs_xxxxxxxxxxx\n"),
+            "Basic-auth password field missing; got: {body}"
+        );
+        assert!(
+            !body.contains("authtype="),
+            "must not emit `authtype=…`; got: {body}"
+        );
+        assert!(
+            !body.contains("credential="),
+            "must not emit `credential=…`; got: {body}"
         );
     }
 
     #[test]
-    fn emit_modern_shape_omits_username() {
-        // Spec: when `credential` is set, `username`/`password` are
-        // not used. The `resp.username` value (always
-        // "x-access-token" for us) must NOT leak into the wire.
+    fn encode_emits_ephemeral_only_when_capability_negotiated() {
         let r = resp("x-access-token", "ghs_tok", 1);
-        let mut out = Vec::new();
-        r.encode(&mut out, true);
-        let body = std::str::from_utf8(&out).unwrap();
-        assert!(!body.contains("username="));
-        assert!(!body.contains("password=")); // distinct from `password_expiry_utc`
-        assert!(body.contains("ephemeral=true\n"));
+
+        // Without capability: no ephemeral hint, no capability echo.
+        let mut without = Vec::new();
+        r.encode(&mut without, false);
+        let body_without = std::str::from_utf8(&without).unwrap();
+        assert!(!body_without.contains("ephemeral="));
+        assert!(!body_without.contains("capability[]=authtype"));
+
+        // With capability: both the echo and the hint must appear.
+        // Spec ties `ephemeral` to the authtype capability gate, so
+        // we may only emit it after the client opts in.
+        let mut with = Vec::new();
+        r.encode(&mut with, true);
+        let body_with = std::str::from_utf8(&with).unwrap();
+        assert!(body_with.contains("capability[]=authtype\n"));
+        assert!(body_with.contains("ephemeral=true\n"));
     }
 
     #[test]

@@ -448,6 +448,7 @@ extending the enum and adding a row below.
 | `enroll` | `provider`, `client` |
 | `revoke` | `provider`, `client` |
 | `cache_invalidated` | `provider`, `repo`, `cause` (`404` \| `ttl_expired`) |
+| `token_cache_hit` | `provider`, `repo` |
 | `sandbox_applied` | `policy` (`required` \| `best_effort` \| `off`), `abi` (Landlock ABI requested; `0` if off), `status` (`fully_enforced` \| `partially_enforced` \| `not_enforced` \| `off`), `fs`, `tcp`, `scope` (bool per Landlock layer actually engaged) |
 | `sandbox_path_skipped` | `path`, `reason` (`enoent` \| `open_failed`), `error` (when applicable): emitted at `debug` for nameservice / CA-bundle paths absent on this host |
 | `prepare` | `version`, `config_path`: emitted by `Service::prepare` once config is loaded and the listening fds have been reclaimed from the supervisor (before selfcheck and readiness) |

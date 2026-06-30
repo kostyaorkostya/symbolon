@@ -121,6 +121,21 @@ pub async fn mount_metadata_token_ok(server: &MockServer) {
 }
 
 pub async fn build_provider(api_base: String) -> GitHubProvider {
+    build_provider_with_clock(api_base, SystemTime::now).await
+}
+
+/// Clock that returns a fixed past instant (2001-09-09T01:46:40Z,
+/// Unix 1_000_000_000). Used in tests that need token-cache hits:
+/// provider responses with `EXPIRES_AT` ("2026-05-31T13:00:00Z") are
+/// in the future relative to this clock, so cached tokens remain valid.
+pub fn past_clock() -> SystemTime {
+    std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000)
+}
+
+pub async fn build_provider_with_clock(
+    api_base: String,
+    clock: fn() -> SystemTime,
+) -> GitHubProvider {
     let cfg = ProviderGithub {
         host: "github.com".to_string(),
         api_base,
@@ -134,7 +149,7 @@ pub async fn build_provider(api_base: String) -> GitHubProvider {
     let key = GitHubProvider::load_key(&cfg).await.unwrap();
     let worker = Rc::new(CpuWorker::new("symbolon-test-jwt-signer").unwrap());
     let cancel = compio::runtime::CancelToken::new();
-    GitHubProvider::with_overrides(&cfg, key, worker, cancel, None, SystemTime::now).unwrap()
+    GitHubProvider::with_overrides(&cfg, key, worker, cancel, None, clock).unwrap()
 }
 
 pub async fn mount_repo_ok(server: &MockServer) {

@@ -246,13 +246,9 @@ impl SharedState {
         };
 
         let psk_content = self.psks.borrow().render();
-        atomic_write(
-            &self.psk_file_path,
-            psk_content.into_bytes(),
-            PSK_FILE_MODE,
-        )
-        .await
-        .map_err(StateMutationError::WritePsks)?;
+        atomic_write(&self.psk_file_path, psk_content.into_bytes(), PSK_FILE_MODE)
+            .await
+            .map_err(StateMutationError::WritePsks)?;
 
         // Render clients.json from in-memory state (which now includes
         // the new entry). The daemon is the sole writer of state files
@@ -287,13 +283,9 @@ impl SharedState {
 
         self.psks.borrow_mut().remove(client);
         let psk_content = self.psks.borrow().render();
-        atomic_write(
-            &self.psk_file_path,
-            psk_content.into_bytes(),
-            PSK_FILE_MODE,
-        )
-        .await
-        .map_err(StateMutationError::WritePsks)?;
+        atomic_write(&self.psk_file_path, psk_content.into_bytes(), PSK_FILE_MODE)
+            .await
+            .map_err(StateMutationError::WritePsks)?;
 
         self.clients.borrow_mut().remove(client);
         Ok(())
@@ -593,10 +585,7 @@ impl SharedState {
     /// to the right provider instance. Wire-side dispatch (the
     /// git-credential `host=` match) lives in `handle_connection`
     /// and uses `provider.host()` instead.
-    pub fn lookup_provider(
-        &self,
-        kind: ProviderKind,
-    ) -> Option<&(dyn Provider + '_)> {
+    pub fn lookup_provider(&self, kind: ProviderKind) -> Option<&(dyn Provider + '_)> {
         self.providers.get(&kind).map(|b| b.as_ref())
     }
 }

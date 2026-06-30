@@ -47,6 +47,7 @@ pub mod signals;
 pub mod singleflight_cache;
 #[doc(hidden)]
 pub mod transport;
+pub mod ttl_cache;
 
 // Curated in-package surface. Cargo forces these to be `pub` because
 // main.rs / tests / fuzz are separate crates from the lib, even

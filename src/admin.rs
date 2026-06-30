@@ -301,7 +301,9 @@ async fn dispatch_and_write<W: AsyncWrite>(
     stream: &mut W,
 ) -> std::io::Result<()> {
     match request {
-        Request::Status => write_response(stream, Ok::<_, ErrorResponse>(handle_status(state))).await,
+        Request::Status => {
+            write_response(stream, Ok::<_, ErrorResponse>(handle_status(state))).await
+        }
         Request::List => write_response(stream, Ok::<_, ErrorResponse>(handle_list(state))).await,
         Request::Enroll {
             provider,

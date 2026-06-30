@@ -40,6 +40,7 @@ use crate::providers::{
     SelfcheckOutcome as AbstractSelfcheckOutcome,
 };
 use crate::singleflight_cache::SingleflightCache;
+use crate::ttl_cache::TtlCache;
 
 pub use crate::config::InstallationId;
 
@@ -49,6 +50,23 @@ pub use crate::config::InstallationId;
 #[from(u64)]
 #[serde(transparent)]
 pub struct RepoId(u64);
+
+/// A GitHub installation access token. `Debug` is redacted so the raw
+/// token never appears in tracing spans, logs, or panic messages.
+#[derive(Clone)]
+struct InstallationToken(String);
+
+impl std::fmt::Debug for InstallationToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
+impl InstallationToken {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 const GITHUB_API_VERSION: &str = "2026-03-10";
 const ACCEPT_HEADER: &str = "application/vnd.github+json";
@@ -211,6 +229,7 @@ pub struct GitHubProvider {
     user_agent: String,
     clock: fn() -> SystemTime,
     repo_ids: SingleflightCache<String, RepoId>,
+    token_cache: TtlCache<String, InstallationToken, SystemTime>,
     selfcheck_timeout: Duration,
     request_timeout: Duration,
     // Cloned from Service::shutdown so HTTPS calls observe shutdown
@@ -289,6 +308,7 @@ impl GitHubProvider {
             user_agent: cfg.user_agent.clone(),
             clock,
             repo_ids: SingleflightCache::default(),
+            token_cache: TtlCache::new(clock),
             selfcheck_timeout: cfg.selfcheck_timeout,
             request_timeout: cfg.request_timeout,
             cancel,
@@ -314,6 +334,22 @@ impl GitHubProvider {
             owner.to_ascii_lowercase(),
             repo.to_ascii_lowercase()
         );
+
+        if let Some((token, expires_at)) = self.token_cache.get_with_expiry(&key) {
+            let response = git_credential::Response::new(
+                "x-access-token".to_string(),
+                token.as_str().to_string(),
+                expires_at,
+            )
+            .expect("cached token passed Response::new at mint time");
+            info!(evt = %EventKind::TokenCacheHit, provider = %self.host, repo = %key);
+            return Ok(AbstractMintOutcome {
+                response,
+                out_req_id: OutReqId::new(),
+                provider_req_id: None,
+            });
+        }
+
         let repo_id = self
             .repo_ids
             .with(&key, async || {
@@ -330,13 +366,24 @@ impl GitHubProvider {
                 .await
             })
             .await?;
-        self.mint_token(repo_id).await.inspect_err(|e| {
+
+        let outcome = self.mint_token(repo_id).await.inspect_err(|e| {
             // Repo deleted/recreated since the resolve — drop the
-            // cached id so the next mint re-resolves.
+            // cached id and any cached token so the next mint
+            // re-resolves and re-mints.
             if matches!(e, GithubError::RepoNotFound) {
                 self.repo_ids.invalidate(&key);
+                self.token_cache.invalidate(&key);
             }
-        })
+        })?;
+
+        self.token_cache.insert(
+            key,
+            InstallationToken(outcome.response.password.clone()),
+            outcome.response.password_expiry_utc,
+        );
+
+        Ok(outcome)
     }
 }
 

@@ -14,9 +14,9 @@ use wiremock::matchers::{body_bytes, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{
-    EXPIRES_AT, OWNER, REPO, REPO_ID, TOKEN, build_provider, canonical_metadata_token_body,
-    canonical_mint_body, mint_path, mount_metadata_token_ok, mount_mint_ok, mount_repo_ok,
-    repo_path,
+    EXPIRES_AT, METADATA_TOKEN, OWNER, REPO, REPO_ID, TOKEN, build_provider,
+    build_provider_with_clock, canonical_metadata_token_body, canonical_mint_body, mint_path,
+    mount_metadata_token_ok, mount_mint_ok, mount_repo_ok, past_clock, repo_path,
 };
 
 #[compio::test]
@@ -80,6 +80,49 @@ async fn mint_uses_cached_repo_id() {
     provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
     provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
     // MockServer's drop verifies `.expect(N)` counts.
+}
+
+#[compio::test]
+async fn mint_uses_cached_token() {
+    let server = MockServer::start().await;
+    // Repo resolve fires once (first mint only; second hits token cache).
+    Mock::given(method("POST"))
+        .and(path(mint_path()))
+        .and(body_bytes(canonical_metadata_token_body()))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(json!({"token": METADATA_TOKEN, "expires_at": EXPIRES_AT})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(repo_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": REPO_ID})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Narrow mint fires once; the second `mint()` call hits the token cache.
+    Mock::given(method("POST"))
+        .and(path(mint_path()))
+        .and(body_bytes(canonical_mint_body()))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(json!({"token": TOKEN, "expires_at": EXPIRES_AT})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // `past_clock` returns Unix 1_000_000_000 (year 2001), making
+    // EXPIRES_AT ("2026-05-31T13:00:00Z", Unix 1_780_232_400) appear
+    // to be in the future so the token cache holds the entry.
+    let provider = build_provider_with_clock(server.uri(), past_clock).await;
+    let o1 = provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
+    let o2 = provider.mint(&format!("{OWNER}/{REPO}")).await.unwrap();
+    assert_eq!(o1.response.password, TOKEN);
+    assert_eq!(o2.response.password, TOKEN);
+    // MockServer drop verifies all three `.expect(1)` counts.
 }
 
 #[compio::test]

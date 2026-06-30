@@ -23,3 +23,6 @@ target
 # Claude Code
 CLAUDE.local.md
 .claude/settings.local.json
+
+# Temporary rustc output files
+rust_out

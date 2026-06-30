@@ -39,6 +39,7 @@ pub enum EventKind {
     Shutdown,
     SignalRegistrationFailed,
     Startup,
+    TokenCacheHit,
 }
 
 #[cfg(test)]

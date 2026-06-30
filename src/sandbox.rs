@@ -21,8 +21,9 @@ use std::io;
 use std::path::PathBuf;
 
 use landlock::{
-    Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath, PathFd,
-    PathFdError, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetError, RulesetStatus, Scope, ABI,
+    ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath,
+    PathFd, PathFdError, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetError, RulesetStatus,
+    Scope,
 };
 
 use crate::config::SandboxMode;
@@ -94,10 +95,7 @@ pub enum SandboxError {
 /// Apply Landlock to the calling thread. Effects persist for the
 /// lifetime of the thread and propagate to descendants. Only call
 /// once per process.
-pub fn apply(
-    level: SandboxMode,
-    paths: &SandboxPaths,
-) -> Result<SandboxOutcome, SandboxError> {
+pub fn apply(level: SandboxMode, paths: &SandboxPaths) -> Result<SandboxOutcome, SandboxError> {
     let compat = match level {
         SandboxMode::Off => {
             return Ok(SandboxOutcome {

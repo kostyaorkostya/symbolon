@@ -1,7 +1,7 @@
 //! `git-credential-symbolon` — client-side git-credential helper.
 //!
 //! Invoked by git per credential request. Reads a git-credential request from
-//! stdin, opens a TCP connection to the symbolon broker, runs the Noise NNpsk0
+//! stdin, opens a TCP connection to the symbolon broker, runs the Noise NKpsk2
 //! initiator handshake, sends the request through the encrypted transport, and
 //! writes the response to stdout.
 //!
@@ -14,8 +14,14 @@
 //! git-credential-symbolon \
 //!     --endpoint broker.lan:9418 \
 //!     --identity dev-vm-1 \
-//!     --psk-file /etc/symbolon/psk get
+//!     --key-file /etc/symbolon/key get
 //! ```
+//!
+//! The key file is one line, `broker_pub_hex:psk_hex` — the broker's
+//! static X25519 public key (from `symbolon pubkey` on the broker)
+//! and this client's PSK (from `symbolon github enroll`), both 64 hex
+//! chars, colon-separated. Same shape as the broker-side `psks` file
+//! (`identity:hex`).
 //! Git always appends an `action` arg (`get`/`store`/`erase`); this helper
 //! only services `get` and exits silently for the rest (store/erase are
 //! no-ops by design — the broker never persists anything to the client).
@@ -30,13 +36,13 @@ use argh::FromArgs;
 use hex::FromHex;
 
 use symbolon::transport::{Initiator, SessionError, Step};
-use symbolon::{Identity, IdentityError, Psk};
+use symbolon::{BrokerPublicKey, Identity, IdentityError, Psk};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// git-credential helper that proxies requests over Noise NNpsk0 to a symbolon broker.
+/// git-credential helper that proxies requests over Noise NKpsk2 to a symbolon broker.
 #[derive(FromArgs)]
 struct Args {
     /// broker endpoint, `host:port` form
@@ -45,9 +51,9 @@ struct Args {
     /// client identity matching the enrolled name on the broker
     #[argh(option)]
     identity: String,
-    /// path to a file containing the 64-hex PSK on a single line
+    /// path to a file containing `broker_pub_hex:psk_hex` on a single line
     #[argh(option)]
-    psk_file: PathBuf,
+    key_file: PathBuf,
     /// git-credential action (`get` / `store` / `erase`). Only `get` is honoured.
     #[argh(positional)]
     action: String,
@@ -93,16 +99,16 @@ fn run(args: &Args) -> Result<(), ClientError> {
         raw: args.identity.clone(),
         source,
     })?;
-    let psk = load_psk(&args.psk_file)?;
+    let (broker_pub, psk) = load_key_file(&args.key_file)?;
     let mut request = Vec::new();
     std::io::stdin()
         .read_to_end(&mut request)
         .map_err(ClientError::ReadStdin)?;
 
     // Build the Initiator BEFORE opening the socket. Validates the
-    // PSK length, so a misconfigured invocation fails fast without a
-    // wasted TCP roundtrip.
-    let sess = Initiator::new(identity, psk, request).map_err(ClientError::Session)?;
+    // key material, so a misconfigured invocation fails fast without
+    // a wasted TCP roundtrip.
+    let sess = Initiator::new(identity, psk, &broker_pub, request).map_err(ClientError::Session)?;
 
     let mut stream = connect(&args.endpoint)?;
     stream
@@ -171,31 +177,38 @@ fn drive(stream: &mut TcpStream, mut sess: Initiator) -> Result<Vec<u8>, ClientE
     }
 }
 
-fn load_psk(path: &Path) -> Result<Psk, ClientError> {
-    let text = std::fs::read_to_string(path).map_err(|source| ClientError::ReadPsk {
+/// Parse the client key file: one line, `broker_pub_hex:psk_hex`.
+/// The colon split is on the FIRST colon; both halves are strict
+/// 64-char hex.
+fn load_key_file(path: &Path) -> Result<(BrokerPublicKey, Psk), ClientError> {
+    let text = std::fs::read_to_string(path).map_err(|source| ClientError::ReadKeyFile {
         path: path.to_path_buf(),
         source,
     })?;
-    Psk::from_hex(text.trim()).map_err(|source| ClientError::BadPsk {
+    let malformed = |detail: &'static str| ClientError::BadKeyFile {
         path: path.to_path_buf(),
-        source,
-    })
+        detail,
+    };
+    let (pub_hex, psk_hex) = text
+        .trim()
+        .split_once(':')
+        .ok_or_else(|| malformed("expected `broker_pub_hex:psk_hex`"))?;
+    let broker_pub = BrokerPublicKey::from_hex(pub_hex)
+        .map_err(|_| malformed("broker public key half is not 64 hex chars"))?;
+    let psk = Psk::from_hex(psk_hex).map_err(|_| malformed("PSK half is not 64 hex chars"))?;
+    Ok((broker_pub, psk))
 }
 
 #[derive(Debug, thiserror::Error)]
 enum ClientError {
-    #[error("reading PSK file {} failed", path.display())]
-    ReadPsk {
+    #[error("reading key file {} failed", path.display())]
+    ReadKeyFile {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("PSK file {} is malformed", path.display())]
-    BadPsk {
-        path: PathBuf,
-        #[source]
-        source: hex::FromHexError,
-    },
+    #[error("key file {} is malformed: {detail}", path.display())]
+    BadKeyFile { path: PathBuf, detail: &'static str },
     #[error("resolving endpoint {endpoint:?} failed")]
     Resolve {
         endpoint: String,

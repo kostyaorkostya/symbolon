@@ -9,7 +9,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{
     CLIENT_ID, OWNER, REPO, TOKEN, admin_request, mount_mint_ok, mount_repo_ok, spawn_daemon,
-    unique_paths_full, write_clients_json, write_psks_file,
+    test_broker_pub, unique_paths_full, write_clients_json, write_psks_file,
 };
 
 #[compio::test]
@@ -23,6 +23,23 @@ async fn admin_status_reports_uptime_and_provider_count() {
     assert_eq!(resp["ok"], serde_json::json!(true));
     assert_eq!(resp["client_count"], 0);
     assert_eq!(resp["providers"], serde_json::json!(["github"]));
+}
+
+#[compio::test]
+async fn admin_pubkey_returns_broker_public_key() {
+    let paths = unique_paths_full();
+    write_clients_json(&paths.clients, &[]);
+    let server = MockServer::start().await;
+    spawn_daemon(&paths, server.uri()).await;
+
+    let resp = admin_request(&paths.admin, serde_json::json!({"op": "pubkey"})).await;
+    assert_eq!(resp["ok"], serde_json::json!(true));
+    // The daemon derives the public key from the same fixed test
+    // private key `common` wrote to disk — assert the exact hex.
+    assert_eq!(
+        resp["broker_public_key"],
+        serde_json::json!(test_broker_pub().to_string())
+    );
 }
 
 #[compio::test]

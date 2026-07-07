@@ -60,12 +60,17 @@ pub struct RuntimeConfig {
 #[serde(deny_unknown_fields)]
 pub struct ListenConfig {
     /// TCP address the daemon binds for inbound client connections.
-    /// Default deployment: `0.0.0.0:9418`. Symbolon terminates Noise NNpsk0
+    /// Default deployment: `0.0.0.0:9418`. Symbolon terminates Noise NKpsk2
     /// in-process.
     pub bind: SocketAddr,
     /// Path to the symbolon-owned PSK store (`identity:hex_psk` per line).
     /// Loaded once at startup; atomically rewritten by enroll/revoke.
     pub psk_file: PathBuf,
+    /// Path to the broker's static X25519 private key: 64 hex chars on
+    /// one line (`openssl rand -hex 32`), mode 0400. Loaded once at
+    /// startup, before the sandbox closes; rotating it requires
+    /// re-enrolling every client (see docs/OPERATIONS.md).
+    pub static_key_file: PathBuf,
 }
 
 /// `[admin]` section.
@@ -272,6 +277,7 @@ mod tests {
 [listen]
 bind = "0.0.0.0:9418"
 psk_file = "/var/lib/symbolon/psks"
+static_key_file = "/etc/symbolon/broker.key"
 
 [admin]
 socket_path = "/run/symbolon/admin.sock"
@@ -296,6 +302,10 @@ selfcheck_timeout = "5s"
         let cfg: Config = toml::from_str(KNOWN_GOOD_CONFIG).unwrap();
         assert_eq!(cfg.listen.bind, "0.0.0.0:9418".parse().unwrap());
         assert_eq!(cfg.listen.psk_file, PathBuf::from("/var/lib/symbolon/psks"));
+        assert_eq!(
+            cfg.listen.static_key_file,
+            PathBuf::from("/etc/symbolon/broker.key")
+        );
         assert_eq!(
             cfg.admin.socket_path,
             PathBuf::from("/run/symbolon/admin.sock")
@@ -350,6 +360,12 @@ selfcheck_timeout = "5s"
     #[test]
     fn config_rejects_missing_client_id() {
         let src = KNOWN_GOOD_CONFIG.replace("client_id = \"Iv23liABCDEFGHIJklmn\"\n", "");
+        assert!(toml::from_str::<Config>(&src).is_err());
+    }
+
+    #[test]
+    fn config_rejects_missing_static_key_file() {
+        let src = KNOWN_GOOD_CONFIG.replace("static_key_file = \"/etc/symbolon/broker.key\"\n", "");
         assert!(toml::from_str::<Config>(&src).is_err());
     }
 

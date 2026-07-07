@@ -98,10 +98,10 @@ where
             .is_some_and(|Reverse((t, _))| t <= now)
         {
             let Reverse((expires_at, k)) = self.expirations.pop().unwrap();
-            if let Entry::Occupied(e) = self.entries.entry(k) {
-                if e.get().1 == expires_at {
-                    e.remove();
-                }
+            if let Entry::Occupied(e) = self.entries.entry(k)
+                && e.get().1 == expires_at
+            {
+                e.remove();
             }
         }
     }

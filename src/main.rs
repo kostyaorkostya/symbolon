@@ -41,6 +41,7 @@ async fn main() -> ExitCode {
         Subcommand::Daemon(_) => run_daemon(config_path).await,
         Subcommand::Status(_) => run_cli(config_path, CliCommand::Status).await,
         Subcommand::List(_) => run_cli(config_path, CliCommand::List).await,
+        Subcommand::Pubkey(_) => run_cli(config_path, CliCommand::Pubkey).await,
         Subcommand::Github(g) => {
             let cmd = match g.cmd {
                 GithubSub::Enroll(a) => {
@@ -66,14 +67,13 @@ async fn main() -> ExitCode {
                                 return ExitCode::from(2);
                             }
                         },
-                        None => {
-                            let mut bytes = [0u8; 32];
-                            if let Err(e) = getrandom::fill(&mut bytes) {
+                        None => match Psk::random() {
+                            Ok(p) => p,
+                            Err(e) => {
                                 eprintln!("symbolon: failed to read OS RNG: {e}");
                                 return ExitCode::from(1);
                             }
-                            Psk::from(bytes)
-                        }
+                        },
                     };
                     CliCommand::GithubEnroll { client, note, psk }
                 }
@@ -213,6 +213,7 @@ enum Subcommand {
     Daemon(DaemonArgs),
     Status(StatusArgs),
     List(ListArgs),
+    Pubkey(PubkeyArgs),
     Github(GithubArgs),
 }
 
@@ -230,6 +231,11 @@ struct StatusArgs {}
 #[derive(FromArgs)]
 #[argh(subcommand, name = "list")]
 struct ListArgs {}
+
+/// print the broker static public key (hex) for client key files
+#[derive(FromArgs)]
+#[argh(subcommand, name = "pubkey")]
+struct PubkeyArgs {}
 
 /// GitHub provider commands
 #[derive(FromArgs)]

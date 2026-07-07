@@ -2,7 +2,7 @@
 //! connection, plus the admin UDS loop.
 //!
 //! Per-connection errors do not propagate: each failure point logs
-//! a structured event (`evt=prelude_invalid` /
+//! a structured event (`evt=identity_invalid` /
 //! `evt=handshake_failed` / `evt=mint_denied` /
 //! `evt=provider_error` / `evt=mint`) and drops the connection.
 //!
@@ -24,6 +24,7 @@ use synchrony::unsync::mutex::Mutex;
 use tracing::{info, warn};
 
 use crate::atomic_fs::atomic_write;
+use crate::broker_key::{BrokerPrivateKey, BrokerPublicKey};
 use crate::config::{ClientEntry, ClientsFile, Config};
 use crate::connection_tracker::ConnectionTracker;
 use crate::cpu_worker::CpuWorker;
@@ -37,6 +38,7 @@ use crate::providers::github::{GitHubProvider, GithubError};
 use crate::providers::{Provider, ProviderError, ProviderKind, ProviderReqId};
 use crate::psk::Psk;
 use crate::psk_store::{PskStore, PskStoreError};
+use crate::rate_limit::TokenBucket;
 use crate::sandbox::{self, SandboxError, SandboxPaths, SandboxStatus};
 use crate::transport::{Phase, Responder, SessionError, Step};
 
@@ -48,6 +50,16 @@ const WIRE_READ_BUDGET: usize = 8 * 1024;
 
 const _WIRE_BUDGET_FITS_PARSER: () =
     assert!(WIRE_READ_BUDGET <= git_credential::Request::PARSER_HARD_MAX);
+
+/// `identity_unknown` warn budget: a burst of 10, then one every 6 s
+/// (10/minute sustained). Probes beyond that are counted and the
+/// count is reported on the next emitted event (`suppressed=N`).
+/// The tolerance is the burst expressed in GCRA time terms:
+/// `(burst - 1) * interval` (see `rate_limit.rs`).
+const UNKNOWN_IDENTITY_LOG_BURST: u32 = 10;
+const UNKNOWN_IDENTITY_LOG_REFILL: Duration = Duration::from_secs(6);
+const UNKNOWN_IDENTITY_LOG_BURST_TOLERANCE: Duration =
+    UNKNOWN_IDENTITY_LOG_REFILL.saturating_mul(UNKNOWN_IDENTITY_LOG_BURST - 1);
 const PER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
@@ -63,6 +75,22 @@ pub enum DaemonError {
         path: PathBuf,
         #[source]
         source: PskStoreError,
+    },
+    #[error("failed to read broker static key at {}", path.display())]
+    BrokerKeyRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "broker static key at {} is malformed (expected 64 hex chars on one line; \
+         generate with `openssl rand -hex 32`)",
+        path.display()
+    )]
+    BrokerKeyParse {
+        path: PathBuf,
+        #[source]
+        source: hex::FromHexError,
     },
     #[error("failed to construct GitHub provider")]
     Github(#[from] GithubError),
@@ -131,7 +159,7 @@ pub struct SharedState {
     /// list / mint / selfcheck) bypass the lock — they don't mutate.
     pub mutation_lock: Mutex<()>,
     /// Identity → metadata. Mutated by admin enroll/revoke. Lookup
-    /// keyed on the PSK identity surfaced by the Noise prelude.
+    /// keyed on the PSK identity decrypted out of handshake msg1.
     ///
     /// **GUARDED_BY:** writes MUST hold [`Self::mutation_lock`] across
     /// the full enroll/revoke sequence. Reads are lock-free — both the
@@ -155,6 +183,19 @@ pub struct SharedState {
     /// Cardinality is 1 today; when GitLab/Gitea land, add a sibling
     /// module + `ProviderKind` variant and insert here.
     pub providers: HashMap<ProviderKind, Box<dyn Provider>>,
+    /// Broker static X25519 private key; seeds every per-connection
+    /// Noise responder. Loaded once pre-sandbox from `[listen]
+    /// static_key_file`; no hot reload (restart to rotate, which is a
+    /// full re-enrollment — see docs/OPERATIONS.md).
+    pub broker_key: BrokerPrivateKey,
+    /// Public half, derived once at startup. Served by the `pubkey`
+    /// admin op and printed on the `startup` log event.
+    pub broker_public: BrokerPublicKey,
+    /// Bounds the `identity_unknown` warn rate — unknown-identity
+    /// probes are attacker-triggerable at line rate (see
+    /// `handle_connection`'s NeedPsk arm). Interior mutability:
+    /// single-threaded compio, borrow never held across `.await`.
+    pub unknown_identity_events: RefCell<TokenBucket<Instant, Duration>>,
     pub psk_file_path: PathBuf,
     pub clients_file_path: PathBuf,
     pub start_time: Instant,
@@ -398,6 +439,12 @@ impl Service {
         // deployment starts with an empty roster and grows via `enroll`.
         let psk_store = load_psk_store(&cfg.listen.psk_file).await?;
 
+        // Pre-sandbox: load the broker static key. NOT ENOENT-tolerant —
+        // without it the daemon cannot terminate a single handshake, so
+        // fail fast with the generation hint in the error.
+        let broker_key = load_broker_key(&cfg.listen.static_key_file).await?;
+        let broker_public = broker_key.derive_public();
+
         // Pre-sandbox: read provider PEMs into memory.
         let github_key = if let Some(gh) = &cfg.provider.github {
             Some(GitHubProvider::load_key(gh).await?)
@@ -432,6 +479,13 @@ impl Service {
             clients: RefCell::new(clients_table),
             psks: RefCell::new(psk_store),
             providers,
+            broker_key,
+            broker_public,
+            unknown_identity_events: RefCell::new(TokenBucket::new(
+                UNKNOWN_IDENTITY_LOG_REFILL,
+                UNKNOWN_IDENTITY_LOG_BURST_TOLERANCE,
+                Instant::now,
+            )),
             psk_file_path: cfg.listen.psk_file.clone(),
             clients_file_path: cfg.clients.file.clone(),
             start_time: Instant::now(),
@@ -498,7 +552,12 @@ impl Service {
             admin_listener,
         } = self;
         let provider_names: Vec<&str> = state.providers.values().map(|p| p.host()).collect();
-        info!(evt = %EventKind::Startup, providers = ?provider_names, "daemon started");
+        info!(
+            evt = %EventKind::Startup,
+            providers = ?provider_names,
+            broker_public_key = %state.broker_public,
+            "daemon started"
+        );
 
         // Admin loop: held as a JoinHandle and awaited after the
         // accept loop exits. The admin loop itself selects on
@@ -608,6 +667,24 @@ async fn load_psk_store(path: &Path) -> Result<PskStore, DaemonError> {
         source: PskStoreError::Utf8(source),
     })?;
     PskStore::parse(text).map_err(|source| DaemonError::LoadPsks {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Read the broker static X25519 private key: 64 hex chars on one
+/// line, surrounding ASCII whitespace tolerated. Any 32-byte value is
+/// a valid key (clamping happens inside the DH), so hex decode is the
+/// only validation.
+async fn load_broker_key(path: &Path) -> Result<BrokerPrivateKey, DaemonError> {
+    use hex::FromHex;
+    let bytes = compio::fs::read(path)
+        .await
+        .map_err(|source| DaemonError::BrokerKeyRead {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    BrokerPrivateKey::from_hex(bytes.trim_ascii()).map_err(|source| DaemonError::BrokerKeyParse {
         path: path.to_path_buf(),
         source,
     })
@@ -796,7 +873,20 @@ async fn handle_connection<S: AsyncRead + AsyncWrite>(
         provider_ms: u64,
     }
 
-    let mut sess = Responder::new();
+    let mut sess = match Responder::new(&state.broker_key) {
+        Ok(s) => s,
+        Err(e) => {
+            // Pattern parse + key install — unreachable with a
+            // validated 32-byte key; treated as an internal error.
+            warn!(
+                evt = %EventKind::HandshakeFailed,
+                peer = ?peer,
+                reason = "responder_init",
+                error = %e,
+            );
+            return;
+        }
+    };
     let mut client_name: Option<String> = None;
     let mut mint_record: Option<MintRecord> = None;
 
@@ -824,35 +914,69 @@ async fn handle_connection<S: AsyncRead + AsyncWrite>(
             }
 
             Step::NeedPsk { identity } => {
-                let psk = match state.psks.borrow().lookup(&identity) {
-                    Some(p) => *p,
-                    None => {
-                        warn!(
-                            evt = %EventKind::MintDenied,
-                            reason = "client_unknown",
+                // Anti-enumeration: an unauthorized identity gets a
+                // freshly random PSK instead of an early drop, so the
+                // handshake proceeds through msg2 and dies at the
+                // first transport-frame decrypt — indistinguishable
+                // (bytes and connection shape) from an enrolled
+                // identity presenting a wrong PSK. Dropping here
+                // would let an attacker probe which identities are
+                // enrolled by watching whether msg2 arrives.
+                let known_psk = state.psks.borrow().lookup(&identity).copied();
+                let metadata_ok = state.clients.borrow().contains_key(&identity);
+                let psk = match (known_psk, metadata_ok) {
+                    (Some(psk), true) => {
+                        info!(
+                            evt = %EventKind::Accept,
                             psk_identity = %identity,
                             peer = ?peer,
+                        );
+                        client_name = Some(identity.to_string());
+                        Ok(psk)
+                    }
+                    (Some(_), false) => {
+                        // PSK exists but no clients.json entry — the
+                        // operator desynced the two files. Refuse to
+                        // mint (random PSK, same failure shape as
+                        // unknown), but log loudly and unthrottled:
+                        // this is operator error on an enrolled
+                        // identity, not an enumeration probe.
+                        warn!(
+                            evt = %EventKind::MintDenied,
+                            reason = "client_metadata_missing",
+                            psk_identity = %identity,
+                        );
+                        Psk::random()
+                    }
+                    (None, _) => {
+                        let suppressed = state.unknown_identity_events.borrow_mut().try_acquire();
+                        if let Some(suppressed) = suppressed {
+                            warn!(
+                                evt = %EventKind::IdentityUnknown,
+                                psk_identity = %identity,
+                                peer = ?peer,
+                                suppressed = suppressed,
+                            );
+                        }
+                        Psk::random()
+                    }
+                };
+                // A substitute PSK MUST be unpredictable — a guessable
+                // one would let the peer complete the handshake. If
+                // the OS RNG is unavailable, drop the connection
+                // instead of substituting anything.
+                let psk = match psk {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(
+                            evt = %EventKind::HandshakeFailed,
+                            peer = ?peer,
+                            reason = "rng_unavailable",
+                            error = %e,
                         );
                         return;
                     }
                 };
-                if !state.clients.borrow().contains_key(&identity) {
-                    // PSK exists but no clients.json entry — operator
-                    // desynced the two files; refuse to mint rather than
-                    // guess metadata.
-                    warn!(
-                        evt = %EventKind::MintDenied,
-                        reason = "client_metadata_missing",
-                        psk_identity = %identity,
-                    );
-                    return;
-                }
-                info!(
-                    evt = %EventKind::Accept,
-                    psk_identity = %identity,
-                    peer = ?peer,
-                );
-                client_name = Some(identity.to_string());
                 if let Err(e) = sess.set_psk(psk) {
                     log_session_failure(peer, sess.phase(), client_name.as_deref(), &e);
                     return;
@@ -876,7 +1000,20 @@ async fn handle_connection<S: AsyncRead + AsyncWrite>(
             }
 
             Step::Request(request_bytes) => {
-                let client_str = client_name.as_deref().unwrap_or("");
+                // `client_name` is set only on the authorized NeedPsk
+                // path (real PSK + metadata present). A session that
+                // got a random substitute PSK can't reach transport
+                // mode — but if it ever did, this guard keeps the
+                // mint path unreachable regardless.
+                let Some(client_str) = client_name.as_deref() else {
+                    warn!(
+                        evt = %EventKind::MintDenied,
+                        reason = "client_unknown",
+                        peer = ?peer,
+                        detail = "request_from_unauthorized_session",
+                    );
+                    return;
+                };
                 if request_bytes.len() > WIRE_READ_BUDGET {
                     warn!(
                         evt = %EventKind::MintDenied,
@@ -995,25 +1132,35 @@ fn log_session_failure(
 ) {
     let client_str = client_name.unwrap_or("");
     match err {
-        SessionError::PreludeBadMagic { .. } => warn!(
-            evt = %EventKind::PreludeInvalid,
+        SessionError::TlvBadMagic { .. } => warn!(
+            evt = %EventKind::IdentityInvalid,
             peer = ?peer,
             reason = "bad_magic",
         ),
-        SessionError::PreludeBadVersion { .. } => warn!(
-            evt = %EventKind::PreludeInvalid,
+        SessionError::TlvBadVersion { .. } => warn!(
+            evt = %EventKind::IdentityInvalid,
             peer = ?peer,
             reason = "bad_version",
         ),
-        SessionError::PreludeBadIdentityLen { .. } => warn!(
-            evt = %EventKind::PreludeInvalid,
+        SessionError::TlvBadIdentityLen { .. } => warn!(
+            evt = %EventKind::IdentityInvalid,
             peer = ?peer,
             reason = "bad_identity_len",
         ),
-        SessionError::PreludeInvalidCharset { .. } => warn!(
-            evt = %EventKind::PreludeInvalid,
+        SessionError::TlvInvalidCharset { .. } => warn!(
+            evt = %EventKind::IdentityInvalid,
             peer = ?peer,
             reason = "invalid_charset",
+        ),
+        SessionError::TlvTrailingBytes { .. } => warn!(
+            evt = %EventKind::IdentityInvalid,
+            peer = ?peer,
+            reason = "trailing_bytes",
+        ),
+        SessionError::TlvIncomplete { .. } => warn!(
+            evt = %EventKind::IdentityInvalid,
+            peer = ?peer,
+            reason = "truncated",
         ),
         SessionError::HandshakeRead(_) => warn!(
             evt = %EventKind::HandshakeFailed,
@@ -1070,15 +1217,10 @@ fn log_session_failure(
 fn log_phase_eof(peer: Option<std::net::SocketAddr>, phase: Phase, client_name: Option<&str>) {
     let client_str = client_name.unwrap_or("");
     match phase {
-        Phase::PreludeHead => warn!(
-            evt = %EventKind::PreludeInvalid,
+        Phase::Msg1 => warn!(
+            evt = %EventKind::HandshakeFailed,
             peer = ?peer,
-            reason = "eof_before_prelude_head",
-        ),
-        Phase::PreludeBody => warn!(
-            evt = %EventKind::PreludeInvalid,
-            peer = ?peer,
-            reason = "eof_before_identity",
+            reason = "eof_before_msg1",
         ),
         Phase::Handshake => warn!(
             evt = %EventKind::HandshakeFailed,
@@ -1175,7 +1317,7 @@ fn log_mint_error(client_name: &str, host: &str, path: &str, provider_ms: u64, e
 // ----- TCP I/O primitives ------------------------------------------------
 //
 // The two functions the state machine driver in `handle_connection` calls
-// against the TCP socket. Everything else (prelude parsing, Noise
+// against the TCP socket. Everything else (identity-TLV parsing, Noise
 // handshake driving, framing, encrypt/decrypt) lives inside
 // `transport::Responder`.
 

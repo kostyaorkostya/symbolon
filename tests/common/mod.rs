@@ -21,8 +21,9 @@ use serde_json::Value;
 use snow::TransportState;
 use symbolon::transport::{self, MAX_MESSAGE_SIZE};
 use symbolon::{
-    AdminConfig, ClientsConfig, Config, CpuWorker, GitHubProvider, ListenConfig, LoggingConfig,
-    MlockMode, ProviderGithub, Providers, RuntimeConfig, SandboxMode, SecurityConfig,
+    AdminConfig, BrokerPrivateKey, BrokerPublicKey, ClientsConfig, Config, CpuWorker,
+    GitHubProvider, ListenConfig, LoggingConfig, MlockMode, ProviderGithub, Providers,
+    RuntimeConfig, SandboxMode, SecurityConfig,
 };
 use wiremock::matchers::{body_bytes, method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -39,6 +40,20 @@ pub fn fixture_pem_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test_app_key.pem")
 }
 
+/// Fixed broker static private key shared by every test daemon. Any
+/// 32-byte value is a valid X25519 private key; a constant keeps the
+/// matching public key derivable in test clients without plumbing.
+pub const TEST_BROKER_PRIV: [u8; 32] = [7u8; 32];
+
+pub fn test_broker_pub() -> BrokerPublicKey {
+    BrokerPrivateKey::from(TEST_BROKER_PRIV).derive_public()
+}
+
+/// Write the broker static key file (64 hex chars) for a test daemon.
+pub fn write_broker_key_file(path: &Path) {
+    std::fs::write(path, hex::encode(TEST_BROKER_PRIV)).unwrap();
+}
+
 pub fn unique_id() -> u64 {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -52,6 +67,7 @@ pub struct TempPaths {
     pub admin: PathBuf,
     pub clients: PathBuf,
     pub psks: PathBuf,
+    pub broker_key: PathBuf,
 }
 
 impl Drop for TempPaths {
@@ -59,6 +75,7 @@ impl Drop for TempPaths {
         let _ = std::fs::remove_file(&self.admin);
         let _ = std::fs::remove_file(&self.clients);
         let _ = std::fs::remove_file(&self.psks);
+        let _ = std::fs::remove_file(&self.broker_key);
     }
 }
 
@@ -70,6 +87,7 @@ pub fn unique_paths_full() -> TempPaths {
         admin: t.join(format!("symbolon-test-{pid}-{id}-admin.sock")),
         clients: t.join(format!("symbolon-test-{pid}-{id}-clients.json")),
         psks: t.join(format!("symbolon-test-{pid}-{id}-psks")),
+        broker_key: t.join(format!("symbolon-test-{pid}-{id}-broker.key")),
     }
 }
 
@@ -180,6 +198,7 @@ pub fn build_full_config(paths: &TempPaths, api_base: String, bind: SocketAddr) 
         listen: ListenConfig {
             bind,
             psk_file: paths.psks.clone(),
+            static_key_file: paths.broker_key.clone(),
         },
         admin: AdminConfig {
             socket_path: paths.admin.clone(),
@@ -251,9 +270,10 @@ pub async fn wait_for_socket(path: &Path) {
     panic!("socket {} did not appear within 1s", path.display());
 }
 
-/// Connect to `addr` over TCP, run the NNpsk0 initiator handshake with
-/// `psk` + identity prelude, write `payload` as a single encrypted Noise
-/// frame, read one encrypted response, return the decrypted bytes.
+/// Connect to `addr` over TCP, run the NKpsk2 initiator handshake
+/// (identity TLV as msg1 payload, PSK mixed at msg2), write `payload`
+/// as a single encrypted Noise frame, read one encrypted response,
+/// return the decrypted bytes.
 pub async fn client_handshake_and_send(
     addr: SocketAddr,
     identity: &str,
@@ -263,21 +283,17 @@ pub async fn client_handshake_and_send(
     let identity = symbolon::Identity::parse(identity).expect("test identity must be valid");
     let psk = symbolon::Psk::from(psk);
     let mut stream = TcpStream::connect(addr).await.expect("tcp connect");
-    let prelude = transport::encode_prelude(&identity);
-    // Build the handshake with the prelude as Noise prologue BEFORE
-    // write_all consumes the buffer.
-    let mut hs = transport::initiator(&psk, &prelude).expect("build initiator");
-    let BufResult(res, _) = stream.write_all(prelude).await;
-    res.expect("write prelude");
+    let mut hs = transport::initiator(&psk, &test_broker_pub()).expect("build initiator");
     let mut scratch = vec![0u8; MAX_MESSAGE_SIZE];
 
-    // -> psk, e
-    let n = transport::handshake_write(&mut hs, &[], &mut scratch).expect("hs write 1");
+    // -> e, es (identity TLV as encrypted payload)
+    let tlv = transport::encode_identity_tlv(&identity);
+    let n = transport::handshake_write(&mut hs, &tlv, &mut scratch).expect("hs write 1");
     let frame1 = transport::frame(&scratch[..n]).expect("frame 1");
     let BufResult(res, _) = stream.write_all(frame1).await;
     res.expect("write hs 1");
 
-    // <- e, ee
+    // <- e, ee, psk
     let frame2 = read_framed(&mut stream).await.expect("read hs 2");
     let _ = transport::handshake_read(&mut hs, &frame2, &mut scratch).expect("hs read 2");
 
@@ -295,15 +311,13 @@ pub async fn client_handshake_and_send(
 }
 
 /// Variant of `client_handshake_and_send` that returns ONLY the
-/// decrypted application-layer bytes (or an empty Vec on EOF before
-/// the daemon emits a response). Use this from tests that assert the
-/// daemon dropped the connection after processing the encrypted
-/// request.
-///
-/// Walks the full state machine: prelude → handshake (in + out) →
-/// encrypted request → attempt to read encrypted response. If the
-/// daemon dropped the socket before sending anything decryptable, we
-/// return an empty Vec.
+/// decrypted application-layer bytes (or an empty Vec on any failure
+/// before the daemon emits a response). Use this from tests that
+/// assert the daemon denied the session — under NKpsk2 that shows up
+/// either as a dropped connection (malformed TLV) or as a handshake
+/// that completes msg2 and then dies (unknown identity / wrong PSK:
+/// this side fails to decrypt msg2, or the daemon fails to decrypt
+/// the request frame — both land in the empty-Vec paths below).
 pub async fn client_handshake_and_read_eof(
     addr: SocketAddr,
     identity: &str,
@@ -320,19 +334,15 @@ pub async fn client_handshake_and_read_eof(
         Err(_) => return Vec::new(),
     };
 
-    let prelude = transport::encode_prelude(&identity);
-    let mut hs = match transport::initiator(&psk, &prelude) {
+    let mut hs = match transport::initiator(&psk, &test_broker_pub()) {
         Ok(h) => h,
         Err(_) => return Vec::new(),
     };
-    let BufResult(res, _) = stream.write_all(prelude).await;
-    if res.is_err() {
-        return Vec::new();
-    }
     let mut scratch = vec![0u8; MAX_MESSAGE_SIZE];
 
-    // -> psk, e
-    let n = match transport::handshake_write(&mut hs, &[], &mut scratch) {
+    // -> e, es (identity TLV as encrypted payload)
+    let tlv = transport::encode_identity_tlv(&identity);
+    let n = match transport::handshake_write(&mut hs, &tlv, &mut scratch) {
         Ok(n) => n,
         Err(_) => return Vec::new(),
     };
@@ -345,9 +355,9 @@ pub async fn client_handshake_and_read_eof(
         return Vec::new();
     }
 
-    // <- e, ee (server may have closed if PSK lookup / identity check
-    // failed before getting here; read_framed then returns Err and we
-    // bail with empty Vec).
+    // <- e, ee, psk (an unknown identity still gets a msg2 — built
+    // against a random substitute PSK — so the failure here is the
+    // decrypt, not the read).
     let reply = match read_framed(&mut stream).await {
         Ok(b) => b,
         Err(_) => return Vec::new(),
@@ -450,6 +460,7 @@ pub async fn spawn_daemon(paths: &TempPaths, api_base: String) {
 
 pub async fn spawn_daemon_with_bind(paths: &TempPaths, api_base: String, bind: SocketAddr) {
     let cfg = build_full_config(paths, api_base, bind);
+    write_broker_key_file(&paths.broker_key);
     // Production uses LISTEN_FDS handoff via systemd/systemfd; tests
     // pre-bind here and feed the listeners through the test-only
     // `prepare_with_listeners` constructor. Env vars are process-global,

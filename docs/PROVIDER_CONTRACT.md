@@ -248,7 +248,7 @@ Noise transport and forgets it.
 ### F6. SSH transport
 
 A provider MUST NOT issue or interact with SSH keys for the
-client. The broker's transport to the client is Noise NNpsk0
+client. The broker's transport to the client is Noise NKpsk2
 over TCP; SSH is a hard NOT per AGENTS.md.
 
 ## How GitHub satisfies the contract

@@ -1,6 +1,6 @@
-//! Noise NNpsk0 transport: identity prelude, framing, and snow handshake
-//! orchestration. I/O-agnostic — callers supply bytes; this module owns the
-//! `HandshakeState` / `TransportState` machinery.
+//! Noise NKpsk2 transport: encrypted identity TLV, framing, and snow
+//! handshake orchestration. I/O-agnostic — callers supply bytes; this
+//! module owns the `HandshakeState` / `TransportState` machinery.
 //!
 //! Two callers:
 //! - daemon (compio async): drives the [`Responder`] state machine after
@@ -12,84 +12,113 @@
 //! telling the I/O driver what to do next (read N bytes, write these
 //! bytes, look up a PSK for this identity, process this plaintext).
 //! The driver does only I/O; the machine owns all state. The bag of
-//! free functions below (`parse_prelude`, `responder`, `initiator`,
-//! `handshake_read`, `frame`, etc.) is the lower layer the state
-//! machines call into; the fuzz harness targets them directly.
+//! free functions below (`parse_identity_tlv`, `responder`,
+//! `initiator`, `handshake_read`, `frame`, etc.) is the lower layer
+//! the state machines call into; the fuzz harness targets them
+//! directly.
 //!
 //! Wire shape:
 //! ```text
-//! Identity prelude (sent once, before the Noise handshake):
+//! Handshake (NK: broker static key known to the client; psk2: PSK
+//! mixed at the end of message 2):
+//!   -> msg1: e, es    payload = SBLN identity TLV (encrypted)
+//!   <- msg2: e, ee, psk
+//!
+//! SBLN identity TLV (msg1 payload plaintext):
 //!   +--------+---+---+----------------+
 //!   | "SBLN" | V | L | identity bytes |
 //!   +--------+---+---+----------------+
 //!      4      1   1       L (1..=64)
 //!
-//! Per-message framing (used for the Noise handshake messages AND post-handshake
-//! transport messages):
+//! Per-message framing (used for the Noise handshake messages AND
+//! post-handshake transport messages):
 //!   +-----------+--------------------+
 //!   | len (u16) | message body bytes |
 //!   +-----------+--------------------+
 //!        2              len
 //! ```
 //!
-//! The identity prelude is cleartext — an attacker on the wire learns which
-//! client identity is being used, but without the PSK they can't impersonate
-//! or decrypt anything.
+//! The client identity travels TLS-ECH-style inside the encrypted
+//! msg1 payload (`es` key: client ephemeral x broker static), so a
+//! passive observer — or any active attacker not holding the broker
+//! static private key — learns nothing about which identity connects.
+//! msg1 is replayable, but a replay cannot complete the handshake:
+//! message 2 onward requires the identity's PSK.
+//!
+//! The responder decrypts msg1 with only its static key, parses the
+//! TLV, and selects the PSK *after* reading msg1 — that is why the
+//! pattern is `psk2` (PSK token at the end of message 2) rather than
+//! `psk0`: a PSK mixed before msg1 could not depend on an identity
+//! carried inside msg1.
 
 use snow::{Builder, HandshakeState, TransportState, params::NoiseParams};
 
+use crate::broker_key::{BrokerPrivateKey, BrokerPublicKey};
 use crate::identity::{Identity, IdentityError};
 use crate::psk::Psk;
 
-/// `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s`. NN (no static keys), `psk0` mixes
-/// the pre-shared key before the handshake; 1-RTT.
-pub const NOISE_PATTERN: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
+/// `Noise_NKpsk2_25519_ChaChaPoly_BLAKE2s`. NK: the client knows the
+/// broker's static X25519 public key and encrypts to it from msg1;
+/// `psk2` mixes the per-client pre-shared key at the end of message 2.
+/// 1-RTT.
+pub const NOISE_PATTERN: &str = "Noise_NKpsk2_25519_ChaChaPoly_BLAKE2s";
+
+/// PSK slot in `NOISE_PATTERN` — the `2` in `psk2`. Single source for
+/// the responder's `set_psk` call and the initiator's builder-time
+/// `psk()` so the two sides can't drift.
+pub const PSK_SLOT: u8 = 2;
 
 /// Snow constrains a single Noise message to at most 65535 bytes, which fits
 /// in our u16 length prefix exactly. Buffers sized to this allow any valid
 /// message to be processed in-place.
 pub const MAX_MESSAGE_SIZE: usize = 65535;
 
-/// Identity prelude magic bytes. Picked to be invalid as a Noise message and
-/// distinctive in tcpdump.
-pub const PRELUDE_MAGIC: [u8; 4] = *b"SBLN";
+/// Identity TLV magic bytes. Distinctive when a decrypted msg1
+/// payload is inspected in logs or a debugger; never appears on the
+/// wire in cleartext.
+pub const TLV_MAGIC: [u8; 4] = *b"SBLN";
 
-/// Identity prelude format version. Incremented if the prelude layout ever
-/// changes; daemon rejects unknown versions.
-pub const PRELUDE_VERSION: u8 = 0x01;
+/// Identity TLV format version. Version 1 was the cleartext prelude
+/// of the NNpsk0 wire protocol; version 2 moved the same bytes inside
+/// the encrypted msg1 payload. The layout is unchanged, but the bump
+/// keeps a mixed-era client loudly rejected instead of half-working.
+pub const TLV_VERSION: u8 = 0x02;
 
-/// Prelude carries `id_len` as a `u8`; `Identity::MAX_LEN` must fit
+/// The TLV carries `id_len` as a `u8`; `Identity::MAX_LEN` must fit
 /// in that byte. Mirrors the `_WIRE_BUDGET_FITS_PARSER` pattern in
 /// `daemon.rs` — catch at compile time, not via `debug_assert!`.
-const _IDENTITY_FITS_PRELUDE_LEN: () = assert!(Identity::MAX_LEN <= u8::MAX as usize);
+const _IDENTITY_FITS_TLV_LEN: () = assert!(Identity::MAX_LEN <= u8::MAX as usize);
 
-/// Errors raised when parsing or validating the identity prelude.
+/// Errors raised when parsing or validating the identity TLV
+/// (decrypted msg1 payload).
 #[derive(Debug, thiserror::Error)]
-pub enum PreludeError {
-    #[error("prelude is incomplete: need {needed} more bytes")]
+pub enum TlvError {
+    #[error("identity TLV is incomplete: need {needed} more bytes")]
     Incomplete { needed: usize },
-    #[error("prelude magic mismatch (got {got:?}, expected {:?})", PRELUDE_MAGIC)]
+    #[error("identity TLV magic mismatch (got {got:?}, expected {:?})", TLV_MAGIC)]
     BadMagic { got: [u8; 4] },
-    #[error("prelude version {got} not supported (expected {PRELUDE_VERSION})")]
+    #[error("identity TLV version {got} not supported (expected {TLV_VERSION})")]
     BadVersion { got: u8 },
     #[error(
-        "prelude identity length {got} out of range (1..={})",
+        "identity TLV identity length {got} out of range (1..={})",
         Identity::MAX_LEN
     )]
     BadIdentityLen { got: u8 },
     #[error(
-        "prelude identity byte 0x{byte:02x} at offset {offset} is outside the allowed \
+        "identity TLV byte 0x{byte:02x} at offset {offset} is outside the allowed \
          charset [A-Za-z0-9._-]"
     )]
     InvalidCharset { offset: usize, byte: u8 },
+    #[error("identity TLV followed by {extra} unexpected trailing bytes")]
+    TrailingBytes { extra: usize },
 }
 
 /// Lift identity validation errors from `Identity::parse` (used by the
 /// wire-side body parser) into the wire-error vocabulary. `BadLen.got`
 /// is `usize`; the wire reports `u8`. Saturate — the wire parser can't
-/// produce > 255 because `parse_prelude_head` already validated id_len
+/// produce > 255 because `parse_tlv_head` already validated id_len
 /// fits in a single byte.
-impl From<IdentityError> for PreludeError {
+impl From<IdentityError> for TlvError {
     fn from(e: IdentityError) -> Self {
         match e {
             IdentityError::BadLen { got } => Self::BadIdentityLen {
@@ -124,38 +153,37 @@ pub enum TransportError {
     OversizedFrame { got: usize },
 }
 
-/// Total prelude byte length given an identity length.
-pub const fn prelude_size(identity_len: usize) -> usize {
+/// Total identity-TLV byte length given an identity length.
+pub const fn identity_tlv_size(identity_len: usize) -> usize {
     6 + identity_len
 }
 
-/// Encode an `Identity` into prelude bytes. Infallible: `Identity`'s
-/// constructor already enforces `1..=Identity::MAX_LEN` length and the
-/// `[A-Za-z0-9._-]` charset, which is exactly what the wire requires.
-pub fn encode_prelude(identity: &Identity) -> Vec<u8> {
+/// Encode an `Identity` into TLV bytes (the msg1 payload plaintext).
+/// Infallible: `Identity`'s constructor already enforces
+/// `1..=Identity::MAX_LEN` length and the `[A-Za-z0-9._-]` charset,
+/// which is exactly what the wire requires.
+pub fn encode_identity_tlv(identity: &Identity) -> Vec<u8> {
     // `Identity::parse` bounds `bytes.len()` to `1..=Identity::MAX_LEN`,
     // and `_IDENTITY_FITS_PRELUDE_LEN` proves at compile time that
     // `Identity::MAX_LEN <= u8::MAX`, so the cast is statically lossless.
     let bytes = identity.as_str().as_bytes();
-    let mut out = Vec::with_capacity(prelude_size(bytes.len()));
-    out.extend_from_slice(&PRELUDE_MAGIC);
-    out.push(PRELUDE_VERSION);
+    let mut out = Vec::with_capacity(identity_tlv_size(bytes.len()));
+    out.extend_from_slice(&TLV_MAGIC);
+    out.push(TLV_VERSION);
     out.push(bytes.len() as u8);
     out.extend_from_slice(bytes);
     out
 }
 
-/// Validate the 6-byte prelude head: magic, version, and identity length.
-/// Returns the declared identity length on success. Used by the streaming
-/// state machine to reject `bad_magic` / `bad_version` / `bad_identity_len`
-/// after the first 6 bytes, before pulling the identity body off the wire.
-fn parse_prelude_head(head: &[u8; 6]) -> Result<u8, PreludeError> {
+/// Validate the 6-byte TLV head: magic, version, and identity length.
+/// Returns the declared identity length on success.
+fn parse_tlv_head(head: &[u8; 6]) -> Result<u8, TlvError> {
     let &[m0, m1, m2, m3, version, id_len] = head;
     match ([m0, m1, m2, m3], version, id_len) {
-        (m, _, _) if m != PRELUDE_MAGIC => Err(PreludeError::BadMagic { got: m }),
-        (_, v, _) if v != PRELUDE_VERSION => Err(PreludeError::BadVersion { got: v }),
+        (m, _, _) if m != TLV_MAGIC => Err(TlvError::BadMagic { got: m }),
+        (_, v, _) if v != TLV_VERSION => Err(TlvError::BadVersion { got: v }),
         (_, _, l) if l == 0 || l as usize > Identity::MAX_LEN => {
-            Err(PreludeError::BadIdentityLen { got: l })
+            Err(TlvError::BadIdentityLen { got: l })
         }
         (_, _, l) => Ok(l),
     }
@@ -170,7 +198,7 @@ fn parse_prelude_head(head: &[u8; 6]) -> Result<u8, PreludeError> {
 /// at the first invalid offset via `InvalidCharset`. That keeps the
 /// "first bad byte" reporting the wire layer wants while letting
 /// `Identity::parse` own the actual charset rule.
-fn parse_prelude_body(body: &[u8]) -> Result<Identity, PreludeError> {
+fn parse_tlv_body(body: &[u8]) -> Result<Identity, TlvError> {
     match std::str::from_utf8(body) {
         Ok(s) => Ok(Identity::parse(s)?),
         Err(e) => {
@@ -180,7 +208,7 @@ fn parse_prelude_body(body: &[u8]) -> Result<Identity, PreludeError> {
             // `InvalidCharset` matches what `Identity::parse` would
             // say if the bytes happened to be valid UTF-8.
             let offset = e.valid_up_to();
-            Err(PreludeError::InvalidCharset {
+            Err(TlvError::InvalidCharset {
                 offset,
                 byte: body[offset],
             })
@@ -188,65 +216,65 @@ fn parse_prelude_body(body: &[u8]) -> Result<Identity, PreludeError> {
     }
 }
 
-/// Parse a prelude from `input`. On success returns the parsed
-/// identity and the byte length consumed. The caller slices
-/// `input[consumed..]` to find the first Noise framed message. The
-/// fuzz harness targets this function.
+/// Parse an identity TLV from `input`. On success returns the parsed
+/// identity and the byte length consumed. The fuzz harness targets
+/// this function.
 ///
-/// Streaming callers should use [`Responder`] instead; it sees bytes
-/// as they arrive and validates the head before reading the body.
-pub fn parse_prelude(input: &[u8]) -> Result<(Identity, usize), PreludeError> {
+/// The [`Responder`] applies this to a decrypted msg1 payload and
+/// additionally requires `consumed == payload.len()` (no trailing
+/// bytes); this function itself tolerates them so callers with
+/// concatenated input can slice.
+pub fn parse_identity_tlv(input: &[u8]) -> Result<(Identity, usize), TlvError> {
     let head = input
         .first_chunk::<6>()
-        .ok_or_else(|| PreludeError::Incomplete {
+        .ok_or_else(|| TlvError::Incomplete {
             needed: 6 - input.len(),
         })?;
-    let id_len = parse_prelude_head(head)?;
-    let total = prelude_size(id_len as usize);
-    let body = input
-        .get(6..total)
-        .ok_or_else(|| PreludeError::Incomplete {
-            needed: total - input.len(),
-        })?;
-    let identity = parse_prelude_body(body)?;
+    let id_len = parse_tlv_head(head)?;
+    let total = identity_tlv_size(id_len as usize);
+    let body = input.get(6..total).ok_or_else(|| TlvError::Incomplete {
+        needed: total - input.len(),
+    })?;
+    let identity = parse_tlv_body(body)?;
     Ok((identity, total))
 }
 
-/// Build the responder (server) side of `NOISE_PATTERN` with the given
-/// PSK. `prologue` must be the same bytes both peers observed
-/// out-of-band before the handshake (for us, the cleartext SBLN
-/// identity prelude). It is mixed into the handshake transcript hash;
-/// if the two sides disagree on prologue, the first handshake MAC
-/// check fails. See snow `Builder::prologue` docs.
-pub fn responder(psk: &Psk, prologue: &[u8]) -> Result<HandshakeState, TransportError> {
-    build_handshake(psk, prologue, /* initiator */ false)
+/// Build the responder (server) side of `NOISE_PATTERN` with the
+/// broker's static private key. The PSK is NOT supplied here: the
+/// responder learns the client identity only after decrypting msg1,
+/// then injects the PSK via `HandshakeState::set_psk(PSK_SLOT, …)`
+/// before writing msg2. snow validates PSK presence when the `psk`
+/// token is processed (message 2), not at build time, so the
+/// two-phase construction is safe.
+pub fn responder(broker_key: &BrokerPrivateKey) -> Result<HandshakeState, TransportError> {
+    let params: NoiseParams = NOISE_PATTERN
+        .parse()
+        .map_err(|e: snow::Error| TransportError::Params(e))?;
+    Builder::new(params)
+        .local_private_key(broker_key.as_bytes())
+        .map_err(TransportError::Params)?
+        .build_responder()
+        .map_err(TransportError::Params)
 }
 
-/// Build the initiator (client) side of `NOISE_PATTERN` with the given
-/// PSK and shared prologue bytes (see [`responder`] for the prologue
-/// contract).
-pub fn initiator(psk: &Psk, prologue: &[u8]) -> Result<HandshakeState, TransportError> {
-    build_handshake(psk, prologue, /* initiator */ true)
-}
-
-fn build_handshake(
+/// Build the initiator (client) side of `NOISE_PATTERN` with the
+/// client's PSK and the pinned broker static public key. Both are
+/// known up front on the client, so unlike [`responder`] the PSK is
+/// supplied at build time.
+pub fn initiator(
     psk: &Psk,
-    prologue: &[u8],
-    initiator: bool,
+    broker_pub: &BrokerPublicKey,
 ) -> Result<HandshakeState, TransportError> {
     let params: NoiseParams = NOISE_PATTERN
         .parse()
         .map_err(|e: snow::Error| TransportError::Params(e))?;
-    let builder = Builder::new(params)
-        .prologue(prologue)
+    Builder::new(params)
+        .remote_public_key(broker_pub.as_bytes())
         .map_err(TransportError::Params)?
-        .psk(0, psk.as_bytes())
-        .map_err(TransportError::Params)?;
-    if initiator {
-        builder.build_initiator().map_err(TransportError::Params)
-    } else {
-        builder.build_responder().map_err(TransportError::Params)
-    }
+        .psk(PSK_SLOT, psk.as_bytes())
+        .map_err(TransportError::Params)?
+        .build_initiator()
+        .map_err(TransportError::Params)
 }
 
 /// Transition a completed handshake into transport mode.
@@ -279,8 +307,9 @@ pub fn read_frame_length(buf: &[u8; 2]) -> Result<usize, TransportError> {
 }
 
 /// Apply the Noise handshake responder transform to one inbound message.
-/// `out` must be at least `MAX_MESSAGE_SIZE` long. Returns the number of plaintext
-/// bytes written into `out` (always 0 for NNpsk0 — no static payloads).
+/// `out` must be at least `MAX_MESSAGE_SIZE` long. Returns the number of
+/// plaintext bytes written into `out` — for msg1 that is the decrypted
+/// identity TLV; for msg2 it is 0.
 pub fn handshake_read(
     hs: &mut HandshakeState,
     msg: &[u8],
@@ -326,12 +355,13 @@ pub fn transport_write(
 // =========================================================================
 // Sans-IO session state machines.
 //
-// `Responder` and `Initiator` own the full Noise NNpsk0 lifecycle
-// (prelude → handshake → encrypted request/response) as an explicit
-// state machine. They emit `Step` values telling the I/O driver what to
-// do next; the driver does the I/O and feeds bytes back. Same machine
-// drives the async compio daemon and the sync std::net client, so
-// protocol changes happen in one place.
+// `Responder` and `Initiator` own the full Noise NKpsk2 lifecycle
+// (msg1-with-identity-TLV → PSK selection → msg2 → encrypted
+// request/response) as an explicit state machine. They emit `Step`
+// values telling the I/O driver what to do next; the driver does the
+// I/O and feeds bytes back. Same machine drives the async compio
+// daemon and the sync std::net client, so protocol changes happen in
+// one place.
 // =========================================================================
 
 /// Side-agnostic event the I/O driver must service before calling
@@ -341,8 +371,13 @@ pub enum Step {
     /// Read exactly `n` bytes from the wire and feed them via `recv`.
     /// `n` is bounded by `MAX_MESSAGE_SIZE`.
     ReadExact { n: usize },
-    /// Look up the PSK for `identity`. Caller calls `set_psk(psk)`;
-    /// dropping the session is how a "not enrolled" lookup ends.
+    /// Look up the PSK for `identity` (decrypted out of msg1). Caller
+    /// calls `set_psk(psk)`. For an unknown identity the caller MUST
+    /// substitute a freshly random PSK and continue rather than drop —
+    /// the handshake then dies at the first transport-frame decrypt,
+    /// indistinguishable (to the peer) from an enrolled identity with
+    /// a wrong PSK. Dropping early would let an attacker enumerate
+    /// enrolled identities by observing whether msg2 arrives.
     NeedPsk { identity: Identity },
     /// Write these bytes to the wire, then call `wrote()`.
     Write(Vec<u8>),
@@ -360,9 +395,10 @@ pub enum Step {
 /// attributed to a phase by the driver).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
-    PreludeHead,
-    PreludeBody,
+    /// Waiting for (or mid-read of) handshake msg1.
+    Msg1,
     AwaitingPsk,
+    /// msg2 in flight (responder writing / initiator reading).
     Handshake,
     Transport,
     Done,
@@ -373,14 +409,18 @@ pub enum Phase {
 /// catalog in `docs/PROTOCOLS.md`.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
-    #[error("prelude bad magic: got {got:?}")]
-    PreludeBadMagic { got: [u8; 4] },
-    #[error("prelude bad version: got {got}")]
-    PreludeBadVersion { got: u8 },
-    #[error("prelude bad identity length: got {got}")]
-    PreludeBadIdentityLen { got: u8 },
-    #[error("prelude identity byte 0x{byte:02x} at offset {offset} is outside [A-Za-z0-9._-]")]
-    PreludeInvalidCharset { offset: usize, byte: u8 },
+    #[error("identity TLV bad magic: got {got:?}")]
+    TlvBadMagic { got: [u8; 4] },
+    #[error("identity TLV bad version: got {got}")]
+    TlvBadVersion { got: u8 },
+    #[error("identity TLV bad identity length: got {got}")]
+    TlvBadIdentityLen { got: u8 },
+    #[error("identity TLV byte 0x{byte:02x} at offset {offset} is outside [A-Za-z0-9._-]")]
+    TlvInvalidCharset { offset: usize, byte: u8 },
+    #[error("identity TLV followed by {extra} unexpected trailing bytes in msg1 payload")]
+    TlvTrailingBytes { extra: usize },
+    #[error("identity TLV truncated: msg1 payload is {needed} bytes short of the declared length")]
+    TlvIncomplete { needed: usize },
     #[error("noise handshake read failed")]
     HandshakeRead(#[source] snow::Error),
     #[error("noise handshake write failed")]
@@ -402,24 +442,17 @@ pub enum SessionError {
     },
 }
 
-impl From<PreludeError> for SessionError {
-    fn from(e: PreludeError) -> Self {
+impl From<TlvError> for SessionError {
+    fn from(e: TlvError) -> Self {
         match e {
-            PreludeError::BadMagic { got } => SessionError::PreludeBadMagic { got },
-            PreludeError::BadVersion { got } => SessionError::PreludeBadVersion { got },
-            PreludeError::BadIdentityLen { got } => SessionError::PreludeBadIdentityLen { got },
-            PreludeError::InvalidCharset { offset, byte } => {
-                SessionError::PreludeInvalidCharset { offset, byte }
+            TlvError::BadMagic { got } => SessionError::TlvBadMagic { got },
+            TlvError::BadVersion { got } => SessionError::TlvBadVersion { got },
+            TlvError::BadIdentityLen { got } => SessionError::TlvBadIdentityLen { got },
+            TlvError::InvalidCharset { offset, byte } => {
+                SessionError::TlvInvalidCharset { offset, byte }
             }
-            PreludeError::Incomplete { .. } => {
-                // The state machine reads exact byte counts, so a
-                // partial-buffer error from the parsers should be
-                // unreachable. Surface as WrongState if it ever fires.
-                SessionError::WrongState {
-                    method: "parse_prelude",
-                    state: "incomplete_buffer",
-                }
-            }
+            TlvError::TrailingBytes { extra } => SessionError::TlvTrailingBytes { extra },
+            TlvError::Incomplete { needed } => SessionError::TlvIncomplete { needed },
         }
     }
 }
@@ -456,8 +489,8 @@ impl SessionError {
 
     /// Const-length variant: returns the bytes as an owned `[u8; N]`
     /// so the caller skips the `try_into().expect(...)` dance. Use
-    /// when the expected length is a compile-time constant (prelude
-    /// head = 6, frame-length prefix = 2).
+    /// when the expected length is a compile-time constant (the
+    /// frame-length prefix = 2).
     fn recv_chunk<const N: usize>(bytes: &[u8]) -> Result<[u8; N], Self> {
         bytes.try_into().map_err(|_| Self::RecvLen {
             expected: N,
@@ -473,27 +506,20 @@ impl SessionError {
 enum RState {
     /// Terminal failure state. `step` and friends return WrongState.
     Failed,
-    /// Initial state. Ask the driver for 6 prelude head bytes.
-    WantPreludeHead,
-    /// Head validated; ask for `head[5]` identity body bytes.
-    WantPreludeBody {
-        head: [u8; 6],
-    },
-    /// Identity parsed; ask the driver to look up the PSK. The
-    /// `prelude` bytes (head + identity body) are carried forward to
-    /// be mixed into the Noise handshake transcript via
-    /// `Builder::prologue` once the PSK arrives.
+    /// Identity parsed out of msg1; ask the driver to look up the
+    /// PSK. `hs` is mid-handshake (msg1 consumed, msg2 not yet
+    /// written — it needs the PSK).
     NeedPsk {
+        hs: HandshakeState,
         identity: Identity,
-        prelude: Vec<u8>,
     },
     /// `Step::NeedPsk` has been emitted (identity moved out).
     /// Caller must invoke `set_psk` next; another `step()` here is
     /// a contract violation (`WrongState`).
     AwaitingPsk {
-        prelude: Vec<u8>,
+        hs: HandshakeState,
     },
-    /// PSK provided; ask for the 2-byte handshake-msg-1 length.
+    /// Initial state. Ask for the 2-byte handshake-msg-1 length.
     WantHsLen {
         hs: HandshakeState,
     },
@@ -541,13 +567,9 @@ enum RState {
 impl RState {
     fn phase(&self) -> Phase {
         match self {
-            RState::WantPreludeHead => Phase::PreludeHead,
-            RState::WantPreludeBody { .. } => Phase::PreludeBody,
+            RState::WantHsLen { .. } | RState::WantHsBody { .. } => Phase::Msg1,
             RState::NeedPsk { .. } | RState::AwaitingPsk { .. } => Phase::AwaitingPsk,
-            RState::WantHsLen { .. }
-            | RState::WantHsBody { .. }
-            | RState::WriteHs { .. }
-            | RState::WroteHsPending { .. } => Phase::Handshake,
+            RState::WriteHs { .. } | RState::WroteHsPending { .. } => Phase::Handshake,
             RState::WantReqLen { .. }
             | RState::WantReqBody { .. }
             | RState::HaveRequest { .. }
@@ -559,15 +581,15 @@ impl RState {
     }
 }
 
-/// Responder-side Noise NNpsk0 session state machine.
+/// Responder-side Noise NKpsk2 session state machine.
 ///
 /// Drive it like:
 /// ```ignore
-/// let mut sess = Responder::new();
+/// let mut sess = Responder::new(&broker_key)?;
 /// loop {
 ///     match sess.step()? {
 ///         Step::ReadExact { n } => sess.recv(&read_n_bytes(n).await?)?,
-///         Step::NeedPsk { identity } => sess.set_psk(lookup(&identity))?,
+///         Step::NeedPsk { identity } => sess.set_psk(lookup_or_random(&identity))?,
 ///         Step::Write(bytes) => { write_all(&bytes).await?; sess.wrote()?; }
 ///         Step::Request(plaintext) => sess.set_response(&handle(plaintext))?,
 ///         Step::Done => break,
@@ -585,18 +607,17 @@ pub struct Responder {
     scratch: Box<[u8; MAX_MESSAGE_SIZE]>,
 }
 
-impl Default for Responder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Responder {
-    pub fn new() -> Self {
-        Self {
-            state: RState::WantPreludeHead,
+    /// Build a responder around the broker's static private key. The
+    /// snow `HandshakeState` is constructed here (fallible: pattern
+    /// parse + key install); the PSK arrives later via `set_psk`
+    /// after msg1 reveals the client identity.
+    pub fn new(broker_key: &BrokerPrivateKey) -> Result<Self, SessionError> {
+        let hs = responder(broker_key)?;
+        Ok(Self {
+            state: RState::WantHsLen { hs },
             scratch: Box::new([0u8; MAX_MESSAGE_SIZE]),
-        }
+        })
     }
 
     /// Current protocol phase. Used by the driver to attribute clean
@@ -615,23 +636,14 @@ impl Responder {
     pub fn step(&mut self) -> Result<Step, SessionError> {
         let state_name: &str = (&self.state).into();
         match std::mem::replace(&mut self.state, RState::Failed) {
-            RState::WantPreludeHead => {
-                self.state = RState::WantPreludeHead;
-                Ok(Step::ReadExact { n: 6 })
-            }
-            RState::WantPreludeBody { head } => {
-                let n = head[5] as usize;
-                self.state = RState::WantPreludeBody { head };
-                Ok(Step::ReadExact { n })
-            }
-            RState::NeedPsk { identity, prelude } => {
+            RState::NeedPsk { hs, identity } => {
                 // Move the identity into the Step (zero clone). The
                 // contract is: caller MUST call `set_psk` next. A
                 // second `step()` before that returns WrongState
-                // via the catch-all below. `prelude` is held in
-                // AwaitingPsk so `set_psk` can mix it into the Noise
-                // handshake transcript.
-                self.state = RState::AwaitingPsk { prelude };
+                // via the catch-all below. `hs` is parked in
+                // AwaitingPsk mid-handshake (msg1 read, msg2 pending
+                // on the PSK).
+                self.state = RState::AwaitingPsk { hs };
                 Ok(Step::NeedPsk { identity })
             }
             RState::WantHsLen { hs } => {
@@ -684,29 +696,6 @@ impl Responder {
     pub fn recv(&mut self, bytes: &[u8]) -> Result<(), SessionError> {
         let state_name: &str = (&self.state).into();
         match std::mem::replace(&mut self.state, RState::Failed) {
-            RState::WantPreludeHead => {
-                let head = SessionError::recv_chunk::<6>(bytes)?;
-                // Validate magic+version+id_len BEFORE asking for the
-                // body. A hostile peer can't make us pull `id_len` more
-                // bytes unless the head is well-formed.
-                let _ = parse_prelude_head(&head)?;
-                self.state = RState::WantPreludeBody { head };
-                Ok(())
-            }
-            RState::WantPreludeBody { head } => {
-                let id_len = head[5] as usize;
-                SessionError::check_recv_len(id_len, bytes.len())?;
-                let identity = parse_prelude_body(bytes)?;
-                // Stash the full prelude (head + body) so `set_psk`
-                // can pass it as the Noise prologue. Both peers
-                // independently re-derive these bytes and so agree on
-                // the transcript hash.
-                let mut prelude = Vec::with_capacity(prelude_size(id_len));
-                prelude.extend_from_slice(&head);
-                prelude.extend_from_slice(bytes);
-                self.state = RState::NeedPsk { identity, prelude };
-                Ok(())
-            }
             RState::WantHsLen { hs } => {
                 let len_buf = SessionError::recv_chunk::<2>(bytes)?;
                 let body_len = read_frame_length(&len_buf)?;
@@ -715,11 +704,20 @@ impl Responder {
             }
             RState::WantHsBody { mut hs, body_len } => {
                 SessionError::check_recv_len(body_len, bytes.len())?;
-                handshake_read(&mut hs, bytes, &mut self.scratch[..])?;
-                // Produce handshake msg 2 immediately so the driver can emit it.
-                let n = handshake_write(&mut hs, &[], &mut self.scratch[..])?;
-                let out = frame(&self.scratch[..n])?;
-                self.state = RState::WriteHs { hs, out };
+                // Decrypt msg1; the payload plaintext is the identity
+                // TLV. Decryption needs only the broker static key —
+                // the PSK enters the transcript at msg2 (`psk2`).
+                let n = handshake_read(&mut hs, bytes, &mut self.scratch[..])?;
+                let (identity, consumed) = parse_identity_tlv(&self.scratch[..n])?;
+                // The payload must be exactly one TLV. Trailing bytes
+                // mean a peer speaking some extended dialect we never
+                // specified — reject rather than silently ignore.
+                if consumed != n {
+                    return Err(SessionError::TlvTrailingBytes {
+                        extra: n - consumed,
+                    });
+                }
+                self.state = RState::NeedPsk { hs, identity };
                 Ok(())
             }
             RState::WantReqLen { ts } => {
@@ -747,13 +745,24 @@ impl Responder {
         }
     }
 
-    /// Provide the PSK requested by the previous `Step::NeedPsk`.
+    /// Provide the PSK requested by the previous `Step::NeedPsk`
+    /// (the real one, or a random substitute for unknown identities —
+    /// see the `Step::NeedPsk` doc). Injects it into slot `PSK_SLOT`
+    /// and immediately produces framed handshake msg2.
     pub fn set_psk(&mut self, psk: Psk) -> Result<(), SessionError> {
         let state_name: &str = (&self.state).into();
         match std::mem::replace(&mut self.state, RState::Failed) {
-            RState::AwaitingPsk { prelude } => {
-                let hs = responder(&psk, &prelude)?;
-                self.state = RState::WantHsLen { hs };
+            RState::AwaitingPsk { mut hs } => {
+                // `Error::Input` here means a wrong-length key or an
+                // out-of-range slot — both impossible by construction
+                // (Psk is 32 bytes; PSK_SLOT matches NOISE_PATTERN).
+                // Surfaced as HandshakeWrite since it aborts msg2
+                // production.
+                hs.set_psk(usize::from(PSK_SLOT), psk.as_bytes())
+                    .map_err(SessionError::HandshakeWrite)?;
+                let n = handshake_write(&mut hs, &[], &mut self.scratch[..])?;
+                let out = frame(&self.scratch[..n])?;
+                self.state = RState::WriteHs { hs, out };
                 Ok(())
             }
             other => {
@@ -818,18 +827,7 @@ impl Responder {
 #[strum(serialize_all = "snake_case")]
 enum IState {
     Failed,
-    /// Emit the prelude bytes.
-    WritePrelude {
-        hs: HandshakeState,
-        prelude: Vec<u8>,
-        request: Vec<u8>,
-    },
-    /// Prelude bytes handed to driver; awaiting `wrote()`.
-    WrotePreludePending {
-        hs: HandshakeState,
-        request: Vec<u8>,
-    },
-    /// Emit framed handshake msg 1.
+    /// Emit framed handshake msg 1 (identity TLV as encrypted payload).
     WriteHs1 {
         hs: HandshakeState,
         msg1: Vec<u8>,
@@ -880,11 +878,8 @@ enum IState {
 impl IState {
     fn phase(&self) -> Phase {
         match self {
-            IState::WritePrelude { .. } | IState::WrotePreludePending { .. } => Phase::PreludeHead,
-            IState::WriteHs1 { .. }
-            | IState::WroteHs1Pending { .. }
-            | IState::WantHs2Len { .. }
-            | IState::WantHs2Body { .. } => Phase::Handshake,
+            IState::WriteHs1 { .. } | IState::WroteHs1Pending { .. } => Phase::Msg1,
+            IState::WantHs2Len { .. } | IState::WantHs2Body { .. } => Phase::Handshake,
             IState::WriteReq { .. }
             | IState::WroteReqPending { .. }
             | IState::WantRespLen { .. }
@@ -894,12 +889,13 @@ impl IState {
     }
 }
 
-/// Initiator-side Noise NNpsk0 session state machine.
+/// Initiator-side Noise NKpsk2 session state machine.
 ///
-/// Identity, PSK, and request bytes are known up front (the client
-/// binary reads stdin before opening the socket), so they're consumed
-/// by `Initiator::new`. The driver pumps `step()` until `Step::Done`,
-/// then calls `take_response()` to recover the decrypted plaintext.
+/// Identity, PSK, broker public key, and request bytes are known up
+/// front (the client binary reads stdin before opening the socket),
+/// so they're consumed by `Initiator::new`. The driver pumps `step()`
+/// until `Step::Done`, then calls `take_response()` to recover the
+/// decrypted plaintext.
 pub struct Initiator {
     state: IState,
     /// One per-session scratch buffer reused across handshake-step
@@ -908,20 +904,23 @@ pub struct Initiator {
 }
 
 impl Initiator {
-    pub fn new(identity: Identity, psk: Psk, request: Vec<u8>) -> Result<Self, SessionError> {
-        let prelude = encode_prelude(&identity);
-        // The cleartext prelude is the only out-of-band data both
-        // peers agree on; bind it into the Noise handshake transcript
-        // so an in-flight tamper of magic/version/identity bytes
-        // surfaces as a handshake failure rather than silently.
-        let hs = initiator(&psk, &prelude)?;
+    pub fn new(
+        identity: Identity,
+        psk: Psk,
+        broker_pub: &BrokerPublicKey,
+        request: Vec<u8>,
+    ) -> Result<Self, SessionError> {
+        let mut hs = initiator(&psk, broker_pub)?;
+        // msg1 carries the identity TLV as its (encrypted) payload;
+        // everything needed to produce it is in hand, so compute it
+        // here and start the machine at the write step.
+        let tlv = encode_identity_tlv(&identity);
+        let mut scratch = Box::new([0u8; MAX_MESSAGE_SIZE]);
+        let n = handshake_write(&mut hs, &tlv, &mut scratch[..])?;
+        let msg1 = frame(&scratch[..n])?;
         Ok(Self {
-            state: IState::WritePrelude {
-                hs,
-                prelude,
-                request,
-            },
-            scratch: Box::new([0u8; MAX_MESSAGE_SIZE]),
+            state: IState::WriteHs1 { hs, msg1, request },
+            scratch,
         })
     }
 
@@ -932,14 +931,6 @@ impl Initiator {
     pub fn step(&mut self) -> Result<Step, SessionError> {
         let state_name: &str = (&self.state).into();
         match std::mem::replace(&mut self.state, IState::Failed) {
-            IState::WritePrelude {
-                hs,
-                prelude,
-                request,
-            } => {
-                self.state = IState::WrotePreludePending { hs, request };
-                Ok(Step::Write(prelude))
-            }
             IState::WriteHs1 { hs, msg1, request } => {
                 self.state = IState::WroteHs1Pending { hs, request };
                 Ok(Step::Write(msg1))
@@ -1040,13 +1031,6 @@ impl Initiator {
     pub fn wrote(&mut self) -> Result<(), SessionError> {
         let state_name: &str = (&self.state).into();
         match std::mem::replace(&mut self.state, IState::Failed) {
-            IState::WrotePreludePending { mut hs, request } => {
-                // Compute handshake msg 1 now that the prelude is on the wire.
-                let n = handshake_write(&mut hs, &[], &mut self.scratch[..])?;
-                let msg1 = frame(&self.scratch[..n])?;
-                self.state = IState::WriteHs1 { hs, msg1, request };
-                Ok(())
-            }
             IState::WroteHs1Pending { hs, request } => {
                 self.state = IState::WantHs2Len { hs, request };
                 Ok(())
@@ -1090,22 +1074,37 @@ mod tests {
         Identity::parse("dev-vm-1.test_03").unwrap()
     }
 
+    fn broker_key() -> BrokerPrivateKey {
+        BrokerPrivateKey::from([7u8; 32])
+    }
+
+    fn broker_pub() -> BrokerPublicKey {
+        broker_key().derive_public()
+    }
+
+    /// The pattern string is the protocol contract; snow must parse it.
     #[test]
-    fn prelude_round_trip() {
+    fn noise_pattern_parses() {
+        let params: Result<NoiseParams, _> = NOISE_PATTERN.parse();
+        assert!(params.is_ok(), "snow rejected {NOISE_PATTERN}");
+    }
+
+    #[test]
+    fn tlv_round_trip() {
         let id = good_identity();
-        let bytes = encode_prelude(&id);
-        assert_eq!(bytes.len(), prelude_size(id.as_str().len()));
-        let (parsed, consumed) = parse_prelude(&bytes).expect("round-trip parse");
+        let bytes = encode_identity_tlv(&id);
+        assert_eq!(bytes.len(), identity_tlv_size(id.as_str().len()));
+        let (parsed, consumed) = parse_identity_tlv(&bytes).expect("round-trip parse");
         assert_eq!(parsed, id);
         assert_eq!(consumed, bytes.len());
     }
 
     #[test]
-    fn prelude_rejects_short_buffer() {
+    fn tlv_rejects_short_buffer() {
         for prefix_len in 0..6 {
             let bytes = vec![0u8; prefix_len];
-            match parse_prelude(&bytes) {
-                Err(PreludeError::Incomplete { needed }) => {
+            match parse_identity_tlv(&bytes) {
+                Err(TlvError::Incomplete { needed }) => {
                     assert_eq!(needed, 6 - prefix_len);
                 }
                 other => panic!("expected Incomplete, got {other:?}"),
@@ -1114,101 +1113,118 @@ mod tests {
     }
 
     #[test]
-    fn prelude_rejects_bad_magic() {
-        let mut bytes = encode_prelude(&Identity::parse("foo").unwrap());
+    fn tlv_rejects_bad_magic() {
+        let mut bytes = encode_identity_tlv(&Identity::parse("foo").unwrap());
         bytes[0] = b'X';
         assert!(matches!(
-            parse_prelude(&bytes),
-            Err(PreludeError::BadMagic { .. })
+            parse_identity_tlv(&bytes),
+            Err(TlvError::BadMagic { .. })
         ));
     }
 
     #[test]
-    fn prelude_rejects_bad_version() {
-        let mut bytes = encode_prelude(&Identity::parse("foo").unwrap());
+    fn tlv_rejects_bad_version() {
+        let mut bytes = encode_identity_tlv(&Identity::parse("foo").unwrap());
         bytes[4] = 0x99;
         assert!(matches!(
-            parse_prelude(&bytes),
-            Err(PreludeError::BadVersion { got: 0x99 })
+            parse_identity_tlv(&bytes),
+            Err(TlvError::BadVersion { got: 0x99 })
+        ));
+    }
+
+    /// Version 1 is the retired cleartext-prelude wire format; a v2
+    /// broker must reject it, not half-work.
+    #[test]
+    fn tlv_rejects_version_1() {
+        let mut bytes = encode_identity_tlv(&Identity::parse("foo").unwrap());
+        bytes[4] = 0x01;
+        assert!(matches!(
+            parse_identity_tlv(&bytes),
+            Err(TlvError::BadVersion { got: 0x01 })
         ));
     }
 
     #[test]
-    fn prelude_rejects_zero_length() {
-        // Hand-build a malformed prelude with id_len = 0.
+    fn tlv_rejects_zero_length() {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&PRELUDE_MAGIC);
-        bytes.push(PRELUDE_VERSION);
+        bytes.extend_from_slice(&TLV_MAGIC);
+        bytes.push(TLV_VERSION);
         bytes.push(0);
         assert!(matches!(
-            parse_prelude(&bytes),
-            Err(PreludeError::BadIdentityLen { got: 0 })
+            parse_identity_tlv(&bytes),
+            Err(TlvError::BadIdentityLen { got: 0 })
         ));
     }
 
     #[test]
-    fn prelude_rejects_oversized_id_len() {
+    fn tlv_rejects_oversized_id_len() {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&PRELUDE_MAGIC);
-        bytes.push(PRELUDE_VERSION);
+        bytes.extend_from_slice(&TLV_MAGIC);
+        bytes.push(TLV_VERSION);
         bytes.push((Identity::MAX_LEN as u8) + 1);
         bytes.resize(bytes.len() + Identity::MAX_LEN + 1, b'a');
         assert!(matches!(
-            parse_prelude(&bytes),
-            Err(PreludeError::BadIdentityLen { .. })
+            parse_identity_tlv(&bytes),
+            Err(TlvError::BadIdentityLen { .. })
         ));
     }
 
     #[test]
-    fn prelude_rejects_incomplete_identity() {
+    fn tlv_rejects_incomplete_identity() {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&PRELUDE_MAGIC);
-        bytes.push(PRELUDE_VERSION);
+        bytes.extend_from_slice(&TLV_MAGIC);
+        bytes.push(TLV_VERSION);
         bytes.push(10);
         // ...but only 3 identity bytes follow
         bytes.extend_from_slice(b"abc");
-        match parse_prelude(&bytes) {
-            Err(PreludeError::Incomplete { needed }) => assert_eq!(needed, 7),
+        match parse_identity_tlv(&bytes) {
+            Err(TlvError::Incomplete { needed }) => assert_eq!(needed, 7),
             other => panic!("expected Incomplete, got {other:?}"),
         }
     }
 
     #[test]
-    fn prelude_rejects_invalid_charset() {
+    fn tlv_rejects_invalid_charset() {
         // CR is the canonical Clone2Leak-class injection byte we defend against
         // in git_credential too.
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&PRELUDE_MAGIC);
-        bytes.push(PRELUDE_VERSION);
+        bytes.extend_from_slice(&TLV_MAGIC);
+        bytes.push(TLV_VERSION);
         bytes.push(3);
         bytes.extend_from_slice(b"a\rb");
         assert!(matches!(
-            parse_prelude(&bytes),
-            Err(PreludeError::InvalidCharset {
+            parse_identity_tlv(&bytes),
+            Err(TlvError::InvalidCharset {
                 offset: 1,
                 byte: b'\r'
             })
         ));
     }
 
-    /// End-to-end Noise NNpsk0 handshake + a transport-mode message round-trip,
-    /// driven entirely in-memory.
+    /// End-to-end Noise NKpsk2 handshake + a transport-mode message
+    /// round-trip, driven entirely in-memory through the free
+    /// functions (the state machines get their own test below).
     #[test]
     fn noise_handshake_round_trip() {
         let psk = Psk::from([0x42u8; 32]);
+        let tlv = encode_identity_tlv(&good_identity());
 
-        let mut initiator_hs = initiator(&psk, &[]).expect("build initiator");
-        let mut responder_hs = responder(&psk, &[]).expect("build responder");
+        let mut initiator_hs = initiator(&psk, &broker_pub()).expect("build initiator");
+        let mut responder_hs = responder(&broker_key()).expect("build responder");
 
         let mut buf_i_to_r = [0u8; MAX_MESSAGE_SIZE];
         let mut buf_r_to_i = [0u8; MAX_MESSAGE_SIZE];
         let mut out = [0u8; MAX_MESSAGE_SIZE];
 
-        // -> psk, e
-        let n = handshake_write(&mut initiator_hs, &[], &mut buf_i_to_r).unwrap();
-        let _ = handshake_read(&mut responder_hs, &buf_i_to_r[..n], &mut out).unwrap();
+        // -> e, es (identity TLV as encrypted payload)
+        let n = handshake_write(&mut initiator_hs, &tlv, &mut buf_i_to_r).unwrap();
+        let m = handshake_read(&mut responder_hs, &buf_i_to_r[..n], &mut out).unwrap();
+        assert_eq!(&out[..m], &tlv[..], "responder must recover the TLV");
 
-        // <- e, ee
+        // PSK selected from the decrypted identity, then <- e, ee, psk
+        responder_hs
+            .set_psk(usize::from(PSK_SLOT), psk.as_bytes())
+            .unwrap();
         let n = handshake_write(&mut responder_hs, &[], &mut buf_r_to_i).unwrap();
         let _ = handshake_read(&mut initiator_hs, &buf_r_to_i[..n], &mut out).unwrap();
 
@@ -1232,18 +1248,42 @@ mod tests {
         assert_eq!(&pt[..m], b"hi back");
     }
 
-    /// Wrong-PSK handshake must fail at the responder's read of message 1
-    /// (the psk0 mix means the binder check fails).
+    /// With psk2 a PSK mismatch surfaces at the INITIATOR's read of
+    /// msg2 (the psk token is mixed at the end of message 2). The
+    /// responder's msg2 write succeeds — its side fails later, at the
+    /// first transport read. Both halves asserted here; together they
+    /// are the mechanism behind the anti-enumeration property.
     #[test]
-    fn noise_wrong_psk_rejected() {
-        let mut initiator_hs = initiator(&Psk::from([0xaa; 32]), &[]).unwrap();
-        let mut responder_hs = responder(&Psk::from([0xbb; 32]), &[]).unwrap();
+    fn noise_wrong_psk_fails_at_msg2_read_and_transport() {
+        let tlv = encode_identity_tlv(&good_identity());
+        let mut initiator_hs = initiator(&Psk::from([0xaa; 32]), &broker_pub()).unwrap();
+        let mut responder_hs = responder(&broker_key()).unwrap();
 
-        let mut buf = [0u8; MAX_MESSAGE_SIZE];
+        let mut wire = [0u8; MAX_MESSAGE_SIZE];
         let mut out = [0u8; MAX_MESSAGE_SIZE];
-        let n = handshake_write(&mut initiator_hs, &[], &mut buf).unwrap();
-        let res = handshake_read(&mut responder_hs, &buf[..n], &mut out);
-        assert!(res.is_err(), "responder must reject mismatched PSK");
+        let n = handshake_write(&mut initiator_hs, &tlv, &mut wire).unwrap();
+        let _ = handshake_read(&mut responder_hs, &wire[..n], &mut out).unwrap();
+
+        // Responder substitutes a different PSK (e.g. the random
+        // anti-enumeration substitute) — msg2 production MUST succeed.
+        responder_hs
+            .set_psk(usize::from(PSK_SLOT), Psk::from([0xbb; 32]).as_bytes())
+            .unwrap();
+        let n = handshake_write(&mut responder_hs, &[], &mut wire).unwrap();
+
+        // Initiator side: msg2 tag check fails.
+        assert!(
+            handshake_read(&mut initiator_hs, &wire[..n], &mut out).is_err(),
+            "initiator must reject msg2 built with a different PSK"
+        );
+
+        // Responder side: handshake "completed" from its view; the
+        // mismatch surfaces only when a transport frame arrives.
+        let mut responder_ts = into_transport(responder_hs).unwrap();
+        assert!(
+            transport_read(&mut responder_ts, b"any bytes at all!", &mut out).is_err(),
+            "responder must fail at first transport decrypt"
+        );
     }
 
     #[test]
@@ -1277,10 +1317,11 @@ mod tests {
         let request = b"protocol=https\nhost=github.com\npath=foo/bar\n\n".to_vec();
         let response_plain = b"username=x-access-token\npassword=ghs_abc\n\n".to_vec();
 
-        let mut server = Responder::new();
+        let mut server = Responder::new(&broker_key()).expect("build responder");
         let mut client = Initiator::new(
             Identity::parse("dev-vm-1.test_03").unwrap(),
             psk,
+            &broker_pub(),
             request.clone(),
         )
         .expect("build initiator");
@@ -1348,75 +1389,138 @@ mod tests {
         assert_eq!(resp, response_plain, "client-decrypted response must match");
     }
 
-    /// Regression test for the double-parse_prelude bug: a bad-magic
-    /// head must surface from the FIRST `recv` (after 6 bytes), not
-    /// after the second body read. Pulls `id_len` more bytes from a
-    /// hostile peer only if the head is well-formed.
+    /// Craft a framed msg1 whose (validly encrypted) payload is an
+    /// arbitrary byte string — the vehicle for feeding malformed TLVs
+    /// through a real handshake to the responder state machine.
+    fn framed_msg1_with_payload(payload: &[u8]) -> Vec<u8> {
+        let mut hs = initiator(&Psk::from([0x42u8; 32]), &broker_pub()).unwrap();
+        let mut buf = [0u8; MAX_MESSAGE_SIZE];
+        let n = handshake_write(&mut hs, payload, &mut buf).unwrap();
+        frame(&buf[..n]).unwrap()
+    }
+
+    /// Feed one framed message through the Responder's two-read
+    /// (length, body) sequence and return the second recv's result.
+    fn feed_framed(sess: &mut Responder, framed: &[u8]) -> Result<(), SessionError> {
+        assert!(matches!(sess.step().unwrap(), Step::ReadExact { n: 2 }));
+        sess.recv(&framed[..2])?;
+        let n = match sess.step().unwrap() {
+            Step::ReadExact { n } => n,
+            other => panic!("expected body read, got {other:?}"),
+        };
+        assert_eq!(n, framed.len() - 2);
+        sess.recv(&framed[2..])
+    }
+
     #[test]
-    fn responder_rejects_bad_magic_after_first_read() {
-        let mut sess = Responder::new();
-        assert!(matches!(sess.step().unwrap(), Step::ReadExact { n: 6 }));
-        // Feed 6 bytes with wrong magic.
-        let bad = b"XXXX\x01\x05";
-        let err = sess.recv(bad).expect_err("must reject bad magic");
+    fn responder_rejects_bad_magic_in_msg1_payload() {
+        let mut sess = Responder::new(&broker_key()).unwrap();
+        let mut tlv = encode_identity_tlv(&good_identity());
+        tlv[0] = b'X';
+        let err = feed_framed(&mut sess, &framed_msg1_with_payload(&tlv))
+            .expect_err("must reject bad magic");
         assert!(
-            matches!(err, SessionError::PreludeBadMagic { .. }),
+            matches!(err, SessionError::TlvBadMagic { .. }),
             "got {err:?}"
         );
     }
 
     #[test]
-    fn responder_rejects_bad_version_after_first_read() {
-        let mut sess = Responder::new();
-        assert!(matches!(sess.step().unwrap(), Step::ReadExact { n: 6 }));
-        let mut head = [0u8; 6];
-        head[0..4].copy_from_slice(&PRELUDE_MAGIC);
-        head[4] = 0x99; // wrong version
-        head[5] = 5;
-        let err = sess.recv(&head).expect_err("must reject bad version");
+    fn responder_rejects_bad_version_in_msg1_payload() {
+        let mut sess = Responder::new(&broker_key()).unwrap();
+        let mut tlv = encode_identity_tlv(&good_identity());
+        tlv[4] = 0x99;
+        let err = feed_framed(&mut sess, &framed_msg1_with_payload(&tlv))
+            .expect_err("must reject bad version");
         assert!(
-            matches!(err, SessionError::PreludeBadVersion { got: 0x99 }),
+            matches!(err, SessionError::TlvBadVersion { got: 0x99 }),
             "got {err:?}"
         );
     }
 
     #[test]
-    fn responder_rejects_bad_id_len_after_first_read() {
-        let mut sess = Responder::new();
-        assert!(matches!(sess.step().unwrap(), Step::ReadExact { n: 6 }));
-        let mut head = [0u8; 6];
-        head[0..4].copy_from_slice(&PRELUDE_MAGIC);
-        head[4] = PRELUDE_VERSION;
-        head[5] = 0; // bad id_len
-        let err = sess.recv(&head).expect_err("must reject zero id_len");
+    fn responder_rejects_bad_id_len_in_msg1_payload() {
+        let mut sess = Responder::new(&broker_key()).unwrap();
+        let mut tlv = encode_identity_tlv(&good_identity());
+        tlv[5] = 0;
+        // Truncate to head-only so the declared len (0) drives parse.
+        tlv.truncate(6);
+        let err = feed_framed(&mut sess, &framed_msg1_with_payload(&tlv))
+            .expect_err("must reject zero id_len");
         assert!(
-            matches!(err, SessionError::PreludeBadIdentityLen { got: 0 }),
+            matches!(err, SessionError::TlvBadIdentityLen { got: 0 }),
             "got {err:?}"
         );
     }
 
     #[test]
-    fn responder_rejects_invalid_charset_after_body_read() {
-        let mut sess = Responder::new();
-        assert!(matches!(sess.step().unwrap(), Step::ReadExact { n: 6 }));
-        let mut head = [0u8; 6];
-        head[0..4].copy_from_slice(&PRELUDE_MAGIC);
-        head[4] = PRELUDE_VERSION;
-        head[5] = 3;
-        sess.recv(&head).expect("head ok");
-        assert!(matches!(sess.step().unwrap(), Step::ReadExact { n: 3 }));
+    fn responder_rejects_invalid_charset_in_msg1_payload() {
+        let mut sess = Responder::new(&broker_key()).unwrap();
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&TLV_MAGIC);
+        bad.push(TLV_VERSION);
+        bad.push(3);
         // CR byte = Clone2Leak-class injection attempt.
-        let body = b"a\rb";
-        let err = sess.recv(body).expect_err("charset must reject CR");
+        bad.extend_from_slice(b"a\rb");
+        let err = feed_framed(&mut sess, &framed_msg1_with_payload(&bad))
+            .expect_err("charset must reject CR");
         assert!(
             matches!(
                 err,
-                SessionError::PreludeInvalidCharset {
+                SessionError::TlvInvalidCharset {
                     offset: 1,
                     byte: b'\r'
                 }
             ),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn responder_rejects_trailing_bytes_in_msg1_payload() {
+        let mut sess = Responder::new(&broker_key()).unwrap();
+        let mut tlv = encode_identity_tlv(&good_identity());
+        tlv.extend_from_slice(b"extra");
+        let err = feed_framed(&mut sess, &framed_msg1_with_payload(&tlv))
+            .expect_err("must reject trailing bytes");
+        assert!(
+            matches!(err, SessionError::TlvTrailingBytes { extra: 5 }),
+            "got {err:?}"
+        );
+    }
+
+    /// The anti-enumeration walk: a responder given a random
+    /// substitute PSK for an unknown identity still produces msg2
+    /// (same shape as the real one) and only fails at the first
+    /// transport frame. This is the state-machine mirror of
+    /// `noise_wrong_psk_fails_at_msg2_read_and_transport`.
+    #[test]
+    fn responder_with_substitute_psk_dies_at_transport_frame() {
+        let mut sess = Responder::new(&broker_key()).unwrap();
+        let tlv = encode_identity_tlv(&good_identity());
+        feed_framed(&mut sess, &framed_msg1_with_payload(&tlv)).expect("msg1 accepted");
+
+        let identity = match sess.step().unwrap() {
+            Step::NeedPsk { identity } => identity,
+            other => panic!("expected NeedPsk, got {other:?}"),
+        };
+        assert_eq!(identity, good_identity());
+
+        // Substitute PSK (the initiator used 0x42; this is not it).
+        sess.set_psk(Psk::from([0xbb; 32])).expect("set_psk");
+
+        // msg2 is produced normally.
+        let msg2 = match sess.step().unwrap() {
+            Step::Write(bytes) => bytes,
+            other => panic!("expected Write(msg2), got {other:?}"),
+        };
+        assert!(!msg2.is_empty());
+        sess.wrote().expect("wrote");
+
+        // First transport frame fails to decrypt — that is the
+        // designed failure point.
+        let garbage = frame(b"not a valid noise transport message").unwrap();
+        let err = feed_framed(&mut sess, &garbage).expect_err("decrypt must fail");
+        assert!(matches!(err, SessionError::TransportRead(_)), "got {err:?}");
     }
 }

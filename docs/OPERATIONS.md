@@ -17,7 +17,7 @@ Access is gated entirely by filesystem permissions on the socket's
 parent directory (`/run/symbolon/` mode `0o750`, group `symbolon`)
 and the socket inode itself (mode `0o600` under systemd's
 `SocketMode=`; under `systemfd` + OpenRC the dir mode is the only
-gate — see [INSTALL.md](INSTALL.md) §3.10). Run the commands as
+gate — see [INSTALL.md](INSTALL.md) §3.11). Run the commands as
 root or as a user in the `symbolon` group.
 
 ## Commands
@@ -34,7 +34,7 @@ go to stderr; exit code is `0` on success, `1` on any error.
 symbolon daemon
     Run the broker daemon. Expects pre-bound listeners via the
     LISTEN_FDS env protocol (systemd .socket unit or systemfd
-    wrapper) — see INSTALL.md §§3.8–3.10.
+    wrapper) — see INSTALL.md §§3.9–3.11.
 
 symbolon status
     Print daemon liveness:
@@ -53,6 +53,14 @@ symbolon list
                   …]}
     Order is HashMap-iteration order — pipe through `jq` if you
     want it sorted.
+
+symbolon pubkey
+    Print the broker's static public key:
+      {"ok":true,
+       "broker_public_key":"<64 hex chars>"}
+    This is the first half of every client's key file
+    (`broker_pub_hex:psk_hex`); fetch it once per enrollment
+    batch. Also logged on the `startup` event.
 ```
 
 ### Per-provider
@@ -148,7 +156,7 @@ ls -l /run/symbolon/admin.sock   # admin UDS, owner+mode set by supervisor:
 If the admin socket is missing after a reboot: `/run` is tmpfs,
 cleared at boot. `checkpath` (OpenRC) or `tmpfiles.d` (systemd)
 must recreate `/run/symbolon`. See
-[INSTALL.md §3.8 / §3.9](INSTALL.md).
+[INSTALL.md §3.9 / §3.10](INSTALL.md).
 
 **3. Can the client reach the broker over Noise?**
 
@@ -161,14 +169,18 @@ path=octocat/Spoon-Knife
 ' | git-credential-symbolon \
     --endpoint broker.lan:9418 \
     --identity dev-vm-1 \
-    --psk-file /etc/symbolon/psk \
+    --key-file /etc/symbolon/key \
     get
 ```
 
 A successful response prints `username`, `password`, and
 `password_expiry_utc` on stdout. If the helper exits non-zero with
 a stderr message, the cause is a PSK mismatch, an unknown identity
-on the broker side, or a network path block.
+on the broker side, a stale broker public key in the key file, or
+a network path block. The first three are deliberately
+indistinguishable from the client side (anti-enumeration; see
+[PROTOCOLS.md § Anti-enumeration](PROTOCOLS.md#anti-enumeration-unauthorized-identities))
+— the broker's log tells them apart.
 
 **4. Can a mint succeed end to end?**
 
@@ -198,11 +210,20 @@ Find the `req_id` of the failing request and trace it from
   you ran `symbolon daemon` without a supervisor. The daemon does
   not bind sockets itself — it expects pre-bound fds from systemd's
   `.socket` unit or from the `systemfd` wrapper. See [INSTALL.md
-  §§ 3.8–3.10](INSTALL.md). For dev, prefix with `systemfd -s tcp::… -s unix::… --`.
-- **`mint_denied reason=client_unknown`**: the PSK identity from
-  the Noise prelude didn't match any enrolled client. Either the
-  client's `--identity` flag is wrong, the client was revoked, or
-  the operator and client disagree about the spelling.
+  §§ 3.9–3.11](INSTALL.md). For dev, prefix with `systemfd -s tcp::… -s unix::… --`.
+- **`identity_unknown`**: the identity decrypted out of handshake
+  msg1 didn't match any enrolled client. Either the client's
+  `--identity` flag is wrong, the client was revoked, or the
+  operator and client disagree about the spelling. The client-side
+  symptom is a handshake failure reading msg2 (identical to a
+  wrong PSK — deliberate; anti-enumeration). This event is
+  rate-limited (burst 10, 10/min sustained, `suppressed=N` counts
+  the gap), so a probe flood can't drown the journal.
+- **`mint_denied reason=client_metadata_missing`**: the identity
+  has a PSK entry but no `clients.json` record — the two state
+  files are desynced (e.g. a partial restore from backup). The
+  session is refused. Restore both files from the same backup, or
+  revoke + re-enroll the client.
 - **`mint_denied reason=unknown_host`**: the credential helper
   sent a `host=` that isn't one of the configured providers. The
   match is byte-exact against `provider.<name>.host`. No suffix
@@ -243,9 +264,11 @@ symbolon github revoke <client>
 ```
 
 This removes the client's PSK entry from the daemon's PSK store
-and from `clients.json`. Subsequent handshakes from that identity
-are rejected with `evt=mint_denied reason=client_unknown` before
-the handshake completes.
+and from `clients.json`. Subsequent connections from that identity
+log `evt=identity_unknown` and die at the transport stage without
+ever reaching the mint path (the broker substitutes a random PSK,
+so the revoked client's handshake fails exactly like a wrong-PSK
+attempt).
 
 **Tokens already minted are not invalidated.** They live their
 full provider-side TTL regardless. For hard cutoff (kill all
@@ -255,6 +278,48 @@ rotation, App uninstall, etc.).
 
 To stop all clients at once: stop the symbolon daemon. Restart
 when the situation is resolved.
+
+## Suspected broker compromise
+
+The broker host holds three classes of secret side by side: the
+provider private key(s), the per-client PSKs, and the broker
+static key. If the host may have been compromised, assume all
+three leaked — they are co-resident, and an attacker who could
+read one could read the others. The response is a full
+re-enrollment, not a selective rotation:
+
+1. Rotate the provider credentials first (for GitHub: generate a
+   new App private key and revoke the old one — see
+   [providers/github.md](providers/github.md)). This is the secret
+   with reach beyond the broker.
+2. Generate a new broker static key on the (rebuilt or verified)
+   host:
+
+   ```sh
+   openssl rand -hex 32 > /etc/symbolon/broker.key
+   chmod 0400 /etc/symbolon/broker.key
+   ```
+
+3. Delete `/var/lib/symbolon/psks` and `/var/lib/symbolon/clients.json`,
+   restart the daemon, and re-enroll every client. Each client
+   gets a fresh PSK **and** the new broker public key (from
+   `symbolon pubkey`) in one key-file update — the two travel
+   together through the same enrollment channel, so this costs
+   one file write per client either way.
+
+There is deliberately no broker-key rotation machinery (no key
+ids, no trial decryption, no overlap window): PSKs are weeks-lived
+and re-enrollment is the recovery path anyway, so rotation
+tooling would add attack surface without removing operator work.
+Note the accepted residual documented in
+[PROTOCOLS.md § Identity confidentiality](PROTOCOLS.md#identity-confidentiality-protocol-level-guarantees):
+a leaked broker static key retroactively decrypts client
+identities (not credentials) in any recorded traffic.
+
+Outside of incidents, you MAY rotate a single client's PSK at any
+time (`revoke` + `enroll`), or the broker static key (regenerate
+the file, restart, update every client key file) — both are just
+the enrollment steps re-run.
 
 ## Updating
 
@@ -290,10 +355,15 @@ What to back up:
 - The provider key file (path per provider; for GitHub typically
   `/etc/symbolon/github-app.pem`). Treat as a secret; back up to
   a place at least as protected as the broker itself.
+- `/etc/symbolon/broker.key`: the broker static X25519 key. Treat
+  as a secret, same rule as above. Losing it (without a backup)
+  means re-enrolling every client — their key files pin the
+  matching public key.
 - `/var/lib/symbolon/psks`: per-client PSKs. Treat as a secret;
   back up to a place at least as protected as the broker itself.
-  Restoring this alongside `clients.json` is sufficient to keep
-  existing clients working without re-enrolling.
+  Restoring this alongside `clients.json` and `broker.key` is
+  sufficient to keep existing clients working without
+  re-enrolling.
 
 What NOT to back up:
 

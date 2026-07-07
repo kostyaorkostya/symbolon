@@ -2343,6 +2343,7 @@ dependencies = [
  "async-trait",
  "base64",
  "compio",
+ "curve25519-dalek",
  "cyper",
  "derive_more",
  "futures-channel",

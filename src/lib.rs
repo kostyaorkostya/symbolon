@@ -26,6 +26,7 @@
 
 pub mod admin;
 pub mod atomic_fs;
+pub mod broker_key;
 pub mod config;
 pub mod connection_tracker;
 pub mod cpu_worker;
@@ -41,6 +42,7 @@ pub mod note;
 pub mod providers;
 pub mod psk;
 pub mod psk_store;
+pub mod rate_limit;
 pub mod ready;
 pub mod sandbox;
 pub mod signals;
@@ -57,6 +59,8 @@ pub mod ttl_cache;
 
 #[doc(hidden)]
 pub use crate::admin::{CliCommand, cli_dispatch};
+#[doc(hidden)]
+pub use crate::broker_key::{BrokerPrivateKey, BrokerPublicKey};
 #[doc(hidden)]
 pub use crate::config::{
     AdminConfig, ClientsConfig, Config, ListenConfig, LoggingConfig, MlockMode, ProviderGithub,
@@ -91,4 +95,4 @@ pub use crate::signals::spawn_shutdown_watcher;
 #[doc(hidden)]
 pub use crate::git_credential::Request as GitCredentialRequest;
 #[doc(hidden)]
-pub use crate::transport::parse_prelude as parse_identity_prelude;
+pub use crate::transport::parse_identity_tlv;

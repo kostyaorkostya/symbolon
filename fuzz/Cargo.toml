@@ -24,8 +24,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "identity_prelude_parse"
-path = "fuzz_targets/identity_prelude_parse.rs"
+name = "identity_tlv_parse"
+path = "fuzz_targets/identity_tlv_parse.rs"
 test = false
 doc = false
 bench = false

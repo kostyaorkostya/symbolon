@@ -1,6 +1,8 @@
-//! Fuzz the identity-prelude parser. The prelude carries the
-//! client identity that drives PSK selection on the daemon side
-//! (AGENTS.md invariant #7).
+//! Fuzz the identity-TLV parser. The TLV rides as the (encrypted)
+//! payload of Noise handshake msg1 and carries the client identity
+//! that drives PSK selection on the daemon side (AGENTS.md invariant
+//! #7); the daemon parses it from the decrypted payload bytes, which
+//! the peer fully controls.
 //! When parsing succeeds, this harness asserts post-conditions:
 //!
 //! - `consumed >= 6 && consumed <= input.len()` (parser never reads
@@ -15,11 +17,8 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    if let Ok((identity, consumed)) = symbolon::parse_identity_prelude(data) {
-        assert!(
-            consumed >= 6,
-            "consumed {consumed} < 6-byte minimum prelude"
-        );
+    if let Ok((identity, consumed)) = symbolon::parse_identity_tlv(data) {
+        assert!(consumed >= 6, "consumed {consumed} < 6-byte minimum TLV");
         assert!(
             consumed <= data.len(),
             "consumed {consumed} > input len {}",

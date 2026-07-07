@@ -24,10 +24,15 @@ See also:
 # Informational — the daemon does NOT bind sockets itself; the
 # supervisor (systemd `.socket` unit or `systemfd` wrapper) hands
 # pre-bound fds via the `LISTEN_FDS` env protocol. Slot 0 = TCP
-# wire, slot 1 = admin UDS. See INSTALL.md §§3.8–3.10.
+# wire, slot 1 = admin UDS. See INSTALL.md §§3.9–3.11.
 bind = "0.0.0.0:9418"
 # Symbolon-owned PSK store. Mutated atomically on enroll/revoke.
 psk_file = "/var/lib/symbolon/psks"
+# Broker static X25519 private key: 64 hex chars on one line.
+# Operator-generated (`openssl rand -hex 32`), mode 0400. Read once
+# at startup, before the sandbox closes. Rotating it invalidates
+# every client's pinned public key — see OPERATIONS.md.
+static_key_file = "/etc/symbolon/broker.key"
 
 [admin]
 # Path the CLI connects to. The supervisor binds + chmods this
@@ -96,13 +101,13 @@ Unknown top-level keys are rejected by `serde` deserialization
 section is optional and defaults to `sandbox = "best_effort"` with
 no extra read dirs.
 
-The provider private-key path is read once at startup, **before**
-the sandbox is applied. The default sandbox ruleset deliberately
-omits `/etc/symbolon/` so a post-compromise process inside the
-daemon cannot re-open the key. Keep the key file under
-`/etc/symbolon/` (or any other dir outside `/var/lib/symbolon/`);
-do not place it in the directory granted write access for atomic
-state-file writes.
+The provider private-key path and the broker static key are read
+once at startup, **before** the sandbox is applied. The default
+sandbox ruleset deliberately omits `/etc/symbolon/` so a
+post-compromise process inside the daemon cannot re-open either
+key. Keep both key files under `/etc/symbolon/` (or any other dir
+outside `/var/lib/symbolon/`); do not place them in the directory
+granted write access for atomic state-file writes.
 
 ### `/var/lib/symbolon/clients.json`: machine-authored
 
@@ -138,6 +143,26 @@ atomically on every `enroll` / `revoke`. Owner is the `symbolon`
 user, mode `0600`. There is no in-process hot-reload — config
 changes require a restart.
 
+### `/etc/symbolon/broker.key`: operator-authored
+
+The broker's static X25519 private key: 64 lowercase hex chars on
+one line (surrounding whitespace tolerated), owner `symbolon`,
+mode `0400`. Generate with:
+
+```
+openssl rand -hex 32 > /etc/symbolon/broker.key
+chmod 0400 /etc/symbolon/broker.key
+```
+
+Any 32-byte value is a valid X25519 private key (RFC 7748 clamping
+happens inside the scalar multiplication), so no dedicated keygen
+tool exists. The daemon reads the file once at startup and derives
+the public key; retrieve it with `symbolon pubkey` (admin socket)
+or from the `startup` log event's `broker_public_key` field. The
+daemon never writes this file, and there is no rotation machinery:
+replacing the key is a full client re-enrollment (see
+OPERATIONS.md).
+
 ## Atomic writes
 
 `clients.json` and `psks` are mutated only by the daemon (the CLI
@@ -156,7 +181,49 @@ makes them unnecessary.
 
 ## Wire formats
 
-### Identity prelude (cleartext, sent before the Noise handshake)
+### Noise NKpsk2 handshake (binary)
+
+Pattern: `Noise_NKpsk2_25519_ChaChaPoly_BLAKE2s` (per
+[Noise spec rev 34](https://noiseprotocol.org/noise_rev34.html)),
+driven by the [`snow`](https://github.com/mcginty/snow) crate.
+`NK`: the client knows the broker's static X25519 public key
+(pinned in its key file) and encrypts to it from the first
+message; `psk2`: the per-client PSK is mixed at the end of
+message 2.
+
+Both sides exchange exactly two framed messages:
+
+```
+1. initiator → responder: e, es    payload = identity TLV (encrypted)
+2. responder → initiator: e, ee, psk
+```
+
+Per-message framing on the TCP stream (handshake AND transport
+messages):
+
+```
++-----------+--------------------+
+| len (u16) | message body bytes |
++-----------+--------------------+
+     2              len (≤ 65535)
+```
+
+The broker decrypts message 1 with only its static key, parses the
+identity TLV out of the payload, selects that identity's PSK, and
+injects it (`set_psk`) before producing message 2 — that ordering
+is why the pattern is `psk2` and not `psk0`: a PSK mixed before
+message 1 could not depend on an identity carried inside it.
+
+Handshake completion authenticates the connection (PSK proof on both
+sides) and yields an AEAD transport state. Forward secrecy is
+provided by the ephemeral X25519 keys; replay protection is provided
+by the per-message AEAD nonce counter.
+
+On handshake failure (tag check, oversized frame, EOF mid-message),
+the daemon logs `evt=handshake_failed reason=...` and closes the
+connection.
+
+### Identity TLV (encrypted payload of handshake message 1)
 
 ```
 +--------+---+---+----------------+
@@ -166,47 +233,56 @@ makes them unnecessary.
 ```
 
 - 4 bytes magic: ASCII `"SBLN"`. Daemon rejects with
-  `evt=prelude_invalid reason=bad_magic` otherwise.
-- 1 byte version: `0x01`. Future-proofing.
+  `evt=identity_invalid reason=bad_magic` otherwise.
+- 1 byte version: `0x02`. Version `0x01` was the retired cleartext
+  prelude of the NNpsk0 wire protocol; the layout is unchanged but
+  the bump keeps a mixed-era client loudly rejected.
 - 1 byte identity length `L`. Must be 1..=64.
 - `L` bytes identity. Charset enforced to `[A-Za-z0-9._-]+` (same rule
   as git-credential values; CR/LF/NUL rejected; AGENTS.md invariant
   #12 in spirit).
 
-Prelude bytes are cleartext on the wire. An attacker passively
-observing the network learns which client identity is being used but
-cannot impersonate without the PSK and cannot decrypt anything.
+The message-1 payload must be exactly one TLV — trailing bytes are
+rejected (`reason=trailing_bytes`).
 
-### Noise NNpsk0 handshake (binary)
+### Identity confidentiality (protocol-level guarantees)
 
-Pattern: `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s` (per
-[Noise spec rev 34](https://noiseprotocol.org/noise_rev34.html)),
-driven by the [`snow`](https://github.com/mcginty/snow) crate.
+The client identity travels only inside the encrypted message-1
+payload (encryption key derived from `es`: client ephemeral x
+broker static). Consequences, in decreasing order of comfort:
 
-After the prelude, both sides exchange exactly two framed messages:
+- **Confidentiality bound.** Identity confidentiality holds against
+  passive observers and against any active attacker not holding the
+  broker's static *private* key. Compromise of one client does not
+  help decrypt other clients' identities: clients hold only the
+  public key.
+- **Replay bound.** Message 1 is replayable (there is no timestamp
+  or challenge in it), but a replay cannot complete the handshake:
+  message 2 onward requires the identity's PSK, which the replayer
+  does not hold. A replay costs the broker one PSK lookup and one
+  message-2 write.
+- **Accepted residual: recorded traffic.** If the broker static
+  private key ever leaks, identities in previously recorded traffic
+  become decryptable retroactively and indefinitely. Accepted
+  because an observer positioned to record that traffic already
+  collects source-IP metadata of equivalent identifying value.
+- **Metadata is not hidden.** Source IP, connection timing, and
+  message sizes still identify clients to an on-path observer
+  regardless of payload encryption.
 
-```
-1. initiator → responder: psk, e   (one framed Noise message)
-2. responder → initiator: e, ee    (one framed Noise message)
-```
+### Anti-enumeration (unauthorized identities)
 
-Per-message framing on the TCP stream:
-
-```
-+-----------+--------------------+
-| len (u16) | message body bytes |
-+-----------+--------------------+
-     2              len (≤ 65535)
-```
-
-Handshake completion authenticates the connection (PSK proof on both
-sides) and yields an AEAD transport state. Forward secrecy is
-provided by the ephemeral X25519 keys; replay protection is provided
-by the per-message AEAD nonce counter.
-
-On handshake failure (binder check, oversized frame, EOF mid-message),
-the daemon logs `evt=handshake_failed reason=...` and closes the
-connection.
+On an identity with no PSK entry, the broker MUST NOT fail early.
+It substitutes a freshly random 32-byte PSK, proceeds normally
+through message 2, and lets the session die at the first
+transport-frame decrypt — byte-shape and connection behaviour
+identical to an enrolled identity presenting a wrong PSK. An
+attacker probing identities therefore cannot distinguish "enrolled"
+from "unknown" by observing whether or when the connection fails.
+The attempt is logged (`evt=identity_unknown`, rate-limited; see
+the logging schema). If the OS RNG is unavailable the connection
+is dropped instead (`reason=rng_unavailable`) — a predictable
+substitute PSK would be worse than the timing leak.
 
 ### git-credential protocol (inside the Noise transport)
 
@@ -313,7 +389,7 @@ Line-delimited JSON over Unix-domain stream at
 `admin.socket_path`. One request per connection. The daemon writes
 one response and closes.
 
-**Request:** `{"op":"<status|list|enroll|revoke|mint|selfcheck>",
+**Request:** `{"op":"<status|list|pubkey|enroll|revoke|mint|selfcheck>",
 …op-specific fields}\n`
 
 **Response on success:** `{"ok":true, …op-specific fields}\n`
@@ -330,6 +406,7 @@ Op fields (request → response):
 |---|---|---|
 | `status` | — | `uptime_sec`, `providers`, `client_count` |
 | `list` | — | `clients` (array of `{name, providers, enrolled_at, note}`) |
+| `pubkey` | — | `broker_public_key` (64 hex chars — the value a client pins in its key file) |
 | `enroll` | `provider`, `client`, `psk` (32-byte array; client-generated), `note` (nullable) | — (daemon response is bare `{"ok":true}`; CLI then prints `{"ok":true,"psk_hex":"…"}` synthesised locally so the PSK can be piped to the client host) |
 | `revoke` | `provider`, `client` | — |
 | `mint` | `provider`, `client`, `path` | `username`, `password`, `expires_at_unix`, `out_req_id`, `provider_req_id` |
@@ -366,19 +443,21 @@ Currently:
 ### Startup
 
 1. Parse `config.toml`. Fail fast on schema errors.
-2. Load each configured provider's private key file into memory.
-   Fail fast on parse error.
+2. Load each configured provider's private key file and the broker
+   static key (`[listen] static_key_file`) into memory. Fail fast
+   on parse error.
 3. **Reclaim the listening sockets from the supervisor** via the
    `LISTEN_FDS` env protocol. Slot 0 = TCP wire, slot 1 = admin
    UDS. Plain `symbolon daemon` invocation with no supervisor
    exits immediately with `DaemonError::EnvFdTake`. The daemon
    never binds, chmods, or unlinks these sockets — that's the
-   supervisor's job. See INSTALL.md §§3.8–3.10.
+   supervisor's job. See INSTALL.md §§3.9–3.11.
 4. Load `clients.json`. Fail fast on schema errors.
 5. Apply sandbox (Landlock at ABI 6). Per `[security] sandbox`:
    `required` aborts on missing kernel features; `best_effort`
    degrades and emits `evt=sandbox_applied` at `warn` lvl; `off`
-   skips. After this step the provider key dir is unreachable;
+   skips. After this step the provider key dir and the broker
+   static key file are unreachable;
    only the small allowlist (state dirs, `/dev/urandom`,
    `/etc/ssl/certs`, nameservice files, TCP-connect to port 443,
    intra-process signals) remains permitted.
@@ -438,9 +517,9 @@ extending the enum and adding a row below.
 
 | evt | additional fields |
 |---|---|
-| `startup` | `providers` |
+| `startup` | `providers`, `broker_public_key` (hex; the value clients pin) |
 | `shutdown` | `signal`, `inflight_drained`, `drain_ms`, `drain_complete` |
-| `accept` | `psk_identity` (from the Noise prelude), `peer` (TCP source addr, audit-only) |
+| `accept` | `psk_identity` (decrypted out of handshake msg1), `peer` (TCP source addr, audit-only) |
 | `mint` | `provider`, `repo`, `client`, `ttl_sec`, `expires_at_unix`, `provider_ms` |
 | `mint_denied` | `provider`, `client`, `repo`, `reason`, `provider_status`; `retry_after_sec` when `provider_status=429` and the provider's `Retry-After` header was parseable (else `0`) |
 | `provider_error` | `provider`, `endpoint`, `status`, `body_snippet` |
@@ -455,8 +534,9 @@ extending the enum and adding a row below.
 | `ready` | `pid`: emitted by `main` after `service.selfcheck()` returns and `ready::notify` has sent `READY=1` to systemd (if applicable) and written the pidfile (if configured) |
 | `run_failed` | `signal`, `error`: emitted at `error` lvl by `main` when `Service::run` returns `Err`. Mutually exclusive with `shutdown` (one or the other fires) |
 | `ready_pidfile_write_failed` | `path`, `error`: emitted at `warn` lvl by `ready::notify` if the configured pidfile can't be written (typically a sandbox or permission issue) |
-| `prelude_invalid` | `peer`, `reason` (`bad_magic` \| `bad_version` \| `bad_identity_len` \| `invalid_charset` \| `eof_before_prelude_head` \| `eof_before_identity`): emitted when the identity prelude is malformed; connection dropped |
-| `handshake_failed` | `client`, `reason` (`handshake_read_failed` \| `handshake_write_failed` \| `handshake_into_transport_failed` \| `decrypt_failed` \| `frame_too_big`): Noise handshake or transport error; connection dropped |
+| `identity_invalid` | `peer`, `reason` (`bad_magic` \| `bad_version` \| `bad_identity_len` \| `invalid_charset` \| `trailing_bytes` \| `truncated`): emitted when the identity TLV decrypted out of handshake msg1 is malformed; connection dropped. A malformed TLV requires a peer that already encrypts to the broker pubkey, so unlike `identity_unknown` this is not rate-limited |
+| `identity_unknown` | `psk_identity`, `peer`, `suppressed`: emitted at `warn` when msg1 carries an identity with no PSK entry. Rate-limited (burst 10, 10/min sustained); `suppressed` counts events dropped since the last emitted one. The connection is NOT dropped early — a random substitute PSK keeps the wire shape identical to a wrong-PSK attempt (anti-enumeration; see Wire formats) |
+| `handshake_failed` | `client`, `peer`, `reason` (`responder_init` \| `rng_unavailable` \| `handshake_read_failed` \| `handshake_write_failed` \| `handshake_write_io` \| `handshake_into_transport_failed` \| `frame_too_big` \| `eof_before_msg1` \| `eof_during_handshake` \| `eof_unexpected_phase` \| `internal`): Noise handshake error; connection dropped |
 | `drain_incomplete` | `inflight_drained`, `drain_ms`: emitted at `warn` lvl when the per-connection drain deadline elapses with handlers still in flight at shutdown |
 | `signal_registration_failed` | `signal`, `error`: emitted at `error` lvl by `main` when `signal-hook-registry::register` fails at startup. Treated as fatal (exit 1). Without it the daemon cannot honour SIGTERM/SIGINT |
 | `mlock` | `status` (`applied` \| `skipped` \| `failed` \| `off`), `policy` (`required` \| `best_effort` \| `off`), `flags` (when applied) or `error` (when skipped/failed): emitted once at startup by `main::run_daemon` after `setup_tracing`. `required` failure surfaces as the separate `mlock_required_failed` error event before exit |
@@ -466,7 +546,14 @@ extending the enum and adding a row below.
 | `provider_call_done` | `req_id`, `out_req_id`, `status` (HTTP status code, 0 if no response), `provider_req_id` (provider's upstream correlation id — `X-GitHub-Request-Id` etc.; empty if absent), `elapsed_ms`, optional `error`: emitted after each outbound HTTPS call |
 
 `reason` values for `mint_denied`:
-`client_unknown | unknown_host | repo_not_accessible | provider_4xx | malformed_request`.
+`client_unknown | client_metadata_missing | unknown_host |
+repo_not_accessible | provider_4xx | malformed_request |
+transport_read`. `transport_read` (with `detail` = `decrypt_failed`
+| `frame_too_big` | `eof`) is where a wrong-PSK or
+unknown-identity session finally dies; `client_metadata_missing`
+means the PSK store and `clients.json` disagree (operator desync —
+the session is refused with the same wire shape as
+unknown-identity, but the log is loud and unthrottled).
 
 `endpoint` and `body_snippet` on `provider_error` are deferred
 pending a redaction layer to avoid leaking sensitive data (provider

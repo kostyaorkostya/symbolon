@@ -10,6 +10,7 @@ argh = { version = "0.1.19", default-features = false, features = ["help"] }
 async-trait = "0.1.89"
 base64 = "0.22.1"
 compio = { version = "0.19.1", features = ["fs", "io-uring", "macros", "net", "ring", "runtime", "time"] }
+curve25519-dalek = { version = "^4.1.3", default-features = false }
 cyper = { version = "0.9", default-features = false, features = [
   "rustls",
   "http2",

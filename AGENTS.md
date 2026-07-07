@@ -123,20 +123,30 @@ and permission set per provider live in `docs/providers/<name>.md`.
    it. The required-vs-forbidden-vs-rejected set per provider
    lives in `docs/providers/<name>.md`. Normative form:
    [`docs/PROVIDER_CONTRACT.md` § M2, F4](docs/PROVIDER_CONTRACT.md).
-6. **Transport: Noise NNpsk0 over TCP, terminated in-process** via
+6. **Transport: Noise NKpsk2 over TCP, terminated in-process** via
    the [`snow`](https://github.com/mcginty/snow) crate. The daemon
    listens directly on TCP (default `:9418`) and runs the responder
-   side of `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s` against the PSK
-   selected by the client's identity prelude. Clients use the
-   bundled `git-credential-symbolon` helper to run the matching
-   initiator. No TLS at any layer (preserves the no-TLS hard NOT).
-7. **Identity: PSK identity from the Noise handshake.** The client
-   emits a small unencrypted identity prelude (`magic | version |
-   identity_len | identity`) before the handshake; the broker looks
-   up the PSK for that identity in its in-memory store and runs
-   Noise. Handshake completion is the identity proof. The source IP
-   is not used for identity at any point (DHCP-friendly); it is
-   logged as audit metadata only.
+   side of `Noise_NKpsk2_25519_ChaChaPoly_BLAKE2s` with a static
+   X25519 key (`[listen] static_key_file`, 32 random bytes hex —
+   no keygen tool, no rotation machinery, exactly one key). Clients
+   pin the broker's static public key (from `symbolon pubkey`) and
+   run the matching initiator via the bundled
+   `git-credential-symbolon` helper. No TLS at any layer (preserves
+   the no-TLS hard NOT).
+7. **Identity: encrypted TLV inside handshake msg1.** The client
+   carries the SBLN TLV (`magic | version | identity_len |
+   identity`) as the encrypted payload of Noise message 1,
+   TLS-ECH-style; the broker decrypts it with its static key,
+   looks up the PSK for that identity in its in-memory store, and
+   injects it via `set_psk` before message 2 (`psk2`). Handshake
+   completion is the identity proof. **Anti-enumeration is
+   mandatory:** an unknown identity gets a freshly random
+   substitute PSK and the session dies at the first
+   transport-frame decrypt — never an early drop, so enrollment
+   status is unobservable from the wire (logged as rate-limited
+   `evt=identity_unknown`). The source IP is not used for identity
+   at any point (DHCP-friendly); it is logged as audit metadata
+   only.
 8. **State is files.** `clients.json` + `psks` only, both owned and
    atomically rewritten by the daemon (tempfile + fsync + rename +
    fsync parent).
@@ -183,7 +193,7 @@ and permission set per provider live in `docs/providers/<name>.md`.
     `symbolon daemon` exits with `evt=run_failed` +
     `DaemonError::EnvFdTake` when no supervisor is present. The
     supervisor owns the socket inode lifecycle, perms, and unlink.
-    See `docs/INSTALL.md` §3.8–3.10. Consumed via the `listenfd`
+    See `docs/INSTALL.md` §3.9–3.11. Consumed via the `listenfd`
     crate.
 
 ## Hard NOTs
@@ -312,12 +322,26 @@ Pinned in `Cargo.toml`:
   ["default-resolver", "use-chacha20poly1305", "use-blake2",
   "use-curve25519", "use-getrandom", "std"]` (pure-Rust Noise
   Protocol Framework implementation; tracks Noise spec rev 34,
-  forbids `unsafe_code` internally. Drives `Noise_NNpsk0_25519_
+  forbids `unsafe_code` internally. Drives `Noise_NKpsk2_25519_
   ChaChaPoly_BLAKE2s` in `src/transport.rs` (responder side in
   the daemon, initiator side in the `git-credential-symbolon`
   client binary). Feature trim drops aes-gcm / sha2 /
   blake3 / p256 / pqcrypto since our pattern uses only
   ChaCha20-Poly1305 + BLAKE2s + X25519.)
+- `curve25519-dalek` with `default-features = false` (one call:
+  `MontgomeryPoint::mul_base_clamped` in
+  `src/broker_key.rs::derive_public`, deriving the broker's public
+  key from the 32-byte private key at startup. Already in the
+  dependency graph transitively via snow's `use-curve25519`
+  feature — and it is the exact function snow's own
+  `Dh25519::derive_pubkey` uses, so our derivation is bit-identical
+  to what the handshake computes; the explicit dep adds zero binary
+  weight. snow deliberately doesn't re-export a pub-from-priv
+  helper, and the alternative `x25519-dalek` wrapper would add a
+  new crate for the same underlying call. Version pinned to the
+  4.x line to stay unified with snow's requirement — `cargo add
+  curve25519-dalek` alone picks 5.x and silently doubles the
+  crate in the graph.)
 - `serde`, `serde_json`, `toml` (config + provider responses)
 - `strum` with `features = ["derive"]` (proc-macro derives that
   generate `Into<&'static str>` and `Display` from enum variant
@@ -500,6 +524,7 @@ src/
   lib.rs               # crate-level docs, pub re-exports
   admin.rs             # admin Unix socket + CLI dispatch (enroll/revoke/etc.)
   atomic_fs.rs         # tempfile + fsync + rename + fsync-parent write
+  broker_key.rs        # broker static X25519 keypair newtypes + pub derivation
   config.rs            # config.toml + clients.json parsing
   connection_tracker.rs# spawn / drain abstraction for accept loops
   cpu_worker.rs        # dedicated OS thread for CPU-bound work
@@ -514,11 +539,13 @@ src/
   note.rs              # validated operator-note newtype
   psk.rs               # 32-byte PSK newtype (redacted Debug, LowerHex)
   psk_store.rs         # in-memory identity → PSK store, file-backed
+  rate_limit.rs        # token bucket bounding attacker-triggerable log events
   ready.rs             # sd_notify + pidfile (atomic) at startup
   sandbox.rs           # landlock (FS + TCP + UDS scope + signal scope)
   signals.rs           # signal-hook-registry handlers → CancelToken
-  singleflight_cache.rs# generic TTL cache + singleflight coordinator
-  transport.rs         # Responder/Initiator sans-IO state machines, framing, prelude
+  singleflight_cache.rs# no-TTL memo + singleflight coordinator
+  transport.rs         # Responder/Initiator sans-IO state machines, framing, identity TLV
+  ttl_cache.rs         # generic expiring cache (clock-parameterised, sweep-on-access)
   providers/
     mod.rs             # `Provider` trait + abstract `ProviderError` / outcomes
     github.rs          # GitHub: JWT, repo-ID resolution + mint
@@ -586,9 +613,10 @@ the submission/completion queue model), so the codebase's
 **Fuzzing** is set up for the two parsers that consume attacker-
 controlled bytes:
 
-- `symbolon::parse_identity_prelude`: the unencrypted prelude
-  bytes the client sends before the Noise handshake. Identity
-  selection depends on it (AGENTS.md invariant #7).
+- `symbolon::parse_identity_tlv`: the identity TLV decrypted out
+  of Noise handshake msg1 — peer-controlled bytes once the msg1
+  decrypt succeeds. Identity selection depends on it (AGENTS.md
+  invariant #7).
 - `symbolon::git_credential::parse`: git-credential request block
   (decrypted out of the Noise transport before parsing); carries
   the CR/LF Clone2Leak defence (AGENTS.md invariant #12).
@@ -601,7 +629,7 @@ stays on stable. Run ad-hoc:
 cargo install cargo-fuzz   # one-shot, no project change
 cd fuzz
 cargo fuzz run git_credential_parse -- -max_total_time=600
-cargo fuzz run identity_prelude_parse -- -max_total_time=600
+cargo fuzz run identity_tlv_parse -- -max_total_time=600
 ```
 
 (The `+nightly` switch isn't needed because `fuzz/rust-toolchain.toml`

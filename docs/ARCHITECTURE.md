@@ -21,7 +21,7 @@ See also:
 │   client                 │                │       broker host         │
 │ (VM or container)        │                │                           │
 │                          │                │  symbolon :9418           │
-│  git → git-credential-   │  Noise NNpsk0  │  (TCP listen,             │
+│  git → git-credential-   │  Noise NKpsk2  │  (TCP listen,             │
 │        symbolon          ├──────────────► │   PSK identity →          │
 │           │              │                │   per-client lookup)      │
 │           │              │ ◄── git creds ─┤                           │
@@ -34,9 +34,11 @@ See also:
 
 Per request: `git` invokes the bundled `git-credential-symbolon`
 helper on the client. The helper opens a TCP connection to the
-broker, sends a small cleartext identity prelude, and runs the
-initiator side of a Noise NNpsk0 handshake against the PSK both
-sides hold. Handshake completion proves the client's identity. The
+broker and runs the initiator side of a Noise NKpsk2 handshake:
+its identity travels encrypted inside the first handshake message
+(encrypted to the broker's pinned static public key), and the
+per-client PSK both sides hold is mixed into message 2. Handshake
+completion proves the client's identity. The
 daemon then dispatches the credential request to the configured
 provider, mints a single-repository token, and writes it back
 through the authenticated Noise transport. The token's lifetime
@@ -46,8 +48,9 @@ and exact scope are provider-determined (see
 ## Trust boundary
 
 The broker host is the trust boundary. It holds the
-**provider private key** (e.g. a GitHub App's PEM) and the
-**per-client PSKs**. Clients hold a single PSK and a stable
+**provider private key** (e.g. a GitHub App's PEM), the
+**per-client PSKs**, and the **broker static X25519 key**. Clients
+hold a single PSK, the broker's static *public* key, and a stable
 identity name; nothing else.
 
 A client compromise is bounded by:
@@ -77,13 +80,19 @@ A client compromise does NOT buy:
 Identity is the **PSK identity surfaced by the Noise handshake**,
 not the TCP source address. The flow:
 
-1. Client sends a cleartext identity prelude (4-byte magic `SBLN`
-   plus version, length, and identity bytes). The identity is a
-   stable name (e.g. `dev-vm-1`); the wire format is in
-   [`PROTOCOLS.md` § Identity prelude](PROTOCOLS.md).
-2. Broker looks up the PSK for that identity in its in-memory
-   store.
-3. Both sides run `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s`. The
+1. Client opens the `Noise_NKpsk2_25519_ChaChaPoly_BLAKE2s`
+   handshake, carrying an identity TLV (4-byte magic `SBLN` plus
+   version, length, and identity bytes) as the *encrypted* payload
+   of message 1 — encrypted to the broker's static public key,
+   which the client pins in its key file. The identity is a stable
+   name (e.g. `dev-vm-1`); the wire format is in
+   [`PROTOCOLS.md` § Identity TLV](PROTOCOLS.md).
+2. Broker decrypts message 1 with its static private key and looks
+   up the PSK for the identity in its in-memory store. Unknown
+   identities get a random substitute PSK rather than an early
+   drop, so enrollment status is not observable from the wire
+   (anti-enumeration; see PROTOCOLS.md).
+3. The PSK is mixed into handshake message 2 (`psk2`); the
    handshake only completes if both sides hold the same PSK.
 4. Handshake completion **is** the identity proof. The `evt=accept`
    log field `psk_identity` reflects the authenticated value, not
@@ -93,9 +102,13 @@ The TCP source address is logged as `peer` for audit only, never
 used for identity decisions. This makes the daemon DHCP-friendly:
 client IPs may change freely.
 
-The cleartext prelude leaks **which** identity is being used to
-a passive observer, but not whether they hold the PSK. Identity
-names are not secrets.
+The identity travels only inside the encrypted message-1 payload,
+so a passive observer (or any active attacker without the broker's
+static private key) learns neither **which** identity connects nor
+whether it is enrolled. Source IP and timing still identify
+clients to an on-path observer; the protocol-level guarantees and
+accepted residuals are enumerated in
+[`PROTOCOLS.md` § Identity confidentiality](PROTOCOLS.md#identity-confidentiality-protocol-level-guarantees).
 
 ## Permission model and per-mint scoping
 
@@ -144,7 +157,7 @@ Slot ordering is fixed: slot 0 = TCP wire, slot 1 = admin UDS.
 A plain `symbolon daemon` invocation with no supervisor exits
 immediately with `DaemonError::EnvFdTake`. The supervisor owns
 the socket inode lifecycle (perms, unlink); the daemon never
-binds, chmods, or unlinks. See [`INSTALL.md`](INSTALL.md) §§ 3.8–3.10
+binds, chmods, or unlinks. See [`INSTALL.md`](INSTALL.md) §§ 3.9–3.11
 for the unit / init-script recipes.
 
 ## State and atomic writes
@@ -197,8 +210,9 @@ off disk").
 
 ## Transport layer
 
-The Noise NNpsk0 protocol lifecycle (identity prelude → handshake
-→ encrypted request/response) is a sans-IO state machine:
+The Noise NKpsk2 protocol lifecycle (msg1 with encrypted identity
+TLV → PSK selection → msg2 → encrypted request/response) is a
+sans-IO state machine:
 `transport::Responder` for the daemon side, `transport::Initiator`
 for the client. Each emits `Step` values telling the I/O driver
 what to do next — read N bytes, write these bytes, look up a PSK

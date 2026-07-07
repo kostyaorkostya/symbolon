@@ -14,7 +14,7 @@
 //! can crash mid-update without leaving the file half-written.
 //!
 //! Identity validation is delegated to [`crate::identity::Identity`]
-//! — the same type the wire prelude parser and the admin enroll
+//! — the same type the identity-TLV parser and the admin enroll
 //! handler use — so a manually-edited file with garbage can't sneak
 //! past the load.
 

@@ -10,7 +10,7 @@ Provider API links live with their provider doc under
 - [Noise Protocol Framework, revision 34](https://noiseprotocol.org/noise_rev34.html):
   the cryptographic protocol family `symbolon` uses for its
   client-server transport (pattern
-  `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s`).
+  `Noise_NKpsk2_25519_ChaChaPoly_BLAKE2s`).
 - [git-credential](https://git-scm.com/docs/git-credential):
   the helper invocation interface.
 - [gitcredentials(7)](https://git-scm.com/docs/gitcredentials):

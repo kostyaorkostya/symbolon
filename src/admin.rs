@@ -55,6 +55,7 @@ const PER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 pub enum Request {
     Status,
     List,
+    Pubkey,
     Enroll {
         provider: ProviderKind,
         client: Identity,
@@ -96,6 +97,15 @@ pub struct StatusResponse {
 #[derive(Debug, Serialize)]
 pub struct ListResponse {
     clients: Vec<ListEntry>,
+}
+
+/// The broker static public key as 64 lowercase hex chars — the value
+/// a client pins in its key file (`broker_pub_hex:psk_hex`). Operators
+/// fetch it here during enrollment; it also appears on the `startup`
+/// log event.
+#[derive(Debug, Serialize)]
+pub struct PubkeyResponse {
+    broker_public_key: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -175,6 +185,7 @@ impl<T> OkEnvelope<T> {
 pub enum CliCommand {
     Status,
     List,
+    Pubkey,
     GithubEnroll {
         client: Identity,
         note: Option<Note>,
@@ -195,6 +206,7 @@ impl CliCommand {
         match self {
             CliCommand::Status => Request::Status,
             CliCommand::List => Request::List,
+            CliCommand::Pubkey => Request::Pubkey,
             CliCommand::GithubEnroll { client, note, psk } => Request::Enroll {
                 provider: ProviderKind::Github,
                 client: client.clone(),
@@ -305,6 +317,9 @@ async fn dispatch_and_write<W: AsyncWrite>(
             write_response(stream, Ok::<_, ErrorResponse>(handle_status(state))).await
         }
         Request::List => write_response(stream, Ok::<_, ErrorResponse>(handle_list(state))).await,
+        Request::Pubkey => {
+            write_response(stream, Ok::<_, ErrorResponse>(handle_pubkey(state))).await
+        }
         Request::Enroll {
             provider,
             client,
@@ -340,6 +355,12 @@ fn handle_status(state: &SharedState) -> StatusResponse {
         uptime_sec: state.start_time.elapsed().as_secs(),
         providers: state.providers.keys().copied().collect(),
         client_count: state.clients.borrow().len(),
+    }
+}
+
+fn handle_pubkey(state: &SharedState) -> PubkeyResponse {
+    PubkeyResponse {
+        broker_public_key: state.broker_public.to_string(),
     }
 }
 

@@ -1,5 +1,5 @@
 //! Validated client-identity newtype shared by every code path that
-//! names a client: the Noise prelude (wire), the PSK store (file),
+//! names a client: the identity TLV (wire), the PSK store (file),
 //! the admin enroll/revoke surface (CLI), and the daemon's in-memory
 //! tables. Construction goes through one function (`Identity::parse`)
 //! so the validation rule cannot drift between callers.
@@ -58,7 +58,7 @@ impl TryFrom<String> for Identity {
 }
 
 impl Identity {
-    /// Maximum identity byte length. Bounds the on-wire prelude so a
+    /// Maximum identity byte length. Bounds the identity TLV so a
     /// malformed peer can never make us pull more than `6 + MAX_LEN`
     /// bytes before rejecting.
     pub const MAX_LEN: usize = 64;

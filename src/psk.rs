@@ -68,7 +68,7 @@ impl hex::FromHex for Psk {
 }
 
 impl Psk {
-    /// Byte length of a Noise NNpsk0 pre-shared key. Fixed by the
+    /// Byte length of a Noise NKpsk2 pre-shared key. Fixed by the
     /// protocol — see `NOISE_PATTERN` in `transport.rs`.
     pub const LEN: usize = 32;
 
@@ -82,5 +82,12 @@ impl Psk {
     /// API (e.g. snow's `Builder::psk`) that doesn't need ownership.
     pub fn as_bytes(&self) -> &[u8; Self::LEN] {
         &self.0
+    }
+
+    /// Fresh PSK from the OS RNG.
+    pub fn random() -> Result<Self, getrandom::Error> {
+        let mut bytes = [0u8; Self::LEN];
+        getrandom::fill(&mut bytes)?;
+        Ok(Self(bytes))
     }
 }

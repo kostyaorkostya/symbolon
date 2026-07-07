@@ -100,21 +100,22 @@ symbolon github enroll <client> [--note <text>] [--psk <64-hex>]
     atomic), and print:
       {"ok":true,"psk_hex":"<64 hex chars>"}
     The PSK is generated client-side by the CLI, then handed to
-    the daemon — the daemon never sees raw entropy. Pipe through
-    `jq -r .psk_hex` to extract the bare hex for provisioning,
-    e.g.:
-      symbolon github enroll dev-vm-1 --note "lab box" \
-        | jq -r .psk_hex \
-        | ssh dev-vm-1 'tee /etc/symbolon/psk >/dev/null && chmod 0400 /etc/symbolon/psk'
+    the daemon — the daemon never sees raw entropy. The client's
+    key file wants `broker_pub_hex:psk_hex` on one line, so
+    combine with `symbolon pubkey` when provisioning, e.g.:
+      PUB=$(symbolon pubkey | jq -r .broker_public_key)
+      PSK=$(symbolon github enroll dev-vm-1 --note "lab box" | jq -r .psk_hex)
+      echo "${PUB}:${PSK}" \
+        | ssh dev-vm-1 'tee /etc/symbolon/key >/dev/null && chmod 0400 /etc/symbolon/key'
     Use --psk to bring your own pre-generated hex (key rotation,
     backup restore, deterministic test setups).
 
 symbolon github revoke <client>
     Remove <client>'s entry from both the in-memory PSK store /
     clients table AND the on-disk `psks` / `clients.json` files
-    (atomic). Subsequent handshakes from that identity are
-    rejected with `evt=mint_denied reason=client_unknown` before
-    the handshake completes.
+    (atomic). Subsequent connections from that identity log
+    `evt=identity_unknown` and fail exactly like a wrong-PSK
+    attempt (anti-enumeration; see PROTOCOLS.md).
 
     Outstanding tokens minted in the previous hour are NOT
     revoked. They live their full TTL; see § "Hard cutoff" below.
@@ -315,7 +316,7 @@ git config --global \
   "/usr/local/bin/git-credential-symbolon \
    --endpoint broker.lan:9418 \
    --identity test-vm \
-   --psk-file /etc/symbolon/psk"
+   --key-file /etc/symbolon/key"
 # Required so git sends `path=owner/repo` on credential queries —
 # the broker mints per-repo and rejects the request as
 # `malformed_request` without it.

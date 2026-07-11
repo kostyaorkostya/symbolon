@@ -195,6 +195,31 @@ and permission set per provider live in `docs/providers/<name>.md`.
     supervisor owns the socket inode lifecycle, perms, and unlink.
     See `docs/INSTALL.md` §3.9–3.11. Consumed via the `listenfd`
     crate.
+16. **The App private key never lives in the daemon.** Signing goes
+    through the `JwtBackend` trait (`src/providers/jwt_backend.rs`),
+    the ONLY seam where the signing path branches on backend. Past
+    construction the provider holds a `Box<dyn JwtBackend>` and
+    cannot distinguish a vTPM from a key subprocess — no
+    backend-conditional logic anywhere else. Two impls:
+    `tpm_backend` (RSA in a vTPM; the daemon SHA-256s the JWS
+    signing input in Rust and only the 32-byte digest crosses to the
+    TPM) and `agent_backend` (RSA in a sandboxed subprocess that
+    owns the PEM; the daemon ships claims and gets a whole JWT back).
+    The operator picks via `[provider.github] app_key_backend =
+    "tpm" | "file"` — required, no default, no auto-probe, no
+    runtime fallback.
+17. **Signing-backend startup order is fixed.** In `prepare_inner`:
+    take LISTEN_FDS → **construct the backend** (open the TPM device
+    node / `execve` the key subprocess — both need access the
+    sandbox is about to revoke) → `apply_sandbox` (Landlock; it
+    already denies `execve` by handling `AccessFs::Execute` and
+    granting it nowhere, and it never grants the TPM device path or
+    the key path) → **start the backend's fd-owning actor thread**
+    (post-sandbox, so it inherits the ruleset) → `self_check()` the
+    backend (a dead agent / unreachable TPM is fatal at startup, not
+    on the first mint). The `file` agent additionally self-sandboxes
+    (its own tighter Landlock with no network + a seccomp allowlist)
+    and sets `PR_SET_PDEATHSIG` / `PR_SET_DUMPABLE=0` / `mlockall`.
 
 ## Hard NOTs
 
@@ -384,9 +409,27 @@ Pinned in `Cargo.toml`:
 - `futures-util` (`select!` and `FutureExt::fuse()` for the
   accept-vs-signal race in `daemon::run`; compio's own examples
   pull it in the same way. See compio-0.18 `examples/tick.rs`).
-- `futures-channel` (`oneshot` for the result hand-back in
-  `src/cpu_worker.rs`; the dedicated OS thread sends the
-  computed value back to the awaiting compio task.)
+- `futures-channel` (`oneshot` for the result hand-back from the
+  signing-backend actor threads in `src/providers/tpm_backend.rs`
+  and `src/providers/agent_backend.rs`; the fd-owning OS thread
+  sends the computed value back to the awaiting compio task.)
+- `tpm2-protocol` (zero-dependency, `no_std`-capable TPM 2.0
+  marshaler/unmarshaler by the kernel TPM maintainer; drives the
+  `TPM2_ReadPublic` / `TPM2_Sign` wire format in
+  `src/providers/tpm_backend.rs`. Chosen over hand-rolling the two
+  commands: it models TPM2B buffers, the `TPM_RS_PW` session, the
+  null hashcheck ticket, and format-0/format-1 response-code
+  decoding correctly, all against caller-provided `&mut [u8]`
+  buffers with no allocator — a good fit for the musl targets. Pure
+  Rust, no C.)
+- `seccompiler` (Firecracker's seccomp-BPF compiler; pulls only
+  `libc`. Builds the `src/providers/agent.rs` syscall allowlist
+  into a `SECCOMP_RET_KILL_PROCESS` filter. Hand-rolling the BPF
+  was the alternative; seccompiler gives arch-portable syscall
+  numbering and validated program construction for ~no marginal
+  surface. It closes the UDP / raw-socket exfiltration hole
+  Landlock's network layer — which governs `connect`/`bind`, not
+  `socket` creation — leaves open in the key subprocess.)
 - `base64` (URL-safe-no-pad encoding in `src/providers/jwt_rs256.rs`
   for the JWT header / payload / signature segments. Listed as a
   top-level dep so the audit surface is explicit.)
@@ -527,7 +570,6 @@ src/
   broker_key.rs        # broker static X25519 keypair newtypes + pub derivation
   config.rs            # config.toml + clients.json parsing
   connection_tracker.rs# spawn / drain abstraction for accept loops
-  cpu_worker.rs        # dedicated OS thread for CPU-bound work
   daemon.rs            # TCP accept loop, per-connection driver, Service shape
   events.rs            # closed-set EventKind enum for structured logs
   git_credential.rs    # protocol parse/emit; CR/LF rejection mandatory
@@ -548,8 +590,13 @@ src/
   ttl_cache.rs         # generic expiring cache (clock-parameterised, sweep-on-access)
   providers/
     mod.rs             # `Provider` trait + abstract `ProviderError` / outcomes
-    github.rs          # GitHub: JWT, repo-ID resolution + mint
-    jwt_rs256.rs       # minimal RS256 JWS signer (rsa + sha2)
+    github.rs          # GitHub: repo-ID resolution + mint (holds a `dyn JwtBackend`)
+    jwt_backend.rs     # the signing seam: `JwtBackend` trait + `JwtClaims`
+    jwt_rs256.rs       # RS256 JWS framing: signing_input / assemble / whole-token sign
+    tpm_backend.rs     # `tpm` backend: vTPM signer, fd-owning actor thread
+    agent_backend.rs   # `file` backend daemon side: socketpair spawn + actor
+    agent_protocol.rs  # daemon↔agent SEQPACKET message types
+    agent.rs           # `__sign-agent` subprocess: key custody + self-sandbox + serve
 tests/
   admin.rs             # admin UDS protocol against a spawned daemon
   client_binary.rs     # end-to-end smoke against a one-shot Noise responder
@@ -575,27 +622,25 @@ expose that hook to executors. See
 [Tokio: Reducing tail latencies with automatic cooperative task yielding](https://tokio.rs/blog/2020-04-preemption)
 and [Async Rust: Cooperative vs Preemptive scheduling](https://kerkour.com/cooperative-vs-preemptive-scheduling).
 
-For CPU work, two options:
+For blocking work (there is no CPU-bound work left in-process —
+RSA now happens in a vTPM or the key subprocess), the pattern is a
+**dedicated fd-owning OS-thread actor**: a `std::thread` owns the
+blocking fd (TPM device / agent socketpair) for the process
+lifetime, receives requests over an `mpsc` channel, and replies via
+a `futures_channel::oneshot`. See
+`src/providers/tpm_backend.rs` and `src/providers/agent_backend.rs`
+— both take the same shape. The actor thread is spawned
+*post-sandbox* (`into_backend`) so it inherits the Landlock
+ruleset; the fd it owns is opened/created *pre-sandbox* (see the
+startup-order rule under "Signing backends"). Blocking read/write
+on an already-open fd is unaffected by Landlock, so the split is
+safe. There was a shared `CpuWorker` here for in-process RSA; it
+was removed with the in-process signer.
 
-- **Dedicated always-on thread** via the project-wide primitive
-  `crate::cpu_worker::CpuWorker`. Use when the work is recurring
-  and small (microseconds of communication overhead per call, no
-  thread-spawn churn). Construct as
-  `let worker = CpuWorker::new("descriptive-thread-name")?;` then
-  `worker.run(move || do_cpu_work()).await?`. The daemon spawns
-  one shared worker (`symbolon-cpu-worker`) in `Service::prepare`
-  and clones the `Rc<CpuWorker>` into each consumer. The in-tree
-  consumer is `src/providers/github.rs::JwtSigner`, which holds an
-  `Arc<JwtSigningKey>` and dispatches each `sign_jwt_blocking`
-  call. **Invariant:** the closure passed to `CpuWorker::run` must
-  not capture an `Rc`/`Arc<CpuWorker>` for the same worker — a
-  cycle the destructor can't break (the worker thread joins on
-  Drop, but it's busy running a closure that holds a reference).
-  See the `CpuWorker::run` docstring.
-- **`compio::runtime::spawn_blocking(f)`** for one-off CPU bursts.
-  Compio's pool lazily spawns up to 256 threads, 60 s idle reap.
-  Good fit when work is occasional; bad fit for high-frequency
-  recurring work (re-spawn cost dominates after each idle reap).
+For one-off CPU bursts, **`compio::runtime::spawn_blocking(f)`**
+still exists (compio's pool lazily spawns up to 256 threads, 60 s
+idle reap) — good when work is occasional, bad for high-frequency
+recurring work.
 
 For long-but-async work, sprinkle explicit yield points via
 `compio_runtime`'s yield helpers (tokio's analogue is
@@ -603,12 +648,16 @@ For long-but-async work, sprinkle explicit yield points via
 
 ## Security tooling
 
-**Miri** is not used. The codebase has exactly one `unsafe` block
-(in a `src/sandbox.rs` test calling `libc::kill`); production code
-is entirely safe Rust where Miri has nothing to find. Compio's
-io_uring backend additionally cannot run under Miri (no shim for
-the submission/completion queue model), so the codebase's
-`#[compio::test]` tests would be unrunnable regardless. Skipping miri.
+**Miri** is not used. The `unsafe` surface is small and entirely
+FFI into `libc`/`landlock`/`seccompiler` at the process-hardening
+boundary — the signing agent (`src/providers/agent.rs`:
+`recv`/`send`/`prctl`/`mlockall`), the agent spawn
+(`src/providers/agent_backend.rs`: `socketpair`/`pre_exec` fcntl),
+and a `libc::kill` in a `src/sandbox.rs` test. Miri can't model
+those syscalls, and compio's io_uring backend has no Miri shim
+either (the `#[compio::test]` tests would be unrunnable regardless).
+The FFI is validated instead by the integration tests that spawn
+the real agent under real Landlock + seccomp. Skipping miri.
 
 **Fuzzing** is set up for the two parsers that consume attacker-
 controlled bytes:

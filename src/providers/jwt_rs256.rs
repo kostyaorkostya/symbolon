@@ -59,20 +59,42 @@ impl JwtSigningKey {
     /// per call beyond `payload_json` and the boxed signature bytes
     /// `rsa`'s `SignatureEncoding::to_bytes` returns.
     pub fn sign_rs256<C: Serialize>(&self, claims: &C) -> Result<String, JwtError> {
-        let payload_json = serde_json::to_vec(claims).map_err(JwtError::SerializeClaims)?;
-        // Rough upper bound: header + '.' + b64(payload) + '.' + b64(sig).
-        // For 2048-bit RS256 the signature is 256 bytes → 342 base64 chars.
-        let payload_b64_len = payload_json.len().div_ceil(3) * 4;
-        let mut token = String::with_capacity(HEADER_B64.len() + 1 + payload_b64_len + 1 + 350);
-        token.push_str(HEADER_B64);
-        token.push('.');
-        URL_SAFE_NO_PAD.encode_string(&payload_json, &mut token);
-        // `header_b64.payload_b64` IS the RS256 signing input.
-        let signature = self.0.sign(token.as_bytes());
-        token.push('.');
-        URL_SAFE_NO_PAD.encode_string(signature.to_bytes(), &mut token);
-        Ok(token)
+        let signing_input = signing_input(claims)?;
+        // `header_b64.payload_b64` IS the RS256 signing input; the RSA
+        // hash-and-sign runs over these exact bytes.
+        let signature = self.0.sign(signing_input.as_bytes());
+        Ok(assemble_jwt(&signing_input, &signature.to_bytes()))
     }
+}
+
+/// The JWS signing input: `base64url(header).base64url(payload)` — the
+/// bytes an RS256 signature is computed over. Split out from
+/// [`JwtSigningKey::sign_rs256`] so the TPM backend, which does the RSA
+/// in hardware, can compute the SHA-256 of exactly these bytes without
+/// re-implementing the JWS framing. The header is the fixed
+/// [`HEADER_B64`]; only the payload varies per call.
+pub fn signing_input<C: Serialize>(claims: &C) -> Result<String, JwtError> {
+    let payload_json = serde_json::to_vec(claims).map_err(JwtError::SerializeClaims)?;
+    let payload_b64_len = payload_json.len().div_ceil(3) * 4;
+    let mut input = String::with_capacity(HEADER_B64.len() + 1 + payload_b64_len);
+    input.push_str(HEADER_B64);
+    input.push('.');
+    URL_SAFE_NO_PAD.encode_string(&payload_json, &mut input);
+    Ok(input)
+}
+
+/// Assemble the compact JWS from a signing input and the raw signature
+/// bytes (RSASSA-PKCS1-v1_5 output, 256 bytes for RSA-2048). The
+/// counterpart to [`signing_input`]: the file backend gets the whole
+/// token from [`JwtSigningKey::sign_rs256`], while the TPM backend
+/// calls `signing_input` → hash → TPM sign → `assemble_jwt`.
+pub fn assemble_jwt(signing_input: &str, signature: &[u8]) -> String {
+    let mut token =
+        String::with_capacity(signing_input.len() + 1 + signature.len().div_ceil(3) * 4);
+    token.push_str(signing_input);
+    token.push('.');
+    URL_SAFE_NO_PAD.encode_string(signature, &mut token);
+    token
 }
 
 #[cfg(test)]

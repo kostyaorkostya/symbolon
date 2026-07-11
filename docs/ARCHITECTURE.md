@@ -47,9 +47,13 @@ and exact scope are provider-determined (see
 
 ## Trust boundary
 
-The broker host is the trust boundary. It holds the
-**provider private key** (e.g. a GitHub App's PEM), the
-**per-client PSKs**, and the **broker static X25519 key**. Clients
+The broker host is the trust boundary. It holds the **provider
+private key** (e.g. a GitHub App's PEM) — though the daemon process
+itself never maps it: the key lives in a vTPM or a sandboxed signing
+subprocess, so a daemon compromise yields at most a signing oracle,
+not the key (see "App key custody" in
+[`providers/github.md`](providers/github.md)). It also holds the
+**per-client PSKs** and the **broker static X25519 key**. Clients
 hold a single PSK, the broker's static *public* key, and a stable
 identity name; nothing else.
 
@@ -181,8 +185,9 @@ Wire and file schemas in
 
 At startup, after sockets are inherited via `LISTEN_FDS` (the daemon
 does not bind — see [Supervisor handoff](#supervisor-handoff)) and the
-provider private key is loaded, the broker applies Landlock at ABI 6
-to itself:
+signing backend is constructed (the vTPM device opened, or the key
+subprocess `execve`d — both need access the sandbox is about to
+revoke), the broker applies Landlock at ABI 6 to itself:
 
 - **FS allowlist.** Only the state directory
   (`/var/lib/symbolon/`, read-write), `/dev/urandom`, the CA
@@ -225,10 +230,14 @@ Protocol changes happen in one place.
 
 ## Concurrency model
 
-Single-threaded [compio](https://docs.rs/compio) runtime.
-CPU-bound work (today: JWT signing) runs on a dedicated OS
-thread via `crate::cpu_worker::CpuWorker`.
+Single-threaded [compio](https://docs.rs/compio) runtime. There is
+no CPU-bound work in-process — RSA signing lives in a vTPM or a key
+subprocess (see "App key custody" in
+[`providers/github.md`](providers/github.md)). The blocking fd to each
+(the TPM device / the agent socketpair) is owned by a dedicated
+OS-thread actor that receives requests over a channel and replies
+over a oneshot.
 
-Rationale and developer-facing detail (`CpuWorker` vs
+Rationale and developer-facing detail (the actor pattern vs
 `spawn_blocking`, why no Tokio) lives in
 [`../AGENTS.md` § Concurrency notes](../AGENTS.md).

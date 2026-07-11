@@ -10,7 +10,6 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -21,12 +20,38 @@ use serde_json::Value;
 use snow::TransportState;
 use symbolon::transport::{self, MAX_MESSAGE_SIZE};
 use symbolon::{
-    AdminConfig, BrokerPrivateKey, BrokerPublicKey, ClientsConfig, Config, CpuWorker,
-    GitHubProvider, ListenConfig, LoggingConfig, MlockMode, ProviderGithub, Providers,
-    RuntimeConfig, SandboxMode, SecurityConfig,
+    AdminConfig, AppKeyBackend, BrokerPrivateKey, BrokerPublicKey, ClientsConfig, Config,
+    GitHubProvider, JwtBackend, JwtBackendError, JwtClaims, JwtSigningKey, ListenConfig,
+    LoggingConfig, MlockMode, ProviderGithub, Providers, RuntimeConfig, SandboxMode,
+    SecurityConfig,
 };
 use wiremock::matchers::{body_bytes, method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// In-process signing backend for the wiremock provider tests: signs
+/// with the fixture PEM directly. The real `file`/`tpm` backends move
+/// the key out of process, but these tests exercise the HTTP/mint
+/// logic, not signing — wiremock never validates the App JWT — so a
+/// fast in-process signer keeps them subprocess-free. The real file
+/// agent is exercised end-to-end in `tests/sign_agent.rs`.
+struct InProcessBackend(JwtSigningKey);
+
+#[async_trait::async_trait(?Send)]
+impl JwtBackend for InProcessBackend {
+    async fn sign(&self, claims: &JwtClaims) -> Result<String, JwtBackendError> {
+        self.0
+            .sign_rs256(claims)
+            .map_err(|e| JwtBackendError::Rejected(e.to_string()))
+    }
+    async fn self_check(&self) -> Result<(), JwtBackendError> {
+        Ok(())
+    }
+}
+
+fn in_process_backend() -> Box<dyn JwtBackend> {
+    let pem = std::fs::read(fixture_pem_path()).unwrap();
+    Box::new(InProcessBackend(JwtSigningKey::from_pem(&pem).unwrap()))
+}
 
 pub const CLIENT_ID: &str = "Iv1.test12345";
 pub const INSTALLATION_ID: u64 = 789;
@@ -159,15 +184,15 @@ pub async fn build_provider_with_clock(
         api_base,
         client_id: CLIENT_ID.to_string(),
         installation_id: INSTALLATION_ID.into(),
-        private_key_path: fixture_pem_path(),
+        app_key_backend: AppKeyBackend::File,
+        private_key_path: Some(fixture_pem_path()),
+        tpm: None,
         selfcheck_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(10),
         user_agent: "symbolon".to_string(),
     };
-    let key = GitHubProvider::load_key(&cfg).await.unwrap();
-    let worker = Rc::new(CpuWorker::new("symbolon-test-jwt-signer").unwrap());
     let cancel = compio::runtime::CancelToken::new();
-    GitHubProvider::with_overrides(&cfg, key, worker, cancel, None, clock).unwrap()
+    GitHubProvider::with_overrides(&cfg, in_process_backend(), cancel, None, clock).unwrap()
 }
 
 pub async fn mount_repo_ok(server: &MockServer) {
@@ -221,7 +246,9 @@ pub fn build_full_config(paths: &TempPaths, api_base: String, bind: SocketAddr) 
                 api_base,
                 client_id: CLIENT_ID.to_string(),
                 installation_id: INSTALLATION_ID.into(),
-                private_key_path: fixture_pem_path(),
+                app_key_backend: AppKeyBackend::File,
+                private_key_path: Some(fixture_pem_path()),
+                tpm: None,
                 selfcheck_timeout: Duration::from_secs(5),
                 request_timeout: Duration::from_secs(10),
                 user_agent: "symbolon".to_string(),
@@ -472,6 +499,10 @@ pub async fn spawn_daemon_with_bind(paths: &TempPaths, api_base: String, bind: S
     let admin_listener = compio::net::UnixListener::bind(&cfg.admin.socket_path)
         .await
         .expect("bind test admin UDS");
+    // Inject an in-process signing backend so the daemon under test
+    // doesn't fork the real key subprocess (which would re-exec the
+    // test harness). The real agent is covered in tests/sign_agent.rs.
+    let signer = in_process_backend();
     compio::runtime::spawn(async move {
         let shutdown = compio::runtime::CancelToken::new();
         let service = symbolon::Service::prepare_with_listeners(
@@ -480,6 +511,7 @@ pub async fn spawn_daemon_with_bind(paths: &TempPaths, api_base: String, bind: S
             shutdown,
             listener,
             admin_listener,
+            Some(signer),
         )
         .await
         .expect("prepare test service");

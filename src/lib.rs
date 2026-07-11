@@ -29,7 +29,6 @@ pub mod atomic_fs;
 pub mod broker_key;
 pub mod config;
 pub mod connection_tracker;
-pub mod cpu_worker;
 pub mod daemon;
 pub mod events;
 pub mod git_credential;
@@ -63,11 +62,9 @@ pub use crate::admin::{CliCommand, cli_dispatch};
 pub use crate::broker_key::{BrokerPrivateKey, BrokerPublicKey};
 #[doc(hidden)]
 pub use crate::config::{
-    AdminConfig, ClientsConfig, Config, ListenConfig, LoggingConfig, MlockMode, ProviderGithub,
-    Providers, RuntimeConfig, SandboxMode, SecurityConfig,
+    AdminConfig, AppKeyBackend, ClientsConfig, Config, ListenConfig, LoggingConfig, MlockMode,
+    ProviderGithub, ProviderGithubTpm, Providers, RuntimeConfig, SandboxMode, SecurityConfig,
 };
-#[doc(hidden)]
-pub use crate::cpu_worker::CpuWorker;
 #[doc(hidden)]
 pub use crate::daemon::Service;
 #[doc(hidden)]
@@ -83,7 +80,17 @@ pub use crate::mlock::apply as mlock_apply;
 #[doc(hidden)]
 pub use crate::note::Note;
 #[doc(hidden)]
+pub use crate::providers::agent::{parse_args as agent_parse_args, run as run_sign_agent};
+#[doc(hidden)]
+pub use crate::providers::agent_backend::AgentSpawn;
+#[doc(hidden)]
 pub use crate::providers::github::{GitHubProvider, GithubError};
+#[doc(hidden)]
+pub use crate::providers::jwt_backend::{JwtBackend, JwtBackendError, JwtClaims, SpawnedBackend};
+#[doc(hidden)]
+pub use crate::providers::jwt_rs256::JwtSigningKey;
+#[doc(hidden)]
+pub use crate::providers::tpm_backend::TpmSpawn;
 #[doc(hidden)]
 pub use crate::psk::Psk;
 #[doc(hidden)]

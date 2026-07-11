@@ -14,9 +14,38 @@ use symbolon::{Identity, Note, Psk};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/symbolon/config.toml";
 
-#[compio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
+
+    // Hidden `__sign-agent` subcommand: the `file`-backend key
+    // subprocess. Re-execing `/proc/self/exe` with a private,
+    // undocumented subcommand to enter a locked-down child is the
+    // standard pattern for this (runc's `runc init`, Chromium's
+    // `--type=` renderer/zygote, gVisor); the `__` prefix marks it
+    // private and it is deliberately kept out of the argh grammar.
+    // It runs FULLY SYNCHRONOUSLY and never touches the compio runtime
+    // — its seccomp allowlist forbids io_uring, so the ring must never
+    // be initialized in this process. Hence the dispatch here, before
+    // the runtime starts.
+    if argv.get(1).map(String::as_str) == Some("__sign-agent") {
+        return match symbolon::agent_parse_args(&argv[2..]) {
+            Ok(key_path) => symbolon::run_sign_agent(&key_path),
+            Err(e) => {
+                eprintln!("symbolon __sign-agent: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
+
+    // Everything else (daemon + CLI subcommands) runs on the compio
+    // runtime, started manually now that the sync agent path is ruled
+    // out.
+    compio::runtime::Runtime::new()
+        .expect("create compio runtime")
+        .block_on(async_main(argv))
+}
+
+async fn async_main(argv: Vec<String>) -> ExitCode {
     let cmd_name = argv.first().map(String::as_str).unwrap_or("symbolon");
     let rest: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
     let args = match Args::from_args(&[cmd_name], &rest) {
@@ -118,10 +147,12 @@ async fn run_daemon(config_path: PathBuf) -> ExitCode {
     symbolon::setup_tracing(cfg.logging.level);
 
     // Belt-and-suspenders anti-swap hardening. Called BEFORE
-    // Service::prepare so the PEM key load + CpuWorker stack
-    // allocation both fault into locked pages. Primary defence
-    // is operator-disabled swap on the broker host — see
-    // docs/INSTALL.md. Required-mode failure is fatal.
+    // Service::prepare so the daemon's own pages fault into locked
+    // memory. (The App key itself never lives in the daemon — it's in
+    // the vTPM or the mlock'd signing agent — but broker state,
+    // in-flight tokens, and the broker static key still benefit.)
+    // Primary defence is operator-disabled swap on the broker host —
+    // see docs/INSTALL.md. Required-mode failure is fatal.
     if let Err(e) = symbolon::mlock_apply(cfg.security.mlock) {
         tracing::error!(evt = %EventKind::MlockRequiredFailed, error = %e);
         return ExitCode::from(1);

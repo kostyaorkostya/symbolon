@@ -10,9 +10,6 @@
 //! See `docs/PROTOCOLS.md` ("GitHub provider outbound") for the
 //! wire-level contract.
 
-use std::path::PathBuf;
-use std::rc::Rc;
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use compio::bytes::Bytes;
@@ -30,11 +27,10 @@ use derive_more::{Display, From};
 use serde_json::json;
 
 use crate::config::ProviderGithub;
-use crate::cpu_worker::{CpuWorker, WorkerDead};
 use crate::events::EventKind;
 use crate::git_credential;
 use crate::ids::OutReqId;
-use crate::providers::jwt_rs256::{self, JwtSigningKey};
+use crate::providers::jwt_backend::{JwtBackend, JwtBackendError, JwtClaims};
 use crate::providers::{
     MintOutcome as AbstractMintOutcome, Provider, ProviderError, ProviderReqId,
     SelfcheckOutcome as AbstractSelfcheckOutcome,
@@ -77,22 +73,12 @@ const ACCEPT_HEADER: &str = "application/vnd.github+json";
 
 #[derive(Debug, thiserror::Error)]
 pub enum GithubError {
-    #[error("failed to read PEM key at {}", path.display())]
-    PemRead {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to parse PEM key at {}", path.display())]
-    PemParse {
-        path: PathBuf,
-        #[source]
-        source: jwt_rs256::JwtError,
-    },
-    #[error("failed to sign JWT")]
-    JwtSign(#[source] jwt_rs256::JwtError),
-    #[error("JWT signer thread is no longer running")]
-    JwtSignerDead,
+    /// JWT signing failed in the configured backend (vTPM or key
+    /// subprocess). The daemon can't tell which — the seam is opaque
+    /// past construction — so a single variant carries every
+    /// backend-side failure.
+    #[error("failed to sign App JWT")]
+    JwtSign(#[from] JwtBackendError),
     #[error("HTTP transport error")]
     Http(#[from] cyper::Error),
     // `source` deliberately omitted. serde_json::Error's Display can
@@ -136,12 +122,6 @@ pub enum GithubError {
     Timeout(Duration),
     #[error("provider request cancelled (daemon shutting down)")]
     Cancelled,
-}
-
-impl From<WorkerDead> for GithubError {
-    fn from(_: WorkerDead) -> Self {
-        GithubError::JwtSignerDead
-    }
 }
 
 impl GithubError {
@@ -202,14 +182,12 @@ impl From<GithubError> for ProviderError {
             }
             GithubError::Timeout(d) => Self::Timeout { elapsed: d },
             GithubError::Cancelled => Self::Cancelled,
-            // GitHub-private grab bag (PEM load, JWT signer, identity
+            // GitHub-private grab bag (signing backend, identity
             // mismatch). The source chain is walked by `ErrorChain` in
             // the daemon's catch-all log arm.
-            other @ (GithubError::PemRead { .. }
-            | GithubError::PemParse { .. }
-            | GithubError::JwtSign(_)
-            | GithubError::JwtSignerDead
-            | GithubError::ClientIdMismatch { .. }) => Self::Internal(Box::new(other)),
+            other @ (GithubError::JwtSign(_) | GithubError::ClientIdMismatch { .. }) => {
+                Self::Internal(Box::new(other))
+            }
         }
     }
 }
@@ -224,7 +202,9 @@ pub struct GitHubProvider {
     api_base: String,
     client_id: String,
     installation_id: InstallationId,
-    signer: JwtSigner,
+    /// The signing seam. Past construction, the provider cannot tell a
+    /// vTPM from a key subprocess — AGENTS.md invariant.
+    signer: Box<dyn JwtBackend>,
     client: cyper::Client,
     user_agent: String,
     clock: fn() -> SystemTime,
@@ -243,37 +223,22 @@ pub struct GitHubProvider {
 // ============================================================================
 
 impl GitHubProvider {
-    /// Load the App private key from disk and parse it into a
-    /// `JwtSigningKey`. Must run BEFORE the sandbox closes
-    /// filesystem access; the resulting `Arc` is then handed to
-    /// [`new`] post-sandbox along with the shared CpuWorker.
-    pub async fn load_key(cfg: &ProviderGithub) -> Result<Arc<JwtSigningKey>, GithubError> {
-        let path = cfg.private_key_path.clone();
-        let pem_bytes = compio::fs::read(&path)
-            .await
-            .map_err(|source| GithubError::PemRead {
-                path: path.clone(),
-                source,
-            })?;
-        let key = JwtSigningKey::from_pem(&pem_bytes)
-            .map_err(|source| GithubError::PemParse { path, source })?;
-        Ok(Arc::new(key))
-    }
-
+    /// Construct the provider around an already-built signing backend.
+    /// The backend (vTPM fd actor, or key-subprocess actor) is created
+    /// by the daemon pre-sandbox and its actor thread started
+    /// post-sandbox; the provider only holds and calls it.
     pub fn new(
         cfg: &ProviderGithub,
-        key: Arc<JwtSigningKey>,
-        worker: Rc<CpuWorker>,
+        signer: Box<dyn JwtBackend>,
         cancel: CancelToken,
     ) -> Result<Self, GithubError> {
-        Self::with_overrides(cfg, key, worker, cancel, None, SystemTime::now)
+        Self::with_overrides(cfg, signer, cancel, None, SystemTime::now)
     }
 
     #[doc(hidden)]
     pub fn with_overrides(
         cfg: &ProviderGithub,
-        key: Arc<JwtSigningKey>,
-        worker: Rc<CpuWorker>,
+        signer: Box<dyn JwtBackend>,
         cancel: CancelToken,
         api_base_override: Option<String>,
         clock: fn() -> SystemTime,
@@ -303,7 +268,7 @@ impl GitHubProvider {
             api_base,
             client_id: cfg.client_id.clone(),
             installation_id: cfg.installation_id,
-            signer: JwtSigner { worker, key },
+            signer,
             client,
             user_agent: cfg.user_agent.clone(),
             clock,
@@ -394,7 +359,7 @@ impl GitHubProvider {
 impl GitHubProvider {
     async fn sign_jwt_now(&self) -> Result<String, GithubError> {
         let claims = JwtClaims::new((self.clock)(), &self.client_id);
-        self.signer.sign(claims).await
+        Ok(self.signer.sign(&claims).await?)
     }
 
     /// Apply the GitHub-standard request headers that depend only
@@ -771,59 +736,6 @@ struct CallMeta {
 }
 
 // ============================================================================
-// JWT signing
-// ============================================================================
-
-#[derive(Serialize)]
-struct JwtClaims {
-    iss: String,
-    iat: u64,
-    exp: u64,
-}
-
-impl JwtClaims {
-    /// Clock-skew leeway: stamp `iat` 60 s in the past so a slightly
-    /// behind broker still passes GitHub's "iat in the future" check.
-    const LEEWAY_PAST_SECS: u64 = 60;
-    /// Lifetime: 9 minutes. GitHub caps App JWTs at 10 minutes; the
-    /// 60 s margin matches `LEEWAY_PAST_SECS` so total skew tolerance
-    /// is 1 minute on either side.
-    const LIFETIME_SECS: u64 = 540;
-
-    fn new(now: SystemTime, client_id: &str) -> Self {
-        let unix = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        Self {
-            iss: client_id.to_string(),
-            iat: unix.saturating_sub(Self::LEEWAY_PAST_SECS),
-            exp: unix.saturating_add(Self::LIFETIME_SECS),
-        }
-    }
-}
-
-/// Holds a shared [`CpuWorker`] handle and the App's
-/// `JwtSigningKey`, dispatching `sign_jwt_blocking` jobs to the
-/// worker thread. The worker is shared across all providers in
-/// the daemon and spawned once at Service init, after the sandbox
-/// is in place.
-struct JwtSigner {
-    worker: Rc<CpuWorker>,
-    // Arc so each sign call clones a handle into the closure shipped
-    // to the worker thread without copying the key bytes.
-    key: Arc<JwtSigningKey>,
-}
-
-impl JwtSigner {
-    /// Synchronous RSA-2048 signing runs ~1-2 ms per call on the
-    /// shared `CpuWorker` thread — never on the compio runtime.
-    async fn sign(&self, claims: JwtClaims) -> Result<String, GithubError> {
-        let key = Arc::clone(&self.key);
-        self.worker
-            .run(move || key.sign_rs256(&claims).map_err(GithubError::JwtSign))
-            .await?
-    }
-}
-
-// ============================================================================
 // impl GitHubProvider — request body builder, response parsers
 // ============================================================================
 
@@ -952,6 +864,33 @@ impl Provider for GitHubProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::jwt_rs256::JwtSigningKey;
+
+    /// In-process signing backend for tests only: signs with the
+    /// fixture PEM directly, no TPM or subprocess. Lets the provider
+    /// tests exercise the signing path without standing up a backend.
+    struct TestBackend(JwtSigningKey);
+
+    impl TestBackend {
+        fn new() -> Self {
+            Self(JwtSigningKey::from_pem(FIXTURE_PEM.as_bytes()).unwrap())
+        }
+        fn boxed() -> Box<dyn JwtBackend> {
+            Box::new(Self::new())
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl JwtBackend for TestBackend {
+        async fn sign(&self, claims: &JwtClaims) -> Result<String, JwtBackendError> {
+            self.0
+                .sign_rs256(claims)
+                .map_err(|e| JwtBackendError::Rejected(e.to_string()))
+        }
+        async fn self_check(&self) -> Result<(), JwtBackendError> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn http_date_rfc2822_parses_imf_fixdate() {
@@ -961,43 +900,6 @@ mod tests {
     }
 
     const FIXTURE_PEM: &str = include_str!("../../tests/fixtures/test_app_key.pem");
-
-    fn t(secs: u64) -> SystemTime {
-        UNIX_EPOCH + Duration::from_secs(secs)
-    }
-
-    #[test]
-    fn build_claims_at_fixed_time() {
-        let claims = JwtClaims::new(t(1_700_000_000), "Iv1.test42");
-        assert_eq!(claims.iss, "Iv1.test42");
-        assert_eq!(claims.iat, 1_700_000_000 - 60);
-        assert_eq!(claims.exp, 1_700_000_000 + 540);
-    }
-
-    #[test]
-    fn sign_jwt_produces_three_parts() {
-        let key = JwtSigningKey::from_pem(FIXTURE_PEM.as_bytes()).unwrap();
-        let claims = JwtClaims::new(t(1_700_000_000), "Iv1.test42");
-        let token = key.sign_rs256(&claims).unwrap();
-        let parts: Vec<&str> = token.split('.').collect();
-        assert_eq!(parts.len(), 3);
-    }
-
-    /// Pin the exact signed token for known (claims, key).
-    /// RSASSA-PKCS1-v1_5 is deterministic; the
-    /// `crate::providers::jwt_rs256` test has the same assertion
-    /// for the lower-level helper, this one covers
-    /// `JwtSigner::sign` end-to-end.
-    #[test]
-    fn sign_jwt_blocking_known_vector() {
-        let key = JwtSigningKey::from_pem(FIXTURE_PEM.as_bytes()).unwrap();
-        let claims = JwtClaims::new(t(1_700_000_000), "Iv1.test42");
-        let token = key.sign_rs256(&claims).unwrap();
-        assert_eq!(
-            token,
-            "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJJdjEudGVzdDQyIiwiaWF0IjoxNjk5OTk5OTQwLCJleHAiOjE3MDAwMDA1NDB9.yPTDonwO4souVu_3nk7Aq8ZbiAq3PBVLHRJ5J6B67JHmUxVh-yvIoXdQ8O_EAqj-H57GKRAo_b0nu6hQT_keD9-wB_ah8DC_ZqtV42S3jHACWAdEG066W1XdKUftU82QkdSM5hrpdg9OvFN6i7m0ObCJi3uJMWXYb8lY1LYJew0SWajBzLKQjw47Qmbq-AYiTgkdBoRfK5TrD64u6wd0aQCathxELkaiEacilUtU6ZH8jOQ_W5hYjjwxjTF7wbNWdx-v7M3yUSUn_01Sn9w2bTLeimsP4e81ydchLhIeJED4iF-j-QG_uBlhp0auwTPYqPaG6Zh-qhbkE0DJaV-log",
-        );
-    }
 
     #[test]
     fn parse_mint_response_ok() {
@@ -1118,19 +1020,19 @@ mod tests {
             api_base: "https://api.github.com/".to_string(),
             client_id: "Iv1.test1".to_string(),
             installation_id: 2u64.into(),
-            private_key_path: fixture_pem_path(),
+            app_key_backend: crate::config::AppKeyBackend::File,
+            private_key_path: Some(fixture_pem_path()),
+            tpm: None,
             selfcheck_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(10),
             user_agent: "symbolon".to_string(),
         };
-        let key = GitHubProvider::load_key(&cfg).await.unwrap();
-        let worker = Rc::new(CpuWorker::new("symbolon-test-jwt").unwrap());
         let cancel = compio::runtime::CancelToken::new();
-        let p = GitHubProvider::new(&cfg, key, worker, cancel).unwrap();
+        let p = GitHubProvider::new(&cfg, TestBackend::boxed(), cancel).unwrap();
         assert_eq!(p.api_base, "https://api.github.com");
     }
 
-    fn fixture_pem_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test_app_key.pem")
+    fn fixture_pem_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test_app_key.pem")
     }
 }

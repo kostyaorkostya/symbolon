@@ -95,14 +95,52 @@ sha256sum -c "symbolon-${TARGET}.sha256"
 install -o root -g root -m 0755 "symbolon-${TARGET}" /usr/local/bin/symbolon
 ```
 
-### 3.4 Place the provider private key
+### 3.4 Provision the App signing key
 
-Path and file format are per-provider; see your provider doc. For
-GitHub:
+The daemon never holds the provider's private key — it signs
+through a backend you choose with `app_key_backend` (see
+[providers/github.md § App key custody](providers/github.md#app-key-custody-file-vs-tpm)).
+Pick one:
+
+**`file` backend** (no special hardware; recommended default) — a
+sandboxed subprocess owns the PEM:
 
 ```sh
 install -o symbolon -g symbolon -m 0400 /path/to/github-app.pem /etc/symbolon/github-app.pem
 ```
+
+**`tpm` backend** — the RSA key lives in a per-instance vTPM. On an
+Incus/LXD container, attach a software TPM to the instance:
+
+```sh
+incus config device add <instance> vtpm tpm \
+    path=/dev/tpm0 pathrm=/dev/tpmrm0
+```
+
+Host prerequisites: `swtpm` installed and the `tpm_vtpm_proxy`
+kernel module loadable (`modprobe tpm_vtpm_proxy`). Some distros
+ship an AppArmor policy that denies swtpm the `sys_admin` capability
+it needs for the vtpm-proxy device; if the device doesn't appear,
+check `dmesg` / the host AppArmor logs.
+
+The `tpm` device node arrives **root-owned** inside the container,
+and Incus's `tpm` device does *not* accept `uid`/`gid`/`mode` keys
+(they're rejected as unknown options — verified against the Incus
+device schema). So `chown` the node to the `symbolon` user from the
+container's init (a systemd `tmpfiles.d` entry or an OpenRC
+`start_pre`), e.g.:
+
+```
+# /etc/tmpfiles.d/symbolon-tpm.conf
+z /dev/tpmrm0 0600 symbolon symbolon -
+z /dev/tpm0   0600 symbolon symbolon -
+```
+
+Then provision the persistent RSA-2048 key with `tpm2-tools` — the
+`tpm2_createprimary` → `tpm2_import` → `tpm2_load` →
+`tpm2_evictcontrol` recipe is in
+[providers/github.md § App key custody](providers/github.md#app-key-custody-file-vs-tpm).
+Destroy or offline the PEM afterwards.
 
 ### 3.5 Generate the broker static key
 
@@ -163,8 +201,13 @@ host = "github.com"
 api_base = "https://api.github.com"
 client_id = "Iv23liABCDEFGHIJklmn"
 installation_id = 789012
-private_key_path = "/etc/symbolon/github-app.pem"
 selfcheck_timeout = "5s"
+# Signing backend (required). "file" (§3.4) shown; for "tpm":
+#   app_key_backend = "tpm"
+#   [provider.github.tpm]
+#   persistent_handle = 0x81010001
+app_key_backend = "file"
+private_key_path = "/etc/symbolon/github-app.pem"
 ```
 
 ```sh

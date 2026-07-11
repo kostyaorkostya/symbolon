@@ -25,16 +25,18 @@ use tracing::{info, warn};
 
 use crate::atomic_fs::atomic_write;
 use crate::broker_key::{BrokerPrivateKey, BrokerPublicKey};
-use crate::config::{ClientEntry, ClientsFile, Config};
+use crate::config::{AppKeyBackend, ClientEntry, ClientsFile, Config, ProviderGithub};
 use crate::connection_tracker::ConnectionTracker;
-use crate::cpu_worker::CpuWorker;
 use crate::events::EventKind;
 use crate::git_credential;
 use crate::identity::{Identity, IdentityError};
 use crate::ids::{OutReqId, ReqId};
 use crate::logging::ErrorChain;
 use crate::note::Note;
+use crate::providers::agent_backend::AgentSpawn;
 use crate::providers::github::{GitHubProvider, GithubError};
+use crate::providers::jwt_backend::{JwtBackend, JwtBackendError, SpawnedBackend};
+use crate::providers::tpm_backend::TpmSpawn;
 use crate::providers::{Provider, ProviderError, ProviderKind, ProviderReqId};
 use crate::psk::Psk;
 use crate::psk_store::{PskStore, PskStoreError};
@@ -120,10 +122,67 @@ pub enum DaemonError {
     NoParentDir(&'static str),
     #[error("failed to apply sandbox")]
     Sandbox(#[from] SandboxError),
-    #[error("failed to spawn CPU worker thread")]
-    CpuWorker(#[source] std::io::Error),
+    #[error("failed to determine current executable path for signing agent")]
+    CurrentExe(#[source] std::io::Error),
+    #[error("signing backend failed")]
+    SigningBackend(#[from] JwtBackendError),
     #[error("daemon prepare cancelled by shutdown signal")]
     Cancelled,
+}
+
+/// Construct the signing backend selected by `[provider.github]
+/// app_key_backend`, pre-sandbox, boxed behind the `SpawnedBackend`
+/// seam. `file` forks the key subprocess; `tpm` opens the device
+/// node. Config validation guarantees the matching sub-config is
+/// present, so the `expect`s are unreachable.
+fn spawn_signing_backend(gh: &ProviderGithub) -> Result<Box<dyn SpawnedBackend>, DaemonError> {
+    match gh.app_key_backend {
+        AppKeyBackend::File => {
+            let key_path = gh
+                .private_key_path
+                .as_ref()
+                .expect("config validation requires private_key_path for file backend");
+            // The agent is a re-exec of this binary's `__sign-agent`
+            // subcommand.
+            let exe = std::env::current_exe().map_err(DaemonError::CurrentExe)?;
+            Ok(Box::new(AgentSpawn::spawn(&exe, key_path)?))
+        }
+        AppKeyBackend::Tpm => {
+            let tpm = gh
+                .tpm
+                .as_ref()
+                .expect("config validation requires [provider.github.tpm] for tpm backend");
+            Ok(Box::new(TpmSpawn::open(
+                &tpm.device,
+                tpm.persistent_handle,
+            )?))
+        }
+    }
+}
+
+/// Build the immutable provider registry, post-sandbox. Starts the
+/// signing backend's actor thread (from the pre-sandbox `github_spawn`,
+/// or a test-injected live `signer_override`), self-checks it — a
+/// broken agent / unreachable TPM is fatal at startup, not on the
+/// first mint — and constructs the provider around it.
+async fn build_providers(
+    cfg: &Config,
+    github_spawn: Option<Box<dyn SpawnedBackend>>,
+    signer_override: Option<Box<dyn JwtBackend>>,
+    shutdown: &CancelToken,
+) -> Result<HashMap<ProviderKind, Box<dyn Provider>>, DaemonError> {
+    let Some(gh) = &cfg.provider.github else {
+        return Ok(HashMap::new());
+    };
+    let signer = match signer_override {
+        Some(live) => live,
+        None => github_spawn
+            .expect("spawned pre-sandbox when a github provider is configured")
+            .into_backend(),
+    };
+    signer.self_check().await?;
+    let provider: Box<dyn Provider> = Box::new(GitHubProvider::new(gh, signer, shutdown.clone())?);
+    Ok(HashMap::from([(ProviderKind::Github, provider)]))
 }
 
 /// Per-client metadata stored in the in-memory `SharedState.clients`
@@ -375,12 +434,12 @@ pub struct Service {
 }
 
 impl Service {
-    /// Sequencing matters here: PEM bytes, the initial PSK file read,
-    /// and the env-fd handoff all need access the sandbox would deny,
-    /// so they happen first. `apply_sandbox` then closes the gate.
-    /// The shared `CpuWorker` is spawned AFTER the sandbox so its
-    /// thread inherits the Landlock ruleset — spawning it before would
-    /// leak an unsandboxed thread into the process.
+    /// Sequencing matters here: the broker key + PSK file reads, the
+    /// env-fd handoff, and the signing-backend fd acquisition (opening
+    /// the TPM device / `execve`ing the key subprocess) all need access
+    /// the sandbox would deny, so they happen first. `apply_sandbox`
+    /// then closes the gate. The backend's fd-owning actor thread is
+    /// started AFTER the sandbox so it inherits the Landlock ruleset.
     ///
     /// **The daemon does not bind sockets itself.** Both the inbound
     /// TCP listener and the admin UDS are obtained via the
@@ -396,14 +455,19 @@ impl Service {
         shutdown: CancelToken,
     ) -> Result<Self, DaemonError> {
         let (listener, admin_listener) = take_env_listeners()?;
-        Self::prepare_with_listeners(cfg, config_path, shutdown, listener, admin_listener).await
+        Self::prepare_with_listeners(cfg, config_path, shutdown, listener, admin_listener, None)
+            .await
     }
 
     /// Test-only entry point: skip the `LISTEN_FDS` handoff and run
     /// against caller-supplied listeners. Integration tests spawn
     /// many parallel daemon instances in one process; env vars are
     /// process-global, so they bind their own sockets and pass them
-    /// in here. Not part of the operator-visible API.
+    /// in here. `signer_override` injects an already-live signing
+    /// backend so daemon tests don't fork the real key subprocess
+    /// (which would re-exec the test harness, not the symbolon
+    /// binary); production passes `None`. Not part of the
+    /// operator-visible API.
     #[doc(hidden)]
     pub async fn prepare_with_listeners(
         cfg: &Config,
@@ -411,12 +475,13 @@ impl Service {
         shutdown: CancelToken,
         listener: TcpListener,
         admin_listener: UnixListener,
+        signer_override: Option<Box<dyn JwtBackend>>,
     ) -> Result<Self, DaemonError> {
         // Race preparation against shutdown so an early SIGTERM (e.g.
         // during a hung PEM read on a stale NFS mount) returns cleanly.
         futures_util::select_biased! {
             _ = shutdown.clone().wait().fuse() => Err(DaemonError::Cancelled),
-            r = Self::prepare_inner(cfg, config_path, shutdown.clone(), listener, admin_listener).fuse() => r,
+            r = Self::prepare_inner(cfg, config_path, shutdown.clone(), listener, admin_listener, signer_override).fuse() => r,
         }
     }
 
@@ -426,6 +491,7 @@ impl Service {
         shutdown: CancelToken,
         listener: TcpListener,
         admin_listener: UnixListener,
+        signer_override: Option<Box<dyn JwtBackend>>,
     ) -> Result<Self, DaemonError> {
         let clients_file = crate::loader::load_clients_file(&cfg.clients.file)
             .await
@@ -443,44 +509,38 @@ impl Service {
         // without it the daemon cannot terminate a single handshake, so
         // fail fast with the generation hint in the error.
         let broker_key = load_broker_key(&cfg.listen.static_key_file).await?;
-        let broker_public = broker_key.derive_public();
 
-        // Pre-sandbox: read provider PEMs into memory.
-        let github_key = if let Some(gh) = &cfg.provider.github {
-            Some(GitHubProvider::load_key(gh).await?)
-        } else {
-            None
+        // Pre-sandbox: acquire the signing backend's fd. This is where
+        // `execve` (file backend: fork the key subprocess) and opening
+        // the TPM device node happen — both require access the sandbox
+        // is about to revoke, so they MUST precede `apply_sandbox`. The
+        // fd-owning actor thread is NOT started yet. Skipped entirely
+        // when a test injects an already-live backend.
+        let github_spawn = match (&cfg.provider.github, &signer_override) {
+            (Some(gh), None) => Some(spawn_signing_backend(gh)?),
+            _ => None,
         };
 
         // Sockets are already bound — by the caller (production: via
         // `take_env_listeners`; tests: pre-bound and passed in). The
         // supervisor owns the inode lifecycle, perms, and unlink.
 
-        // Sandbox gate closes here.
+        // Sandbox gate closes here. After this, `execve` and the TPM
+        // device path are denied — which is why the backend fd was
+        // acquired above.
         apply_sandbox(cfg)?;
 
-        // Post-sandbox: spawn the shared CPU worker (its OS thread
-        // inherits the Landlock ruleset via TGID-wide application).
-        let cpu_worker = Rc::new(CpuWorker::new("cpu-worker").map_err(DaemonError::CpuWorker)?);
-
-        // Post-sandbox: construct providers with pre-loaded keys.
-        // Keyed by `ProviderKind` at the registration site so the
-        // `Provider` trait itself doesn't need to know its own kind —
-        // the daemon owns the (kind, impl) pairing.
-        let mut providers: HashMap<ProviderKind, Box<dyn Provider>> = HashMap::new();
-        if let Some(gh) = &cfg.provider.github {
-            let key = github_key.expect("github_key loaded above when gh is Some");
-            let provider = GitHubProvider::new(gh, key, cpu_worker.clone(), shutdown.clone())?;
-            providers.insert(ProviderKind::Github, Box::new(provider));
-        }
+        // Post-sandbox: start the actor thread, self-check, and build
+        // the immutable provider registry.
+        let providers = build_providers(cfg, github_spawn, signer_override, &shutdown).await?;
 
         let state = Rc::new(SharedState {
             mutation_lock: Mutex::new(()),
             clients: RefCell::new(clients_table),
             psks: RefCell::new(psk_store),
             providers,
+            broker_public: broker_key.derive_public(),
             broker_key,
-            broker_public,
             unknown_identity_events: RefCell::new(TokenBucket::new(
                 UNKNOWN_IDENTITY_LOG_REFILL,
                 UNKNOWN_IDENTITY_LOG_BURST_TOLERANCE,

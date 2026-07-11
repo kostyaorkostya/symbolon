@@ -92,22 +92,45 @@ host = "github.com"
 api_base = "https://api.github.com"
 client_id = "Iv23liABCDEFGHIJklmn"
 installation_id = 789012
-private_key_path = "/etc/symbolon/github-app.pem"
 selfcheck_timeout = "5s"
+# Signing backend — REQUIRED, no default. The daemon never holds the
+# App private key in its own address space; both backends move it out.
+#   "file" — a sandboxed subprocess owns the PEM (below).
+#   "tpm"  — an RSA key in a vTPM ([provider.github.tpm] below).
+app_key_backend = "file"
+
+# app_key_backend = "file" ⇒ set private_key_path (and no [...tpm]).
+# The PEM is read only by the signing agent subprocess, never the
+# daemon.
+private_key_path = "/etc/symbolon/github-app.pem"
+
+# app_key_backend = "tpm" ⇒ set [provider.github.tpm] (and NO
+# private_key_path). The device is opened once pre-sandbox.
+# [provider.github.tpm]
+# device = "/dev/tpmrm0"          # default; the kernel resource-mgr node
+# persistent_handle = 0x81010001  # the pre-provisioned RSA-2048 key
 ```
 
 Unknown top-level keys are rejected by `serde` deserialization
 (`#[serde(deny_unknown_fields)]` on every struct). The `[security]`
 section is optional and defaults to `sandbox = "best_effort"` with
-no extra read dirs.
+no extra read dirs. `app_key_backend` and its matching sub-config are
+cross-validated at parse time: `file` requires `private_key_path` and
+forbids `[provider.github.tpm]`; `tpm` requires the reverse. A
+mismatch fails fast at startup.
 
-The provider private-key path and the broker static key are read
-once at startup, **before** the sandbox is applied. The default
-sandbox ruleset deliberately omits `/etc/symbolon/` so a
-post-compromise process inside the daemon cannot re-open either
-key. Keep both key files under `/etc/symbolon/` (or any other dir
-outside `/var/lib/symbolon/`); do not place them in the directory
-granted write access for atomic state-file writes.
+The broker static key is read once at startup, **before** the
+sandbox is applied; with `app_key_backend = "tpm"` the TPM device is
+opened at the same point, and with `"file"` the signing agent is
+`execve`d at the same point (afterwards the sandbox denies both). The
+default sandbox ruleset deliberately omits `/etc/symbolon/` and never
+grants the TPM device path, so a post-compromise process inside the
+daemon cannot re-open the broker key, the App key, or the TPM. Keep
+key files under `/etc/symbolon/` (or any dir outside
+`/var/lib/symbolon/`); do not place them in the directory granted
+write access for atomic state-file writes. **With the `file` backend
+the daemon never opens `private_key_path` at all** — only the agent
+subprocess does.
 
 ### `/var/lib/symbolon/clients.json`: machine-authored
 
@@ -442,29 +465,35 @@ Currently:
 
 ### Startup
 
-1. Parse `config.toml`. Fail fast on schema errors.
-2. Load each configured provider's private key file and the broker
-   static key (`[listen] static_key_file`) into memory. Fail fast
-   on parse error.
+1. Parse `config.toml` (cross-validating `app_key_backend` against
+   its sub-config). Fail fast on schema errors.
+2. Load the broker static key (`[listen] static_key_file`) and
+   `clients.json` into memory. Fail fast on parse error.
 3. **Reclaim the listening sockets from the supervisor** via the
    `LISTEN_FDS` env protocol. Slot 0 = TCP wire, slot 1 = admin
    UDS. Plain `symbolon daemon` invocation with no supervisor
    exits immediately with `DaemonError::EnvFdTake`. The daemon
    never binds, chmods, or unlinks these sockets — that's the
    supervisor's job. See INSTALL.md §§3.9–3.11.
-4. Load `clients.json`. Fail fast on schema errors.
+4. **Construct the signing backend.** `tpm` opens the TPM device
+   node; `file` `execve`s the key subprocess over a socketpair.
+   Both need access the sandbox is about to revoke, so this
+   precedes it. The daemon never reads the App PEM itself.
 5. Apply sandbox (Landlock at ABI 6). Per `[security] sandbox`:
    `required` aborts on missing kernel features; `best_effort`
    degrades and emits `evt=sandbox_applied` at `warn` lvl; `off`
-   skips. After this step the provider key dir and the broker
-   static key file are unreachable;
-   only the small allowlist (state dirs, `/dev/urandom`,
-   `/etc/ssl/certs`, nameservice files, TCP-connect to port 443,
-   intra-process signals) remains permitted.
-6. Run per-provider selfcheck (provider-specific: verifies the
+   skips. After this step the App key dir, the broker static key
+   file, and the TPM device path are all unreachable; only the
+   small allowlist (state dirs, `/dev/urandom`, `/etc/ssl/certs`,
+   nameservice files, TCP-connect to port 443, intra-process
+   signals) remains permitted. `execve` is denied.
+6. **Start each signing backend's fd-owning actor thread**
+   (post-sandbox, so it inherits the ruleset) and run its
+   `self_check` — a dead agent / unreachable TPM is fatal here.
+7. Run per-provider selfcheck (provider-specific: verifies the
    provider identity claim and reachability; see
    [providers/](providers/)).
-7. Enter the accept loop.
+8. Enter the accept loop.
 
 ### Shutdown
 

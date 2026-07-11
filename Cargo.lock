@@ -2056,6 +2056,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "seccompiler"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "security-framework"
 version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2356,6 +2365,7 @@ dependencies = [
  "listenfd",
  "rsa",
  "sd-notify",
+ "seccompiler",
  "serde",
  "serde_json",
  "sha2",
@@ -2367,6 +2377,7 @@ dependencies = [
  "thiserror",
  "time",
  "toml",
+ "tpm2-protocol",
  "tracing",
  "tracing-subscriber",
  "ulid",
@@ -2618,6 +2629,12 @@ name = "tower-service"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
+
+[[package]]
+name = "tpm2-protocol"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6c291259420303eaf5ccedf24e933fa552fc9aef14db7be3786c2fa49199cbb"
 
 [[package]]
 name = "tracing"

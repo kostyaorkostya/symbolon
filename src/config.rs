@@ -174,6 +174,38 @@ pub struct Providers {
     pub github: Option<ProviderGithub>,
 }
 
+/// App-key signing backend. Required — no default. The daemon never
+/// holds the App private key in its own address space; both backends
+/// move the key material out of it. `tpm` signs in-process against a
+/// vTPM; `file` signs in a sandboxed subprocess that owns the PEM.
+/// The choice is the operator's; symbolon obeys — no auto-probing,
+/// no runtime fallback.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppKeyBackend {
+    Tpm,
+    File,
+}
+
+/// `[provider.github.tpm]` section — present iff `app_key_backend =
+/// "tpm"`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderGithubTpm {
+    /// TPM device path. Default `/dev/tpmrm0` — the kernel
+    /// resource-manager node, which multiplexes concurrent access and
+    /// virtualizes transient handles. Opened once, blocking, before
+    /// the sandbox closes; the fd is then owned by the signing actor
+    /// thread for the process lifetime (the sandbox never grants this
+    /// path, so it cannot be reopened).
+    #[serde(default = "default_tpm_device")]
+    pub device: PathBuf,
+    /// Persistent handle (`0x81xxxxxx`) of the pre-provisioned
+    /// RSA-2048 signing key. TOML hex literal, e.g.
+    /// `persistent_handle = 0x81010001`.
+    pub persistent_handle: u32,
+}
+
 /// `[provider.github]` section.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -191,8 +223,20 @@ pub struct ProviderGithub {
     /// JSON web token (JWT) for a GitHub App" guide.
     pub client_id: String,
     pub installation_id: InstallationId,
-    /// PEM-encoded App private key; loaded once at startup.
-    pub private_key_path: PathBuf,
+    /// Signing backend selector. Cross-field validation
+    /// ([`Config::parse`]) enforces the matching sub-config:
+    /// `tpm` ⇒ `[provider.github.tpm]` present, `private_key_path`
+    /// absent; `file` ⇒ the reverse.
+    pub app_key_backend: AppKeyBackend,
+    /// PEM-encoded App private key path — required for and only used
+    /// by the `file` backend, where a sandboxed subprocess reads it.
+    /// The daemon itself never opens it.
+    #[serde(default)]
+    pub private_key_path: Option<PathBuf>,
+    /// vTPM signing parameters — required for and only used by the
+    /// `tpm` backend.
+    #[serde(default)]
+    pub tpm: Option<ProviderGithubTpm>,
     /// Startup self-check timeout (e.g. `"5s"`). Required — no
     /// default; the operator picks based on their network's p99
     /// latency to api.github.com.
@@ -213,6 +257,10 @@ pub struct ProviderGithub {
 
 fn default_request_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(10)
+}
+
+fn default_tpm_device() -> PathBuf {
+    PathBuf::from("/dev/tpmrm0")
 }
 
 fn default_user_agent() -> String {
@@ -256,9 +304,49 @@ pub struct ClientEntry {
 pub type ParseError = Box<dyn std::error::Error + Send + Sync>;
 
 impl Config {
-    /// Parse `config.toml` from a UTF-8 string.
+    /// Parse `config.toml` from a UTF-8 string, then run cross-field
+    /// validation that `#[serde(deny_unknown_fields)]` can't express
+    /// (the backend selector and its matching sub-config must agree).
     pub fn parse(text: &str) -> Result<Self, ParseError> {
-        Ok(toml::from_str(text)?)
+        let cfg: Self = toml::from_str(text)?;
+        if let Some(gh) = &cfg.provider.github {
+            gh.validate_backend()?;
+        }
+        Ok(cfg)
+    }
+}
+
+impl ProviderGithub {
+    /// Enforce that the signing-backend selector matches the
+    /// sub-config actually present: each backend requires exactly its
+    /// own keys and forbids the other's, so a typo in `app_key_backend`
+    /// fails loudly at startup instead of silently ignoring a
+    /// misplaced `private_key_path` or `[...tpm]` block.
+    fn validate_backend(&self) -> Result<(), ParseError> {
+        match self.app_key_backend {
+            AppKeyBackend::Tpm => {
+                if self.tpm.is_none() {
+                    return Err(
+                        "app_key_backend = \"tpm\" requires a [provider.github.tpm] section".into(),
+                    );
+                }
+                if self.private_key_path.is_some() {
+                    return Err(
+                        "private_key_path is not used with app_key_backend = \"tpm\"; remove it"
+                            .into(),
+                    );
+                }
+            }
+            AppKeyBackend::File => {
+                if self.private_key_path.is_none() {
+                    return Err("app_key_backend = \"file\" requires private_key_path".into());
+                }
+                if self.tpm.is_some() {
+                    return Err("[provider.github.tpm] is not used with app_key_backend = \"file\"; remove it".into());
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -293,8 +381,36 @@ host = "github.com"
 api_base = "https://api.github.com"
 client_id = "Iv23liABCDEFGHIJklmn"
 installation_id = 789012
+app_key_backend = "file"
 private_key_path = "/etc/symbolon/github-app.pem"
 selfcheck_timeout = "5s"
+"#;
+
+    const KNOWN_GOOD_TPM_CONFIG: &str = r#"
+[listen]
+bind = "0.0.0.0:9418"
+psk_file = "/var/lib/symbolon/psks"
+static_key_file = "/etc/symbolon/broker.key"
+
+[admin]
+socket_path = "/run/symbolon/admin.sock"
+
+[clients]
+file = "/var/lib/symbolon/clients.json"
+
+[logging]
+level = "info"
+
+[provider.github]
+host = "github.com"
+api_base = "https://api.github.com"
+client_id = "Iv23liABCDEFGHIJklmn"
+installation_id = 789012
+app_key_backend = "tpm"
+selfcheck_timeout = "5s"
+
+[provider.github.tpm]
+persistent_handle = 0x81010001
 "#;
 
     #[test]
@@ -320,10 +436,76 @@ selfcheck_timeout = "5s"
         assert_eq!(gh.api_base, "https://api.github.com");
         assert_eq!(gh.client_id, "Iv23liABCDEFGHIJklmn");
         assert_eq!(gh.installation_id, InstallationId::from(789_012_u64));
+        assert_eq!(gh.app_key_backend, AppKeyBackend::File);
         assert_eq!(
             gh.private_key_path,
-            PathBuf::from("/etc/symbolon/github-app.pem")
+            Some(PathBuf::from("/etc/symbolon/github-app.pem"))
         );
+    }
+
+    #[test]
+    fn config_tpm_backend_parses_persistent_handle() {
+        let cfg = Config::parse(KNOWN_GOOD_TPM_CONFIG).unwrap();
+        let gh = cfg.provider.github.expect("github provider present");
+        assert_eq!(gh.app_key_backend, AppKeyBackend::Tpm);
+        assert!(gh.private_key_path.is_none());
+        let tpm = gh.tpm.expect("tpm sub-config present");
+        assert_eq!(tpm.device, PathBuf::from("/dev/tpmrm0"));
+        assert_eq!(tpm.persistent_handle, 0x8101_0001);
+    }
+
+    #[test]
+    fn config_tpm_backend_requires_tpm_section() {
+        let src = KNOWN_GOOD_TPM_CONFIG.replace(
+            "\n[provider.github.tpm]\npersistent_handle = 0x81010001\n",
+            "\n",
+        );
+        let err = Config::parse(&src).unwrap_err();
+        assert!(
+            err.to_string().contains("[provider.github.tpm]"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_tpm_backend_rejects_private_key_path() {
+        let src = KNOWN_GOOD_TPM_CONFIG.replace(
+            "app_key_backend = \"tpm\"",
+            "app_key_backend = \"tpm\"\nprivate_key_path = \"/etc/symbolon/github-app.pem\"",
+        );
+        let err = Config::parse(&src).unwrap_err();
+        assert!(
+            err.to_string().contains("private_key_path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_file_backend_requires_private_key_path() {
+        let src =
+            KNOWN_GOOD_CONFIG.replace("private_key_path = \"/etc/symbolon/github-app.pem\"\n", "");
+        let err = Config::parse(&src).unwrap_err();
+        assert!(
+            err.to_string().contains("private_key_path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_file_backend_rejects_tpm_section() {
+        let src =
+            format!("{KNOWN_GOOD_CONFIG}\n[provider.github.tpm]\npersistent_handle = 0x81010001\n");
+        let err = Config::parse(&src).unwrap_err();
+        assert!(
+            err.to_string().contains("[provider.github.tpm]"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_missing_app_key_backend() {
+        let src = KNOWN_GOOD_CONFIG.replace("app_key_backend = \"file\"\n", "");
+        assert!(Config::parse(&src).is_err());
     }
 
     #[test]

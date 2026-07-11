@@ -9,8 +9,13 @@
 //! `SharedState`; methods use `#[async_trait(?Send)]` because
 //! compio is single-threaded.
 
+pub mod agent;
+pub mod agent_backend;
+pub mod agent_protocol;
 pub mod github;
+pub mod jwt_backend;
 pub mod jwt_rs256;
+pub mod tpm_backend;
 
 use std::time::Duration;
 

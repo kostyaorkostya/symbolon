@@ -77,15 +77,116 @@ host = "github.com"
 api_base = "https://api.github.com"
 client_id = "Iv23liABCDEFGHIJklmn"   # App settings page
 installation_id = 789012             # /installations/<id> URL
-private_key_path = "/etc/symbolon/github-app.pem"
 selfcheck_timeout = "5s"             # required; tune to your p99 to api.github.com
 # request_timeout = "10s"            # optional; default 10s
 # user_agent = "symbolon"            # optional; default "symbolon"
+
+# Signing backend — required, no default. See "App key custody" below.
+app_key_backend = "file"
+private_key_path = "/etc/symbolon/github-app.pem"
 ```
 
 `host` is matched **byte-exact** against the `host=` field a git
 credential helper sends. No suffix matching, no case-folding, no
 default. See [`../PROTOCOLS.md`](../PROTOCOLS.md) § "Host dispatch".
+
+## App key custody: `file` vs `tpm`
+
+The App private key signs a short-lived JWT on every
+metadata-token and mint call. **The daemon never holds it** —
+`app_key_backend` selects where the RSA private key lives, and the
+daemon signs through an opaque seam either way. Pick one; there is
+no default and no runtime fallback.
+
+### `file` — sandboxed signing subprocess
+
+```toml
+app_key_backend = "file"
+private_key_path = "/etc/symbolon/github-app.pem"
+```
+
+At startup the daemon forks a tiny signing agent (a hidden
+subcommand of the same binary) over a `SOCK_SEQPACKET` socketpair,
+*before* it sandboxes itself. The agent reads the PEM, then locks
+itself down: `mlockall` (key off swap), `PR_SET_DUMPABLE=0` (no core
+dump can leak it), `PR_SET_PDEATHSIG` (dies with the daemon),
+Landlock (the key path read-only, **no network**), and a seccomp
+syscall allowlist (no `socket`/`connect`/`execve`/io_uring). It then
+serves one signature per request and logs every sign to stderr →
+journald — an **audit trail** the daemon can't forge. A compromised
+daemon is reduced from *key theft* to a *logged, time-bounded
+signing oracle*: it can request signatures while it is resident, but
+it cannot exfiltrate the key or sign after it is killed, and every
+request it made is in the agent's log. `SIGHUP` to the agent
+re-reads the PEM (key rotation without a full restart).
+
+This backend needs no special hardware and is the recommended
+default for most deployments.
+
+### `tpm` — sign in a vTPM
+
+```toml
+app_key_backend = "tpm"
+
+[provider.github.tpm]
+device = "/dev/tpmrm0"           # default; kernel resource-manager node
+persistent_handle = 0x81010001   # pre-provisioned RSA-2048 signing key
+```
+
+The RSA private key is generated in / imported into a TPM and never
+leaves it. The daemon computes SHA-256 of the JWS signing input in
+Rust and sends only the 32-byte digest to the TPM via `TPM2_Sign`
+(scheme RSASSA+SHA-256); the signature comes back and the daemon
+assembles the JWT. A dedicated thread owns the device fd (opened
+once, pre-sandbox — the sandbox never grants the device path).
+
+Provision the key with `tpm2-tools` (owner hierarchy, unrestricted
+RSA-2048 signing key, empty auth, evicted to a persistent handle):
+
+```sh
+# TCTI points at your TPM (e.g. a per-instance swtpm — see INSTALL.md)
+export TPM2TOOLS_TCTI="device:/dev/tpmrm0"
+
+tpm2_createprimary -C o -G rsa2048 -c primary.ctx
+# Import the GitHub App PEM as a child of the primary...
+tpm2_import -C primary.ctx -G rsa -i github-app.pem -u key.pub -r key.priv
+#   ...OR generate a fresh in-TPM key instead of importing:
+# tpm2_create -C primary.ctx -G rsa2048 -u key.pub -r key.priv \
+#     -a "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|sign"
+tpm2_load -C primary.ctx -u key.pub -r key.priv -c key.ctx
+tpm2_evictcontrol -C o -c key.ctx 0x81010001
+```
+
+The key must be **unrestricted** (no `restricted` attribute) with
+`sign` set and scheme `null` or `rsassa`, so `TPM2_Sign` accepts a
+digest computed outside the TPM with a null hashcheck ticket. Empty
+auth is deliberate — see "App-key threat model" below. After
+importing, destroy or offline the PEM.
+
+### App-key threat model
+
+- **`tpm` mode**: a compromised daemon is a direct, *symbolon-
+  unlogged* signing oracle for as long as it is resident (the vTPM
+  signs whatever digest it's handed; io_uring further dilutes the
+  daemon's own seccomp — an accepted trade). The key itself cannot be
+  extracted. Compensating controls are GitHub-side: the JWT is valid
+  ≤10 minutes, minted tokens are single-repo and short-TTL, and the
+  App key can be revoked on github.com.
+- **`file` mode**: the agent reduces daemon compromise from key theft
+  to a *logged, time-bounded* oracle — strictly better observability
+  than `tpm` (every sign is audited), at the cost of the key living
+  in a (hardened) process rather than hardware.
+- **vTPM is per-instance**: each container gets its own swtpm with a
+  dedicated kernel `vtpm_proxy` device pair; there is no
+  cross-container path. Empty TPM auth is deliberate — an authValue
+  would only police *intra*-container access, which the device-node
+  uid/mode already does, and host root can read any authValue
+  regardless.
+- **Host root is the root of trust** in both modes: the swtpm state
+  directory (holding the wrapped key) and the PEM/agent both live
+  under the instance's host-side storage. symbolon protects against a
+  compromised *client* and a compromised *daemon*, not a compromised
+  *host*.
 
 ## Commands
 
@@ -131,10 +232,12 @@ symbolon github mint <client> <owner/repo>
        "provider_req_id":"<X-GitHub-Request-Id or null>"}
 
 symbolon github selfcheck
-    Verify the App private key parses, the App ID matches the
-    JWT, api.github.com (or your GHES api_base) is reachable, and
-    clock skew is bounded. Exit code `0` on success, `1` on any
-    failed check. Prints:
+    Verify the signing backend is live (the agent responds / the
+    TPM key reads back as RSA-2048), the App ID matches the JWT,
+    api.github.com (or your GHES api_base) is reachable, and clock
+    skew is bounded. Exit code `0` on success, `1` on any failed
+    check. (The daemon also runs the backend's own self-check at
+    startup and refuses to start if it fails.) Prints:
       {"ok":true,
        "clock_skew_sec":<i64>,
        "out_req_id":"<ULID>",
@@ -161,12 +264,16 @@ References: [REST API for App installations][gh-installs],
   Client ID because it is stable across App ownership transfers.
 - `iat`: now − 60 s (clock-skew tolerance).
 - `exp`: now + 540 s (9 minutes; GitHub max is 10).
-- Signing key: PEM at `provider.github.private_key_path`, loaded
-  once at daemon startup, held in memory. To rotate: restart the
-  daemon.
-- Implementation: in-tree RS256 signer at
-  `src/providers/jwt_rs256.rs` (RSASSA-PKCS1-v1_5 with SHA-256),
-  built on the `rsa` and `sha2` crates.
+- Signing key: never in the daemon — held by the configured
+  backend (a vTPM or a sandboxed subprocess). See "App key custody"
+  above. To rotate: `file` mode accepts `SIGHUP` to the agent (or a
+  daemon restart); `tpm` mode re-provisions the persistent handle.
+- Implementation: the RS256 JWS framing (`{"typ":"JWT","alg":
+  "RS256"}` header, base64url segments) lives in
+  `src/providers/jwt_rs256.rs`. The RSASSA-PKCS1-v1_5 signature
+  itself is produced by the backend — the `file` agent via the `rsa`
+  crate, the `tpm` backend via `TPM2_Sign` over a Rust-computed
+  SHA-256 digest.
 
 ### Repository-ID resolution + cache
 

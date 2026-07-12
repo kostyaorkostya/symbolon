@@ -7,7 +7,8 @@
 //! an RSASSA signature and a TPMT_PUBLIC — have fully determined
 //! layouts for an RSA-2048 signing key, so they are parsed by hand
 //! against the TCG "Structures" spec rather than through the crate's
-//! zero-copy view machinery; the swtpm smoke test pins the result.
+//! zero-copy view machinery; the hermetic golden-vector tests below —
+//! fixtures captured from a live swtpm — pin the result.
 
 use tpm2_protocol::TpmWriter;
 use tpm2_protocol::basic::TpmHandle;
@@ -188,10 +189,63 @@ pub fn verify_rsa2048_signing_key(resp: &[u8]) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    // A fixed persistent handle + digest for byte-exact KATs. These
-    // pin the command encoding without a TPM; if the marshaling drifts
-    // (field order, scheme bytes, session area) the hex changes.
     const HANDLE: u32 = 0x8101_0001;
+
+    // === Golden vectors captured from a live swtpm exchange ===
+    //
+    // Provisioned an RSA-2048 unrestricted signing key at persistent
+    // handle 0x81010001, then recorded the exact command bytes we sent
+    // and the exact response bytes swtpm returned, plus the key's public
+    // part. Frozen here so the marshaling and BOTH response parsers are
+    // pinned against a real TPM implementation with no external process
+    // at test time. The gated end-to-end test in `tests/tpm_backend.rs`
+    // re-runs the live exchange; re-capture from there if the fixtures
+    // ever need refreshing (its header documents how).
+
+    /// `TPM2_Sign` command — the exact bytes swtpm accepted and signed,
+    /// for the digest of [`golden_signing_input`].
+    const SIGN_COMMAND: &str = "8002000000490000015d810100010000000940000009000000000000200cc561b958b54213a57db59a406b7c747f25c04660d3c4396f93d78e6f5477a30014000b8024400000070000";
+
+    /// `TPM2_ReadPublic` response for the key (TPM2B_PUBLIC wrapping the
+    /// TPMT_PUBLIC, then name + qualified name).
+    const READ_PUBLIC_RESPONSE: &str = "80010000016a0000000001160001000b0004007200000010001008000000000001009a2696410128f3296b5582f4465086e1ddab9c58f921c9132eec8d8518c182b24367c62d655c6d093c65d62954b1579ec8ec740a5713075c8282aa999627ad04eb84ef210d1f229f3f4a9b89d39e9324209fcd632219f838c2602cc3b1909ce2925c62bee396637da71e76d9e5ba8754be8b740de43c130ed11fd5fdbf0a3225e5c43f47162ac397e402216c6ad7086d5a3456d99645030c8d32fceaced72ae13d6dca729c061ef21c44ddee00ea508dc28f1a3cc697de6409ea36b407f8e55db125d30533e58393eff8bf3799372f36bc6e9dcc92ba230d0a7703512376edc6e8f39696fd03ad02c2256bde112ebff7e81cb41ad597749023b92605054e68a10022000b75897f26f10bb395375d3efe56d287f1439cb69225b522f4281f217b0af7dd6c0022000b36f3b4c80c68df5a47481c6d4845ef869777c601f4add92d64d8914db17e9bc0";
+
+    /// `TPM2_Sign` response (TPMT_SIGNATURE) for the same digest, signed
+    /// by the key below.
+    const SIGN_RESPONSE: &str = "80020000011900000000000001060014000b010013b68d0957ea5ba66a7ef24c15ccd38d49131ff2790dc1a450bda6bfffcb2e034c09d2d12388c1ee589bd122703442bd7edef5340b2813856e7636a26e9629cee76134da9054f00b3aaadda1803ea36bf1adc50e31d68418c5e468411928be22e445c1f8033227aa9ef10cd56c3159f3403784340c5ad9db0856d37cd7f6ec5807415c0a6bee4cfe55d7a9b6a9d230cff467bf70cb90f1f3edbb4e29e2458b3d23c5a299cc5d0579df55d9ab4d6024a7df3cb058ab6189fd3ec0d3b44365ddc922badad42ad447c1ad6c138b7029692ad898a0bc4ba80caa417a2460160a129b0e2503b3d0d3813fd1ad3f0417f27395734765da129e41262c68453998db80990000010000";
+
+    /// The signing key's public part, exported by `tpm2_readpublic` in
+    /// the same run. Used to prove the parsed signature is genuine.
+    const PUBLIC_KEY_PEM: &str = "\
+-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAmiaWQQEo8ylrVYL0RlCG
+4d2rnFj5IckTLuyNhRjBgrJDZ8YtZVxtCTxl1ilUsVeeyOx0ClcTB1yCgqqZliet
+BOuE7yENHyKfP0qbidOekyQgn81jIhn4OMJgLMOxkJziklxivuOWY32nHnbZ5bqH
+VL6LdA3kPBMO0R/V/b8KMiXlxD9HFirDl+QCIWxq1whtWjRW2ZZFAwyNMvzqztcq
+4T1tynKcBh7yHETd7gDqUI3Cjxo8xpfeZAnqNrQH+OVdsSXTBTPlg5Pv+L83mTcv
+NrxuncySuiMNCncDUSN27cbo85aW/QOtAsIla94RLr/36By0GtWXdJAjuSYFBU5o
+oQIDAQAB
+-----END PUBLIC KEY-----
+";
+
+    /// Rebuild the exact JWS signing input the live exchange signed:
+    /// the fixed test claims that `tests/tpm_backend.rs` uses. Its
+    /// SHA-256 is the digest embedded in [`SIGN_COMMAND`] and signed in
+    /// [`SIGN_RESPONSE`].
+    fn golden_signing_input() -> String {
+        use crate::providers::jwt_backend::JwtClaims;
+        use std::time::{Duration, UNIX_EPOCH};
+        let claims = JwtClaims::new(
+            UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            "Iv1.tpm-test",
+        );
+        crate::providers::jwt_rs256::signing_input(&claims).unwrap()
+    }
+
+    fn golden_digest() -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(golden_signing_input().as_bytes()).into()
+    }
 
     #[test]
     fn read_public_command_kat() {
@@ -202,30 +256,49 @@ mod tests {
     }
 
     #[test]
-    fn sign_command_kat() {
-        let digest = [0xABu8; 32];
-        let bytes = sign_command(HANDLE, &digest).unwrap();
-        let round = TpmResponseHeaderless::check(&bytes);
-        // Structural assertions (exact hex is pinned once observed):
-        // tag=8002 (SESSIONS), commandCode=0000015d (Sign), handle,
-        // then auth area + params.
-        assert_eq!(&bytes[0..2], &[0x80, 0x02], "SESSIONS tag");
-        assert_eq!(&bytes[6..10], &[0x00, 0x00, 0x01, 0x5d], "TPM_CC_Sign");
-        assert_eq!(&bytes[10..14], &[0x81, 0x01, 0x00, 0x01], "signing handle");
-        assert!(round, "command size field matches actual length");
+    fn sign_command_matches_live_capture() {
+        // Byte-exact: the digest, RSASSA+SHA256 scheme, null hashcheck
+        // ticket, and TPM_RS_PW session area must marshal to precisely
+        // the command a real swtpm accepted. Any drift changes the hex.
+        let bytes = sign_command(HANDLE, &golden_digest()).unwrap();
+        assert_eq!(hex::encode(bytes), SIGN_COMMAND);
     }
 
-    /// Helper: confirm the command's `commandSize` header field equals
-    /// the actual buffer length (a common marshaling bug).
-    struct TpmResponseHeaderless;
-    impl TpmResponseHeaderless {
-        fn check(bytes: &[u8]) -> bool {
-            if bytes.len() < 10 {
-                return false;
-            }
-            let size = u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]) as usize;
-            size == bytes.len()
-        }
+    #[test]
+    fn verify_rsa2048_accepts_live_read_public() {
+        let resp = hex::decode(READ_PUBLIC_RESPONSE).unwrap();
+        verify_rsa2048_signing_key(&resp).expect("live RSA-2048 key must pass");
+    }
+
+    #[test]
+    fn verify_rsa2048_rejects_truncated() {
+        // Chop the trailing name fields: the TPMT_PUBLIC walk must run
+        // out of bytes and error rather than mis-read.
+        let resp = hex::decode(READ_PUBLIC_RESPONSE).unwrap();
+        assert!(verify_rsa2048_signing_key(&resp[..resp.len() - 48]).is_err());
+    }
+
+    #[test]
+    fn parse_sign_extracts_verifiable_signature_from_live_response() {
+        use rsa::RsaPublicKey;
+        use rsa::pkcs1v15::{Signature, VerifyingKey};
+        use rsa::pkcs8::DecodePublicKey;
+        use rsa::signature::Verifier;
+        use sha2::Sha256;
+
+        let resp = hex::decode(SIGN_RESPONSE).unwrap();
+        let sig = parse_sign(&resp).unwrap();
+        assert_eq!(sig.len(), 256, "RSA-2048 signature is 256 bytes");
+
+        // The extracted bytes must be a genuine RSASSA-PKCS1v1.5 SHA-256
+        // signature over the signing input, under the key the same run
+        // exported — proving the parse located the real signature, not
+        // just some plausible TPM2B.
+        let public = RsaPublicKey::from_public_key_pem(PUBLIC_KEY_PEM).unwrap();
+        let vk = VerifyingKey::<Sha256>::new(public);
+        let signature = Signature::try_from(sig.as_slice()).unwrap();
+        vk.verify(golden_signing_input().as_bytes(), &signature)
+            .expect("signature parsed from the live TPM response must verify");
     }
 
     #[test]
@@ -234,31 +307,5 @@ mod tests {
         // tag=8001 size=0000000a rc=00000101 (TPM_RC_FAILURE)
         let resp = hex::decode("80010000000a00000101").unwrap();
         assert!(parse_sign(&resp).is_err());
-    }
-
-    #[test]
-    fn parse_sign_extracts_signature() {
-        // Craft a minimal SESSIONS Sign response:
-        // header(10) paramSize(4) sigAlg(2=RSASSA) hashAlg(2=SHA256)
-        // TPM2B sig(size=4, bytes=DEADBEEF) authArea(ignored)
-        let mut resp = Vec::new();
-        resp.extend_from_slice(&hex::decode("8002").unwrap()); // tag SESSIONS
-        resp.extend_from_slice(&[0, 0, 0, 0]); // size placeholder
-        resp.extend_from_slice(&[0, 0, 0, 0]); // rc success
-        let params_and_auth = {
-            let mut p = Vec::new();
-            p.extend_from_slice(&0x0014u16.to_be_bytes()); // RSASSA
-            p.extend_from_slice(&0x000Bu16.to_be_bytes()); // SHA256
-            p.extend_from_slice(&4u16.to_be_bytes()); // TPM2B size
-            p.extend_from_slice(&hex::decode("deadbeef").unwrap());
-            p
-        };
-        let param_size = params_and_auth.len() as u32;
-        resp.extend_from_slice(&param_size.to_be_bytes());
-        resp.extend_from_slice(&params_and_auth);
-        let total = resp.len() as u32;
-        resp[2..6].copy_from_slice(&total.to_be_bytes());
-        let sig = parse_sign(&resp).unwrap();
-        assert_eq!(hex::encode(sig), "deadbeef");
     }
 }

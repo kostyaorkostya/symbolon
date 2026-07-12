@@ -16,8 +16,10 @@
 //! command construction and response-code decoding; the two fixed-shape
 //! response parameters (an RSASSA signature, a TPMT_PUBLIC key area)
 //! are parsed by hand since their layouts are fully determined for an
-//! RSA-2048 key. Validated against a live swtpm in the gated
-//! `tests/tpm_backend.rs` smoke test.
+//! RSA-2048 key. The marshaling and both response parsers are pinned by
+//! hermetic golden-vector tests in `tpm_backend::wire` (fixtures
+//! captured from a live swtpm); the opt-in `tests/tpm_backend.rs`
+//! end-to-end test re-runs the whole path against a real swtpm.
 
 use std::fs::OpenOptions;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};

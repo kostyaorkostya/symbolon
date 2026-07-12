@@ -1,6 +1,15 @@
-//! Live smoke test for the `tpm` signing backend against a software
-//! TPM (swtpm). Gated on `swtpm` + tpm2-tools being installed; skips
-//! cleanly otherwise (they are not part of the default toolchain).
+//! Live end-to-end test for the `tpm` signing backend against a
+//! software TPM (swtpm). **Opt-in** (`#[ignore]`): a plain `cargo test`
+//! reports it as *ignored*, never a silent pass — the always-on
+//! coverage of the marshaling and both response parsers lives in the
+//! hermetic golden-vector tests in `src/providers/tpm_backend/wire.rs`.
+//! This test is what those fixtures were captured from, and the
+//! belt-and-suspenders check that the whole path works against a real
+//! TPM. Run it explicitly:
+//!
+//! ```sh
+//! cargo test --test tpm_backend -- --ignored
+//! ```
 //!
 //! Flow:
 //!   1. Provision an RSA-2048 unrestricted signing key at persistent
@@ -14,8 +23,9 @@
 //!   4. Verify the JWT's RS256 signature with the `rsa` crate against
 //!      the exported TPM public key.
 //!
-//! This validates the marshaling, the response parsing, and the whole
-//! digest→sign→assemble path against a real TPM implementation.
+//! To re-capture the wire.rs golden fixtures, temporarily print the
+//! command/response hex in `tpm_backend::transact` and the exported PEM
+//! here, then run this test with `--ignored`.
 
 use std::net::TcpListener;
 use std::os::fd::OwnedFd;
@@ -191,11 +201,35 @@ fn serve_unixio(state_dir: &Path) -> (Child, PathBuf) {
     (child, sock)
 }
 
+/// Live end-to-end signing against a software TPM. Opt-in: `#[ignore]`
+/// so a plain `cargo test` reports it as *ignored* (never a silent pass
+/// that tested nothing) — the always-on marshaling/parsing coverage
+/// lives in the hermetic golden-vector tests in
+/// `src/providers/tpm_backend/wire.rs`, whose fixtures were captured
+/// from THIS test. Run it explicitly:
+///
+/// ```sh
+/// cargo test --test tpm_backend -- --ignored
+/// ```
+///
+/// When opted in, missing tooling is a hard failure (not a skip) so an
+/// intended run can't quietly no-op.
 #[compio::test]
+#[ignore = "live swtpm E2E; run with `cargo test --test tpm_backend -- --ignored` (needs swtpm + tpm2-tools)"]
 async fn tpm_backend_signs_against_swtpm() {
-    if !have("swtpm") || !have("tpm2_createprimary") || !have("tpm2_readpublic") {
-        eprintln!("skipping: swtpm / tpm2-tools not installed");
-        return;
+    for bin in [
+        "swtpm",
+        "tpm2_createprimary",
+        "tpm2_create",
+        "tpm2_load",
+        "tpm2_evictcontrol",
+        "tpm2_readpublic",
+        "tpm2_flushcontext",
+    ] {
+        assert!(
+            have(bin),
+            "tpm E2E opted in (--ignored) but `{bin}` is not on PATH; install swtpm + tpm2-tools"
+        );
     }
 
     let tmp = std::env::temp_dir().join(format!("symbolon-tpm-{}", std::process::id()));

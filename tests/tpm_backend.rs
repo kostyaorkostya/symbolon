@@ -29,7 +29,7 @@ use rsa::pkcs1v15::{Signature, VerifyingKey};
 use rsa::pkcs8::DecodePublicKey;
 use rsa::signature::Verifier;
 use sha2::Sha256;
-use symbolon::{JwtClaims, SpawnedBackend, TpmSpawn};
+use symbolon::{JwtClaims, Sandboxed, SpawnedBackend, TpmSpawn};
 
 const PERSISTENT_HANDLE: u32 = 0x8101_0001;
 
@@ -209,7 +209,8 @@ async fn tpm_backend_signs_against_swtpm() {
     // Connect the raw command channel and hand its fd to the backend.
     let stream = UnixStream::connect(&sock).expect("connect swtpm unixio");
     let fd = OwnedFd::from(stream);
-    let backend = Box::new(TpmSpawn::from_fd(fd, PERSISTENT_HANDLE)).into_backend();
+    let backend = Box::new(TpmSpawn::from_fd(fd, PERSISTENT_HANDLE))
+        .into_backend(&Sandboxed::assume_for_test());
 
     // self_check: TPM2_ReadPublic → verify RSA-2048 signing key.
     backend.self_check().await.expect("tpm self_check");

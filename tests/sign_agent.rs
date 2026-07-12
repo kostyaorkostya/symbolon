@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, UNIX_EPOCH};
 
-use symbolon::{AgentSpawn, JwtClaims, JwtSigningKey, SpawnedBackend};
+use symbolon::{AgentSpawn, JwtClaims, JwtSigningKey, Sandboxed, SpawnedBackend};
 
 fn fixture_pem_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test_app_key.pem")
@@ -32,7 +32,7 @@ fn claims() -> JwtClaims {
 async fn agent_signs_and_self_checks() {
     let backend =
         Box::new(AgentSpawn::spawn(&symbolon_exe(), &fixture_pem_path()).expect("spawn agent"))
-            .into_backend();
+            .into_backend(&Sandboxed::assume_for_test());
 
     // Ping/Pong: the subprocess survived its self-sandbox and serves.
     backend.self_check().await.expect("agent self_check");
@@ -57,7 +57,7 @@ async fn agent_dies_cleanly_on_drop() {
     // and exits. This must not hang (the actor thread joins on Drop).
     let backend =
         Box::new(AgentSpawn::spawn(&symbolon_exe(), &fixture_pem_path()).expect("spawn agent"))
-            .into_backend();
+            .into_backend(&Sandboxed::assume_for_test());
     backend.self_check().await.expect("agent self_check");
     drop(backend); // joins the io thread, which reaps the child
 }

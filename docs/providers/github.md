@@ -117,8 +117,9 @@ journald — an **audit trail** the daemon can't forge. A compromised
 daemon is reduced from *key theft* to a *logged, time-bounded
 signing oracle*: it can request signatures while it is resident, but
 it cannot exfiltrate the key or sign after it is killed, and every
-request it made is in the agent's log. `SIGHUP` to the agent
-re-reads the PEM (key rotation without a full restart).
+request it made is in the agent's log. The agent reads the PEM once,
+before it sandboxes itself, and holds no filesystem access afterward;
+to rotate the key, restart the daemon.
 
 This backend needs no special hardware and is the recommended
 default for most deployments.
@@ -266,8 +267,9 @@ References: [REST API for App installations][gh-installs],
 - `exp`: now + 540 s (9 minutes; GitHub max is 10).
 - Signing key: never in the daemon — held by the configured
   backend (a vTPM or a sandboxed subprocess). See "App key custody"
-  above. To rotate: `file` mode accepts `SIGHUP` to the agent (or a
-  daemon restart); `tpm` mode re-provisions the persistent handle.
+  above. To rotate: `file` mode requires a daemon restart (the agent
+  reads the PEM once at startup); `tpm` mode re-provisions the
+  persistent handle.
 - Implementation: the RS256 JWS framing (`{"typ":"JWT","alg":
   "RS256"}` header, base64url segments) lives in
   `src/providers/jwt_rs256.rs`. The RSASSA-PKCS1-v1_5 signature

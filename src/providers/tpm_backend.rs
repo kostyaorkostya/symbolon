@@ -30,6 +30,7 @@ use sha2::{Digest, Sha256};
 
 use crate::providers::jwt_backend::{JwtBackend, JwtBackendError, JwtClaims, SpawnedBackend};
 use crate::providers::jwt_rs256;
+use crate::sandbox::{self, Sandboxed};
 
 mod wire;
 
@@ -83,24 +84,22 @@ impl TpmSpawn {
     /// Start the fd-owning actor thread. Call after the daemon sandbox
     /// is in place so the thread inherits it (blocking read/write on
     /// the already-open device fd is unaffected).
-    fn start(self) -> TpmBackend {
+    fn start(self, sandboxed: &Sandboxed) -> TpmBackend {
         let (tx, rx) = mpsc::channel::<Job>();
         let fd = self.fd;
-        let thread = std::thread::Builder::new()
-            .name("tpm-io".to_string())
-            .spawn(move || {
-                let raw = fd.as_raw_fd();
-                while let Ok(job) = rx.recv() {
-                    let result = transact(raw, &job.command);
-                    let dead = result.is_err();
-                    let _ = job.reply.send(result);
-                    if dead {
-                        break;
-                    }
+        let thread = sandbox::spawn(sandboxed, "tpm-io", move || {
+            let raw = fd.as_raw_fd();
+            while let Ok(job) = rx.recv() {
+                let result = transact(raw, &job.command);
+                let dead = result.is_err();
+                let _ = job.reply.send(result);
+                if dead {
+                    break;
                 }
-                drop(fd);
-            })
-            .expect("spawn tpm-io thread");
+            }
+            drop(fd);
+        })
+        .expect("spawn tpm-io thread");
         TpmBackend {
             tx: Some(tx),
             thread: Some(thread),
@@ -110,8 +109,8 @@ impl TpmSpawn {
 }
 
 impl SpawnedBackend for TpmSpawn {
-    fn into_backend(self: Box<Self>) -> Box<dyn JwtBackend> {
-        Box::new(self.start())
+    fn into_backend(self: Box<Self>, sandboxed: &Sandboxed) -> Box<dyn JwtBackend> {
+        Box::new(self.start(sandboxed))
     }
 }
 

@@ -23,6 +23,7 @@ use crate::providers::agent_protocol::{
     AGENT_FD_ENV, AgentRequest, AgentResponse, MAX_MESSAGE, decode, encode,
 };
 use crate::providers::jwt_backend::{JwtBackend, JwtBackendError, JwtClaims, SpawnedBackend};
+use crate::sandbox::{self, Sandboxed};
 
 /// A request handed to the actor thread: raw request datagram plus a
 /// oneshot for the raw response datagram.
@@ -94,31 +95,29 @@ impl AgentSpawn {
         })
     }
 
-    fn start(self) -> AgentBackend {
+    fn start(self, sandboxed: &Sandboxed) -> AgentBackend {
         let (tx, rx) = mpsc::channel::<Job>();
         let sock = self.sock;
         let mut child = self.child;
-        let thread = std::thread::Builder::new()
-            .name("sign-agent-io".to_string())
-            .spawn(move || {
-                let fd = sock.as_raw_fd();
-                let mut buf = vec![0u8; MAX_MESSAGE];
-                while let Ok(job) = rx.recv() {
-                    let result = round_trip(fd, &job.request, &mut buf);
-                    let dead = result.is_err();
-                    let _ = job.reply.send(result);
-                    if dead {
-                        break;
-                    }
+        let thread = sandbox::spawn(sandboxed, "sign-agent-io", move || {
+            let fd = sock.as_raw_fd();
+            let mut buf = vec![0u8; MAX_MESSAGE];
+            while let Ok(job) = rx.recv() {
+                let result = round_trip(fd, &job.request, &mut buf);
+                let dead = result.is_err();
+                let _ = job.reply.send(result);
+                if dead {
+                    break;
                 }
-                // Actor is done (channel closed on Drop, or the agent
-                // died). Reap the child so it doesn't zombie; the
-                // socket closes on `sock` drop, which the agent sees as
-                // EOF and exits.
-                drop(sock);
-                let _ = child.wait();
-            })
-            .expect("spawn sign-agent-io thread");
+            }
+            // Actor is done (channel closed on Drop, or the agent
+            // died). Reap the child so it doesn't zombie; the socket
+            // closes on `sock` drop, which the agent sees as EOF and
+            // exits.
+            drop(sock);
+            let _ = child.wait();
+        })
+        .expect("spawn sign-agent-io thread");
         AgentBackend {
             tx: Some(tx),
             thread: Some(thread),
@@ -127,8 +126,8 @@ impl AgentSpawn {
 }
 
 impl SpawnedBackend for AgentSpawn {
-    fn into_backend(self: Box<Self>) -> Box<dyn JwtBackend> {
-        Box::new(self.start())
+    fn into_backend(self: Box<Self>, sandboxed: &Sandboxed) -> Box<dyn JwtBackend> {
+        Box::new(self.start(sandboxed))
     }
 }
 

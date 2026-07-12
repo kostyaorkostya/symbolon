@@ -41,7 +41,7 @@ use crate::providers::{Provider, ProviderError, ProviderKind, ProviderReqId};
 use crate::psk::Psk;
 use crate::psk_store::{PskStore, PskStoreError};
 use crate::rate_limit::TokenBucket;
-use crate::sandbox::{self, SandboxError, SandboxPaths, SandboxStatus};
+use crate::sandbox::{self, SandboxError, SandboxPaths, SandboxStatus, Sandboxed};
 use crate::transport::{Phase, Responder, SessionError, Step};
 
 /// Per-connection read budget enforced at the daemon's read loop.
@@ -169,6 +169,7 @@ async fn build_providers(
     cfg: &Config,
     github_spawn: Option<Box<dyn SpawnedBackend>>,
     signer_override: Option<Box<dyn JwtBackend>>,
+    sandboxed: &Sandboxed,
     shutdown: &CancelToken,
 ) -> Result<HashMap<ProviderKind, Box<dyn Provider>>, DaemonError> {
     let Some(gh) = &cfg.provider.github else {
@@ -178,11 +179,59 @@ async fn build_providers(
         Some(live) => live,
         None => github_spawn
             .expect("spawned pre-sandbox when a github provider is configured")
-            .into_backend(),
+            .into_backend(sandboxed),
     };
     signer.self_check().await?;
     let provider: Box<dyn Provider> = Box::new(GitHubProvider::new(gh, signer, shutdown.clone())?);
     Ok(HashMap::from([(ProviderKind::Github, provider)]))
+}
+
+/// Everything acquired BEFORE the sandbox gate: the file reads and fd
+/// opens that need capabilities `apply_sandbox` is about to revoke.
+/// Bundling them makes `prepare_inner` read as three phases —
+/// `acquire → apply_sandbox → seal` — and makes "what crosses the
+/// gate" a single struct rather than a fistful of interleaved locals.
+struct Acquired {
+    clients: HashMap<Identity, ResolvedClient>,
+    psks: PskStore,
+    broker_key: BrokerPrivateKey,
+    /// `None` when a test injected an already-live backend (nothing to
+    /// spawn) — otherwise the pre-sandbox fd holder.
+    github_spawn: Option<Box<dyn SpawnedBackend>>,
+}
+
+impl Acquired {
+    /// Perform all pre-sandbox I/O: read `clients.json`, the PSK store,
+    /// and the broker static key, and — unless a live backend was
+    /// injected (`spawn_backend == false`) — open the TPM device /
+    /// fork the key subprocess.
+    async fn acquire(cfg: &Config, spawn_backend: bool) -> Result<Self, DaemonError> {
+        let clients_file = crate::loader::load_clients_file(&cfg.clients.file)
+            .await
+            .map_err(|source| DaemonError::LoadClients {
+                path: cfg.clients.file.clone(),
+                source,
+            })?;
+        let clients = HashMap::try_from(clients_file)?;
+        // ENOENT-tolerant: a fresh deployment starts with an empty
+        // roster and grows via `enroll`.
+        let psks = load_psk_store(&cfg.listen.psk_file).await?;
+        // NOT ENOENT-tolerant — without it the daemon can't terminate a
+        // single handshake, so fail fast with the generation hint.
+        let broker_key = load_broker_key(&cfg.listen.static_key_file).await?;
+        // `execve` (fork the key subprocess) / TPM device open happen
+        // here, before the gate revokes both.
+        let github_spawn = match (&cfg.provider.github, spawn_backend) {
+            (Some(gh), true) => Some(spawn_signing_backend(gh)?),
+            _ => None,
+        };
+        Ok(Self {
+            clients,
+            psks,
+            broker_key,
+            github_spawn,
+        })
+    }
 }
 
 /// Per-client metadata stored in the in-memory `SharedState.clients`
@@ -493,51 +542,34 @@ impl Service {
         admin_listener: UnixListener,
         signer_override: Option<Box<dyn JwtBackend>>,
     ) -> Result<Self, DaemonError> {
-        let clients_file = crate::loader::load_clients_file(&cfg.clients.file)
-            .await
-            .map_err(|source| DaemonError::LoadClients {
-                path: cfg.clients.file.clone(),
-                source,
-            })?;
-        let clients_table = HashMap::try_from(clients_file)?;
-
-        // Pre-sandbox: load the PSK store. Tolerate ENOENT — a fresh
-        // deployment starts with an empty roster and grows via `enroll`.
-        let psk_store = load_psk_store(&cfg.listen.psk_file).await?;
-
-        // Pre-sandbox: load the broker static key. NOT ENOENT-tolerant —
-        // without it the daemon cannot terminate a single handshake, so
-        // fail fast with the generation hint in the error.
-        let broker_key = load_broker_key(&cfg.listen.static_key_file).await?;
-
-        // Pre-sandbox: acquire the signing backend's fd. This is where
-        // `execve` (file backend: fork the key subprocess) and opening
-        // the TPM device node happen — both require access the sandbox
-        // is about to revoke, so they MUST precede `apply_sandbox`. The
-        // fd-owning actor thread is NOT started yet. Skipped entirely
-        // when a test injects an already-live backend.
-        let github_spawn = match (&cfg.provider.github, &signer_override) {
-            (Some(gh), None) => Some(spawn_signing_backend(gh)?),
-            _ => None,
-        };
+        // Phase 1 — acquire: everything that needs capabilities the
+        // sandbox will revoke (file reads, TPM device open, agent
+        // `execve`). The backend's actor thread is NOT started yet.
+        let Acquired {
+            clients,
+            psks,
+            broker_key,
+            github_spawn,
+        } = Acquired::acquire(cfg, signer_override.is_none()).await?;
 
         // Sockets are already bound — by the caller (production: via
         // `take_env_listeners`; tests: pre-bound and passed in). The
         // supervisor owns the inode lifecycle, perms, and unlink.
 
-        // Sandbox gate closes here. After this, `execve` and the TPM
-        // device path are denied — which is why the backend fd was
-        // acquired above.
-        apply_sandbox(cfg)?;
+        // Phase 2 — the gate. `apply_sandbox` returns the `Sandboxed`
+        // witness that every post-gate OS-thread spawn requires, so the
+        // backend actor below can only be started after this line.
+        let sandboxed = apply_sandbox(cfg)?;
 
-        // Post-sandbox: start the actor thread, self-check, and build
-        // the immutable provider registry.
-        let providers = build_providers(cfg, github_spawn, signer_override, &shutdown).await?;
+        // Phase 3 — seal: start the actor thread (through the witness),
+        // self-check the backend, and assemble the immutable state.
+        let providers =
+            build_providers(cfg, github_spawn, signer_override, &sandboxed, &shutdown).await?;
 
         let state = Rc::new(SharedState {
             mutation_lock: Mutex::new(()),
-            clients: RefCell::new(clients_table),
-            psks: RefCell::new(psk_store),
+            clients: RefCell::new(clients),
+            psks: RefCell::new(psks),
             providers,
             broker_public: broker_key.derive_public(),
             broker_key,
@@ -765,7 +797,7 @@ const fn nameservice_files() -> &'static [&'static str] {
     ]
 }
 
-fn apply_sandbox(cfg: &Config) -> Result<(), DaemonError> {
+fn apply_sandbox(cfg: &Config) -> Result<Sandboxed, DaemonError> {
     let level = cfg.security.sandbox;
     let mut read_dirs = vec![PathBuf::from("/etc/ssl/certs")];
     read_dirs.extend(cfg.security.extra_read_dirs.iter().cloned());
@@ -814,7 +846,7 @@ fn apply_sandbox(cfg: &Config) -> Result<(), DaemonError> {
             v
         },
     };
-    let outcome = sandbox::apply(level, &paths)?;
+    let (sandboxed, outcome) = sandbox::apply(level, &paths)?;
     let degraded = !matches!(
         outcome.status,
         SandboxStatus::FullyEnforced | SandboxStatus::Off
@@ -842,7 +874,7 @@ fn apply_sandbox(cfg: &Config) -> Result<(), DaemonError> {
             scope = outcome.scope,
         );
     }
-    Ok(())
+    Ok(sandboxed)
 }
 
 /// Reclaim the two pre-bound listeners that the supervisor (systemd or

@@ -29,6 +29,48 @@ use landlock::{
 use crate::config::SandboxMode;
 use crate::events::EventKind;
 
+/// Proof that the Landlock sandbox step has run on the current thread.
+/// Minted ONLY by [`apply`]. Every OS-thread spawn in the daemon goes
+/// through [`spawn`], which requires `&Sandboxed`, so "spawn a thread
+/// before the sandbox" — which would leave that thread outside the
+/// per-thread Landlock domain, a silent sandbox-escape hole — is
+/// unrepresentable rather than merely discouraged by a comment.
+///
+/// It carries a `PhantomData<*const ()>` to be `!Send`: `spawn`'s
+/// child inherits the Landlock domain of the *calling* thread, so the
+/// witness must stay on the thread that minted (and thereby
+/// restricted) itself. The daemon runtime is single-threaded, so this
+/// holds naturally; the `!Send` marker makes it impossible to defeat
+/// by moving the token to another thread.
+pub struct Sandboxed(std::marker::PhantomData<*const ()>);
+
+impl Sandboxed {
+    fn new() -> Self {
+        Self(std::marker::PhantomData)
+    }
+
+    /// Mint a witness WITHOUT applying any sandbox. Test-only: an
+    /// integration test that starts a backend actor thread outside a
+    /// real daemon never calls [`apply`], so it fabricates the token
+    /// here. Never call this in production code.
+    #[doc(hidden)]
+    pub fn assume_for_test() -> Self {
+        Self::new()
+    }
+}
+
+/// Spawn an OS thread — the ONLY thread-spawning path in the daemon.
+/// The `&Sandboxed` argument proves the sandbox step has run on this
+/// thread, so the child inherits the Landlock ruleset. `name` shows
+/// in `/proc/<pid>/task` and `top -H`.
+pub fn spawn(
+    _sandboxed: &Sandboxed,
+    name: &str,
+    f: impl FnOnce() + Send + 'static,
+) -> io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new().name(name.to_string()).spawn(f)
+}
+
 /// Filesystem paths the daemon needs after restriction. Anything
 /// not listed here becomes unreachable.
 pub struct SandboxPaths {
@@ -95,16 +137,26 @@ pub enum SandboxError {
 /// Apply Landlock to the calling thread. Effects persist for the
 /// lifetime of the thread and propagate to descendants. Only call
 /// once per process.
-pub fn apply(level: SandboxMode, paths: &SandboxPaths) -> Result<SandboxOutcome, SandboxError> {
+pub fn apply(
+    level: SandboxMode,
+    paths: &SandboxPaths,
+) -> Result<(Sandboxed, SandboxOutcome), SandboxError> {
     let compat = match level {
         SandboxMode::Off => {
-            return Ok(SandboxOutcome {
-                requested_abi: 0,
-                status: SandboxStatus::Off,
-                fs: false,
-                tcp: false,
-                scope: false,
-            });
+            // Even with sandboxing off we mint the witness: it proves
+            // "the sandbox decision point has passed", so threads
+            // spawned after it are still spawned in the right place in
+            // the lifecycle (there's just no ruleset to inherit).
+            return Ok((
+                Sandboxed::new(),
+                SandboxOutcome {
+                    requested_abi: 0,
+                    status: SandboxStatus::Off,
+                    fs: false,
+                    tcp: false,
+                    scope: false,
+                },
+            ));
         }
         SandboxMode::Required => CompatLevel::HardRequirement,
         SandboxMode::BestEffort => CompatLevel::BestEffort,
@@ -206,13 +258,16 @@ pub fn apply(level: SandboxMode, paths: &SandboxPaths) -> Result<SandboxOutcome,
     };
     let fully = status == SandboxStatus::FullyEnforced;
 
-    Ok(SandboxOutcome {
-        requested_abi: 6,
-        status,
-        fs: fully,
-        tcp: fully,
-        scope: fully,
-    })
+    Ok((
+        Sandboxed::new(),
+        SandboxOutcome {
+            requested_abi: 6,
+            status,
+            fs: fully,
+            tcp: fully,
+            scope: fully,
+        },
+    ))
 }
 
 fn classify_ruleset_err(level: SandboxMode, e: RulesetError) -> SandboxError {
@@ -254,7 +309,7 @@ mod tests {
     fn apply_off_is_noop() {
         let out = run_isolated(|| {
             let paths = make_paths(vec![], vec![]);
-            apply(SandboxMode::Off, &paths).unwrap()
+            apply(SandboxMode::Off, &paths).unwrap().1
         });
         assert_eq!(out.status, SandboxStatus::Off);
         assert!(!out.fs && !out.tcp && !out.scope);
@@ -273,7 +328,7 @@ mod tests {
             fs::write(&other, b"secret").unwrap();
 
             let paths = make_paths(vec![allowed.clone()], vec![]);
-            let out = apply(SandboxMode::BestEffort, &paths).unwrap();
+            let out = apply(SandboxMode::BestEffort, &paths).unwrap().1;
 
             // Allowed path still readable.
             let allowed_data = fs::read(&allowed).unwrap();
@@ -312,7 +367,7 @@ mod tests {
     #[test]
     fn off_mode_returns_off_status() {
         let paths = make_paths(vec![], vec![]);
-        let out = apply(SandboxMode::Off, &paths).unwrap();
+        let out = apply(SandboxMode::Off, &paths).unwrap().1;
         assert_eq!(out.status, SandboxStatus::Off);
     }
 
@@ -340,7 +395,7 @@ mod tests {
                 resolv_files: vec![],
                 write_parent_dirs: vec![dir.clone()],
             };
-            let out = apply(SandboxMode::BestEffort, &paths).unwrap();
+            let out = apply(SandboxMode::BestEffort, &paths).unwrap().1;
 
             // Mirror the syscall sequence atomic_write's final
             // step performs: open(dir, O_RDONLY) + fsync(fd).

@@ -207,6 +207,16 @@ log; on `required`, missing features abort startup. The full
 ruleset (paths, scopes, edge cases) lives in
 [`src/sandbox.rs`](../src/sandbox.rs).
 
+Because Landlock is *per-thread* (a thread spawned before the gate
+stays unrestricted — a silent escape hole), the ordering is
+enforced by types, not convention: `apply` returns a `Sandboxed`
+witness, and `sandbox::spawn` — the only thread-spawning API in the
+daemon — requires it. So the backend's fd-owning actor thread can
+only be started after the gate. The `file`-backend signing agent is
+a separate process with its own, tighter lockdown; it locks itself
+down and hands back a `Locked` witness, and its serve loop is
+reachable only from that witness (see AGENTS.md invariant #17).
+
 A complementary anti-swap defence is `mlockall(MCL_CURRENT |
 MCL_FUTURE)` at startup (see `src/mlock.rs`). The primary
 anti-swap defence is operator-side: disable swap on the broker

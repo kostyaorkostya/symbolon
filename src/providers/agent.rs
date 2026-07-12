@@ -12,13 +12,12 @@
 //!   3. `mlockall` best-effort — the key never reaches swap
 //!   4. `PR_SET_DUMPABLE = 0` — no core dump can leak the key
 //!   5. `PR_SET_PDEATHSIG(SIGTERM)` — die if the daemon dies
-//!   6. register the SIGHUP handler (hot key reload) — before seccomp
-//!      forbids `rt_sigaction`
-//!   7. Landlock: the key path read-only, nothing else; no network
-//!   8. seccomp: a syscall allowlist — closes the UDP / raw-socket
+//!   6. Landlock: deny all filesystem access (the PEM is already read)
+//!      and all network
+//!   7. seccomp: a syscall allowlist — closes the UDP / raw-socket
 //!      exfiltration hole Landlock's net layer doesn't cover, and
 //!      forbids `execve` / `socket` / `connect` / io_uring outright
-//!   9. serve loop: one request in, one signature out, per datagram
+//!   8. serve loop: one request in, one signature out, per datagram
 //!
 //! The process is synchronous and single-threaded — SEQPACKET gives
 //! message framing, so the loop is a plain `recv` → sign → `send`. No
@@ -28,16 +27,11 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::providers::agent_protocol::{
     AGENT_FD_ENV, AgentRequest, AgentResponse, MAX_MESSAGE, decode, encode,
 };
 use crate::providers::jwt_rs256::JwtSigningKey;
-
-/// Set by the SIGHUP handler; consumed by the serve loop to trigger a
-/// PEM re-read. A plain atomic store is async-signal-safe.
-static RELOAD: AtomicBool = AtomicBool::new(false);
 
 /// Entry point for the `__sign-agent` subcommand. Returns an exit
 /// code; the process never returns to normal daemon logic. Any error
@@ -55,28 +49,50 @@ pub fn run(key_path: &Path) -> ExitCode {
 }
 
 fn run_inner(key_path: &Path) -> Result<(), String> {
-    // 1. Reclaim the socketpair end the daemon handed us.
+    // Reclaim the socketpair end the daemon handed us. The fd lives for
+    // the whole function; `serve` borrows it at the end.
     let sock = take_socket_fd()?;
+    Locked::lock_down(key_path)?.serve(sock.as_raw_fd())
+}
 
-    // 2. Read + parse the PEM while we still have FS access.
-    let mut signer = load_key(key_path)?;
+/// A fully locked-down agent. The one type-level guarantee that earns
+/// its keep: `serve` is the only thing you can do with a `Locked`, and
+/// a `Locked` is minted ONLY by [`Self::lock_down`] — so the serve loop
+/// cannot run under-restricted (the sole *silent*-if-wrong ordering).
+///
+/// The intra-lockdown orderings (read the PEM before Landlock closes
+/// FS; Landlock before seccomp) are all *loud* if reordered — the
+/// runtime denies the syscall / read immediately — so they stay a
+/// linear, auditable sequence in `lock_down` rather than a per-rung
+/// typestate.
+struct Locked {
+    signer: JwtSigningKey,
+}
 
-    // 3–5. Harden the process against swap, core dumps, and orphaning.
-    lock_memory();
-    set_undumpable()?;
-    set_parent_death_signal()?;
+impl Locked {
+    /// Read the PEM, then lock the process down in the required order,
+    /// and hand back the witness. Each step's ordering constraint is
+    /// noted inline.
+    fn lock_down(key_path: &Path) -> Result<Self, String> {
+        // FS access needed here — Landlock (below) removes it, so the
+        // key is read exactly once, up front.
+        let signer = load_key(key_path)?;
+        // Harden against swap, core dumps, orphaning.
+        lock_memory();
+        set_undumpable()?;
+        set_parent_death_signal()?;
+        // Landlock before seccomp: seccomp would otherwise kill the
+        // landlock syscalls this call makes.
+        apply_landlock()?;
+        apply_seccomp()?;
+        Ok(Self { signer })
+    }
 
-    // 6. Hot-reload on SIGHUP. Registered before seccomp removes
-    //    rt_sigaction from the allowlist.
-    install_sighup_handler()?;
-
-    // 7–8. Self-sandbox: FS down to the key path, no network, then a
-    //    syscall allowlist.
-    apply_landlock(key_path)?;
-    apply_seccomp()?;
-
-    // 9. Serve until the daemon closes its end (EOF) or we die.
-    serve(sock.as_raw_fd(), key_path, &mut signer)
+    /// The serve loop. Reachable only from `Locked`, so the full
+    /// lockdown provably ran first.
+    fn serve(self, fd: RawFd) -> Result<(), String> {
+        serve_loop(fd, &self.signer)
+    }
 }
 
 fn take_socket_fd() -> Result<OwnedFd, String> {
@@ -147,41 +163,25 @@ fn set_parent_death_signal() -> Result<(), String> {
     Ok(())
 }
 
-fn install_sighup_handler() -> Result<(), String> {
-    // SAFETY: the handler only does a relaxed atomic store, which is
-    // async-signal-safe. signal-hook-registry keeps the disposition
-    // for the process lifetime (same rationale as src/signals.rs).
-    unsafe {
-        signal_hook_registry::register(libc::SIGHUP, || RELOAD.store(true, Ordering::Relaxed))
-    }
-    .map_err(|e| format!("register SIGHUP: {e}"))?;
-    Ok(())
-}
-
-/// Landlock ABI 6: grant `ReadFile` on the key path and nothing else;
-/// handle the network layer but add no rule, so all `connect(2)` is
-/// denied. This is stricter than the daemon's ruleset (which permits
-/// outbound 443) — the agent has no business talking to anything but
-/// its parent over the already-open socketpair.
-fn apply_landlock(key_path: &Path) -> Result<(), String> {
-    use landlock::{
-        ABI, Access, AccessFs, AccessNet, PathBeneath, PathFd, Ruleset, RulesetAttr,
-        RulesetCreatedAttr, Scope,
-    };
+/// Landlock ABI 6: handle the filesystem and network layers but add no
+/// rule to either, so *all* filesystem access and all `connect(2)` is
+/// denied. The PEM was already read in `lock_down` before this call, so
+/// the agent needs no filesystem reach afterward. This is stricter than
+/// the daemon's ruleset (which permits outbound 443 and the state dir) —
+/// the agent has no business touching disk or the network at all; it
+/// talks only to its parent over the already-open socketpair.
+fn apply_landlock() -> Result<(), String> {
+    use landlock::{ABI, Access, AccessFs, AccessNet, Ruleset, RulesetAttr, Scope};
     let abi = ABI::V6;
-    let ruleset = Ruleset::default()
+    Ruleset::default()
         .handle_access(AccessFs::from_all(abi))
         .map_err(|e| format!("landlock fs: {e}"))?
         .handle_access(AccessNet::from_all(abi))
         .map_err(|e| format!("landlock net: {e}"))?
         .scope(Scope::AbstractUnixSocket | Scope::Signal)
-        .map_err(|e| format!("landlock scope: {e}"))?;
-    let key_fd = PathFd::new(key_path).map_err(|e| format!("open key for landlock: {e}"))?;
-    ruleset
+        .map_err(|e| format!("landlock scope: {e}"))?
         .create()
         .map_err(|e| format!("landlock create: {e}"))?
-        .add_rule(PathBeneath::new(key_fd, AccessFs::ReadFile))
-        .map_err(|e| format!("landlock rule: {e}"))?
         .restrict_self()
         .map_err(|e| format!("landlock restrict: {e}"))?;
     Ok(())
@@ -189,11 +189,12 @@ fn apply_landlock(key_path: &Path) -> Result<(), String> {
 
 /// Install a seccomp syscall allowlist. Anything not listed kills the
 /// process (`SECCOMP_RET_KILL_PROCESS`). The list is exactly what the
-/// serve loop plus RSA signing and a SIGHUP reload need — notably NO
-/// `socket` / `connect` / `execve` / io_uring `io_uring_setup`. It
-/// closes the UDP and raw-socket exfiltration paths that Landlock's
-/// network layer (which only governs `connect`/`bind` on inet
-/// sockets, not socket creation) leaves open.
+/// serve loop plus RSA signing need — notably NO `openat` / `read`
+/// (the PEM is read once, pre-lockdown), and NO `socket` / `connect` /
+/// `execve` / io_uring `io_uring_setup`. It closes the UDP and
+/// raw-socket exfiltration paths that Landlock's network layer (which
+/// only governs `connect`/`bind` on inet sockets, not socket creation)
+/// leaves open.
 fn apply_seccomp() -> Result<(), String> {
     use seccompiler::{SeccompAction, SeccompFilter};
     use std::convert::TryInto;
@@ -228,12 +229,6 @@ const ALLOWED_SYSCALLS: &[i64] = &[
     // socketpair I/O (libc recv/send lower to these)
     libc::SYS_recvfrom,
     libc::SYS_sendto,
-    // PEM reload on SIGHUP (std::fs::read)
-    libc::SYS_openat,
-    libc::SYS_read,
-    libc::SYS_close,
-    libc::SYS_lseek,
-    libc::SYS_statx,
     // audit line to stderr
     libc::SYS_write,
     // allocator + RSA bignum working set
@@ -249,8 +244,6 @@ const ALLOWED_SYSCALLS: &[i64] = &[
     // std / allocator internal synchronization
     libc::SYS_futex,
     libc::SYS_sched_yield,
-    // signal return from the SIGHUP handler
-    libc::SYS_rt_sigreturn,
     // orderly and abnormal exit
     libc::SYS_exit,
     libc::SYS_exit_group,
@@ -260,30 +253,22 @@ const ALLOWED_SYSCALLS: &[i64] = &[
 /// Returns `Ok(())` on clean EOF (daemon closed its end). A malformed
 /// request is answered with `AgentResponse::Error` and the loop
 /// continues — one bad datagram is not fatal.
-fn serve(fd: RawFd, key_path: &Path, signer: &mut JwtSigningKey) -> Result<(), String> {
+fn serve_loop(fd: RawFd, signer: &JwtSigningKey) -> Result<(), String> {
     let mut buf = vec![0u8; MAX_MESSAGE];
     loop {
-        if RELOAD.swap(false, Ordering::Relaxed) {
-            match load_key(key_path) {
-                Ok(k) => {
-                    *signer = k;
-                    eprintln!("symbolon-sign-agent: reloaded key on SIGHUP");
-                }
-                Err(e) => eprintln!("symbolon-sign-agent: SIGHUP reload failed: {e}"),
-            }
-        }
         let n = match recv(fd, &mut buf) {
             Ok(0) => return Ok(()), // daemon closed the socket
             Ok(n) => n,
-            Err(e) if e == libc::EINTR => continue, // SIGHUP interrupted recv
+            Err(e) if e == libc::EINTR => continue, // a stray signal interrupted recv
             Err(e) => return Err(format!("recv: {}", std::io::Error::from_raw_os_error(e))),
         };
         let reply = handle(&buf[..n], signer);
-        let bytes = encode(&reply).unwrap_or_else(|e| {
-            // Encoding a small enum can't realistically fail; if it
-            // does, fall back to a fixed error datagram.
-            encode(&AgentResponse::Error(format!("encode: {e}"))).unwrap_or_default()
-        });
+        // Every `reply` variant is length-bounded by construction
+        // (`Jwt` is RSA-sized, `Pong` constant, `Error` capped via
+        // `AgentResponse::error`), so `encode` cannot exceed
+        // `MAX_MESSAGE`. `?` surfaces the impossible case loudly rather
+        // than silently shipping a truncated datagram.
+        let bytes = encode(&reply)?;
         send(fd, &bytes)?;
     }
 }
@@ -291,7 +276,7 @@ fn serve(fd: RawFd, key_path: &Path, signer: &mut JwtSigningKey) -> Result<(), S
 fn handle(bytes: &[u8], signer: &JwtSigningKey) -> AgentResponse {
     let req: AgentRequest = match decode(bytes) {
         Ok(r) => r,
-        Err(e) => return AgentResponse::Error(e),
+        Err(e) => return AgentResponse::error(e),
     };
     match req {
         AgentRequest::Ping => AgentResponse::Pong,
@@ -304,7 +289,7 @@ fn handle(bytes: &[u8], signer: &JwtSigningKey) -> AgentResponse {
             );
             match signer.sign_rs256(&claims) {
                 Ok(jwt) => AgentResponse::Jwt(jwt),
-                Err(e) => AgentResponse::Error(format!("sign: {e}")),
+                Err(e) => AgentResponse::error(format!("sign: {e}")),
             }
         }
     }

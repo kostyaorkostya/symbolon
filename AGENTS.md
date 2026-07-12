@@ -208,18 +208,45 @@ and permission set per provider live in `docs/providers/<name>.md`.
     The operator picks via `[provider.github] app_key_backend =
     "tpm" | "file"` — required, no default, no auto-probe, no
     runtime fallback.
-17. **Signing-backend startup order is fixed.** In `prepare_inner`:
-    take LISTEN_FDS → **construct the backend** (open the TPM device
-    node / `execve` the key subprocess — both need access the
-    sandbox is about to revoke) → `apply_sandbox` (Landlock; it
-    already denies `execve` by handling `AccessFs::Execute` and
-    granting it nowhere, and it never grants the TPM device path or
-    the key path) → **start the backend's fd-owning actor thread**
-    (post-sandbox, so it inherits the ruleset) → `self_check()` the
-    backend (a dead agent / unreachable TPM is fatal at startup, not
-    on the first mint). The `file` agent additionally self-sandboxes
-    (its own tighter Landlock with no network + a seccomp allowlist)
-    and sets `PR_SET_PDEATHSIG` / `PR_SET_DUMPABLE=0` / `mlockall`.
+17. **Security-critical ordering is enforced by types, not comments.**
+    Two silent-if-wrong orderings exist in the codebase (a mistake is
+    a vulnerability, not a loud failure); both are made
+    *unrepresentable*:
+    - **Daemon — the `Sandboxed` witness.** `sandbox::apply` returns a
+      `Sandboxed` (`!Send` ZST, private constructor). `sandbox::spawn`
+      is the ONLY OS-thread API in the daemon and requires
+      `&Sandboxed`, so a thread can't be spawned before Landlock (which
+      would leave it outside the per-thread domain — a silent escape
+      hole). `prepare_inner` reads as three phases: `Acquired::acquire`
+      (all pre-gate reads + the TPM device open / agent `execve`, which
+      need access the sandbox revokes) → `apply_sandbox` (returns the
+      witness; also denies `execve` via `AccessFs::Execute` granted
+      nowhere, never grants the TPM/key paths) → `build_providers`
+      (starts the actor thread through the witness, then `self_check` —
+      a dead agent / unreachable TPM is fatal at startup). The
+      `SpawnedBackend::into_backend(&Sandboxed)` signature makes the
+      two-phase split self-documenting.
+    - **Agent — the `Locked` witness.** The `__sign-agent` process
+      (`src/providers/agent.rs`) locks itself down in
+      `Locked::lock_down` — read the PEM once, then `mlockall` /
+      `PR_SET_DUMPABLE=0` / `PR_SET_PDEATHSIG`, then Landlock (deny all
+      FS — the key is already read — and all network), then the seccomp
+      allowlist — and returns a `Locked` witness. `serve` exists only
+      on `Locked`, so the serve loop cannot run under-restricted. The
+      intra-lockdown orderings (PEM before Landlock; Landlock before
+      seccomp) stay a linear sequence in `lock_down`, NOT a per-rung
+      typestate — they fail loudly at runtime if reordered (see below),
+      so only the one silent risk (serve-before-lockdown) is
+      type-encoded. The key is read exactly once, up front; there is no
+      hot reload (rotate by restarting — see "Out of scope"), so the
+      agent holds no filesystem reach and no `openat`/`read` in its
+      seccomp allowlist after lockdown.
+
+    Orderings that fail *loudly* at runtime (a key read after Landlock
+    → EACCES; `execve` after the gate → denied; a syscall after seccomp
+    → killed) are deliberately NOT type-encoded — the runtime already
+    catches them on the first run, so a witness there would be
+    ceremony.
 
 ## Hard NOTs
 
@@ -538,6 +565,20 @@ Addenda:
   state is `Failed` (invalidate + notify on Drop); `commit_done`
   transitions to `Done` (put_done + notify on Drop). Avoids
   `armed: bool` + a separate `disarm_and_notify` shape.
+- Witness tokens / typestate for **security-critical ordering that
+  fails silently**. When getting an order wrong is a vulnerability
+  rather than a loud runtime error, make the wrong order
+  unrepresentable: a witness ZST minted only by the step that must
+  come first and required by the step that must come after
+  (`Sandboxed` — invariant #17), or a consume-`self` witness where
+  the guarded operation exists only on it (`Locked::serve` in
+  `src/providers/agent.rs`: `Locked` is minted only by
+  `lock_down`). Apply this ONLY to silent-failure orderings;
+  orderings that already fail loudly at runtime (a denied syscall,
+  a missing file) get a plain comment, not a token — the runtime is
+  the check. Don't sprinkle typestate on ordinary control flow, and
+  prefer a single witness over a multi-rung typestate ladder unless
+  every rung's ordering is itself a silent risk.
 
 ## Diagnostic discipline (mandatory)
 
@@ -630,12 +671,15 @@ lifetime, receives requests over an `mpsc` channel, and replies via
 a `futures_channel::oneshot`. See
 `src/providers/tpm_backend.rs` and `src/providers/agent_backend.rs`
 — both take the same shape. The actor thread is spawned
-*post-sandbox* (`into_backend`) so it inherits the Landlock
-ruleset; the fd it owns is opened/created *pre-sandbox* (see the
-startup-order rule under "Signing backends"). Blocking read/write
-on an already-open fd is unaffected by Landlock, so the split is
-safe. There was a shared `CpuWorker` here for in-process RSA; it
-was removed with the in-process signer.
+*post-sandbox* via `sandbox::spawn(&Sandboxed, …)` (`into_backend`
+takes the `&Sandboxed` witness — invariant #17) so it inherits the
+Landlock ruleset; the fd it owns is opened/created *pre-sandbox*.
+Blocking read/write on an already-open fd is unaffected by
+Landlock, so the split is safe. `sandbox::spawn` is the ONLY
+OS-thread-spawning API in the daemon — don't reach for
+`std::thread::spawn` directly, or the witness guarantee is lost.
+There was a shared `CpuWorker` here for in-process RSA; it was
+removed with the in-process signer.
 
 For one-off CPU bursts, **`compio::runtime::spawn_blocking(f)`**
 still exists (compio's pool lazily spawns up to 256 threads, 60 s

@@ -20,6 +20,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::sandbox::Sandboxed;
+
 /// GitHub App JWT claims: `iss` (App client id), `iat`, `exp`. The
 /// registered-claim shape is standard JOSE; GitHub App auth uses
 /// exactly these three. Serialised to JSON by both backends (the TPM
@@ -102,6 +104,11 @@ pub trait JwtBackend {
 /// backend is a new impl, with no central `match` to extend.
 pub trait SpawnedBackend {
     /// Start the actor thread and hand back the live backend. Consumes
-    /// the boxed spawn. Call post-sandbox.
-    fn into_backend(self: Box<Self>) -> Box<dyn JwtBackend>;
+    /// the boxed spawn. The `&Sandboxed` argument is proof the daemon
+    /// sandbox has been applied — the actor thread is spawned through
+    /// it, so it inherits the Landlock ruleset. This makes the
+    /// two-phase (acquire fd pre-sandbox, start thread post-sandbox)
+    /// split self-documenting: you cannot call this without a witness,
+    /// and the only witness comes from `sandbox::apply`.
+    fn into_backend(self: Box<Self>, sandboxed: &Sandboxed) -> Box<dyn JwtBackend>;
 }

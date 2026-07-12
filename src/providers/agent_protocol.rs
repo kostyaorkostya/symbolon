@@ -23,6 +23,16 @@ pub const AGENT_FD_ENV: &str = "SYMBOLON_AGENT_FD";
 /// the agent's read buffer against a hostile-but-in-process peer.
 pub const MAX_MESSAGE: usize = 8 * 1024;
 
+/// Cap on the operator-facing string in [`AgentResponse::Error`] — the
+/// only variable-length field in any message either side sends. Bounding
+/// it at construction ([`AgentResponse::error`]) is what makes every
+/// datagram provably fit [`MAX_MESSAGE`]: JSON escaping can expand a byte
+/// at most 6× (`\uXXXX`), so 1 KiB raw → ≤6 KiB encoded, still under the
+/// limit with headroom. The peer reads into a `MAX_MESSAGE` buffer and an
+/// over-long SEQPACKET datagram is silently truncated, so this bound is
+/// enforced, not hoped for.
+pub const MAX_ERROR_LEN: usize = 1024;
+
 /// Daemon → agent.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum AgentRequest {
@@ -39,10 +49,30 @@ pub enum AgentResponse {
     Jwt(String),
     /// Reply to `Ping`.
     Pong,
-    /// The agent could not satisfy the request (e.g. PEM reload
-    /// failed). The string is operator-facing and must not carry key
-    /// material.
+    /// The agent could not satisfy the request (e.g. the claims failed
+    /// to decode, or signing failed). The string is operator-facing and
+    /// must not carry key material. Construct via [`Self::error`], which
+    /// caps the length so the datagram cannot exceed [`MAX_MESSAGE`].
     Error(String),
+}
+
+impl AgentResponse {
+    /// Build an `Error` response, capping the message to [`MAX_ERROR_LEN`]
+    /// bytes (on a UTF-8 boundary) so the encoded datagram always fits
+    /// [`MAX_MESSAGE`]. This is the sole way an over-long field can enter
+    /// a message, so capping here makes [`encode`] provably infallible for
+    /// every response.
+    pub fn error(msg: impl Into<String>) -> Self {
+        let mut s = msg.into();
+        if s.len() > MAX_ERROR_LEN {
+            let mut end = MAX_ERROR_LEN;
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            s.truncate(end);
+        }
+        Self::Error(s)
+    }
 }
 
 /// Serialise `msg` to a single JSON datagram. Fails only if the value

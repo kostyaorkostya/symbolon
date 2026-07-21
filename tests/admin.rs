@@ -97,7 +97,7 @@ async fn admin_enroll_persists_to_clients_json_and_psk_file() {
         .permissions()
         .mode()
         & 0o777;
-    assert_eq!(cl_mode, 0o640);
+    assert_eq!(cl_mode, 0o600);
 
     let listed = admin_request(&paths.admin, serde_json::json!({"op": "list"})).await;
     assert_eq!(listed["clients"].as_array().unwrap().len(), 1);

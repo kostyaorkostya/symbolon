@@ -314,7 +314,7 @@ pub struct SharedState {
     pub shutdown: CancelToken,
 }
 
-const CLIENTS_FILE_MODE: u32 = 0o640;
+const CLIENTS_FILE_MODE: u32 = 0o600;
 const PSK_FILE_MODE: u32 = 0o600;
 
 /// State-mutation failure from `SharedState::enroll_client` or

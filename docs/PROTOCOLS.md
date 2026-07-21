@@ -29,14 +29,15 @@ bind = "0.0.0.0:9418"
 # Symbolon-owned PSK store. Mutated atomically on enroll/revoke.
 psk_file = "/var/lib/symbolon/psks"
 # Broker static X25519 private key: 64 hex chars on one line.
-# Operator-generated (`openssl rand -hex 32`), mode 0400. Read once
+# Operator-generated (`openssl rand -hex 32`), root:symbolon 0440. Read once
 # at startup, before the sandbox closes. Rotating it invalidates
 # every client's pinned public key — see OPERATIONS.md.
 static_key_file = "/etc/symbolon/broker.key"
 
 [admin]
-# Path the CLI connects to. The supervisor binds + chmods this
-# socket; the daemon never touches the inode.
+# Path the CLI connects to. The supervisor owns the inode — bind,
+# mode (systemd SocketMode= / systemfd umask), unlink; the daemon
+# never touches it.
 socket_path = "/run/symbolon/admin.sock"
 
 [clients]
@@ -169,12 +170,15 @@ changes require a restart.
 ### `/etc/symbolon/broker.key`: operator-authored
 
 The broker's static X25519 private key: 64 lowercase hex chars on
-one line (surrounding whitespace tolerated), owner `symbolon`,
-mode `0400`. Generate with:
+one line (surrounding whitespace tolerated), `root:symbolon`,
+mode `0440` (root-owned so the daemon's uid cannot replace or
+re-chmod it — see INSTALL.md §3.2). Generate with:
 
 ```
+umask 277
 openssl rand -hex 32 > /etc/symbolon/broker.key
-chmod 0400 /etc/symbolon/broker.key
+chown root:symbolon /etc/symbolon/broker.key
+chmod 0440          /etc/symbolon/broker.key
 ```
 
 Any 32-byte value is a valid X25519 private key (RFC 7748 clamping

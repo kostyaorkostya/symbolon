@@ -68,13 +68,13 @@ mod tests {
         assert_eq!(bytes, b"hello\n");
         let meta = std::fs::metadata(&path).expect("metadata");
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
-        atomic_write(&path, b"world\n".to_vec(), 0o640)
+        atomic_write(&path, b"world\n".to_vec(), 0o400)
             .await
             .expect("rewrite");
         let bytes = std::fs::read(&path).expect("reread");
         assert_eq!(bytes, b"world\n");
         let meta = std::fs::metadata(&path).expect("metadata 2");
-        assert_eq!(meta.permissions().mode() & 0o777, 0o640);
+        assert_eq!(meta.permissions().mode() & 0o777, 0o400);
         let _ = std::fs::remove_file(&path);
     }
 }

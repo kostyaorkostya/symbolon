@@ -14,11 +14,12 @@ See also:
 
 CLI commands talk to the daemon over its admin Unix socket.
 Access is gated entirely by filesystem permissions on the socket's
-parent directory (`/run/symbolon/` mode `0o750`, group `symbolon`)
-and the socket inode itself (mode `0o600` under systemd's
-`SocketMode=`; under `systemfd` + OpenRC the dir mode is the only
-gate — see [INSTALL.md](INSTALL.md) §3.11). Run the commands as
-root or as a user in the `symbolon` group.
+parent directory (`/run/symbolon/`, mode `0o700`) and the socket
+inode itself (mode `0o600` under systemd's `SocketMode=`; `0o700`
+under `systemfd` + OpenRC via the init script's `umask="077"` —
+see [INSTALL.md](INSTALL.md) §3.11). Run the commands as root
+(the directory is root-owned under systemd, `symbolon`-owned
+under OpenRC).
 
 ## Commands
 
@@ -150,7 +151,8 @@ which.
 ss -tlnp | grep ':9418'          # symbolon should be listening here
 ls -l /run/symbolon/admin.sock   # admin UDS, owner+mode set by supervisor:
                                  #   systemd: SocketMode=0600 + SocketUser/Group
-                                 #   systemfd: inherits umask; dir mode is the gate
+                                 #   systemfd: born 0777 & ~umask; the init
+                                 #   script's umask="077" makes that 0700
 ```
 
 If the admin socket is missing after a reboot: `/run` is tmpfs,
@@ -296,8 +298,10 @@ re-enrollment, not a selective rotation:
    host:
 
    ```sh
+   umask 277
    openssl rand -hex 32 > /etc/symbolon/broker.key
-   chmod 0400 /etc/symbolon/broker.key
+   chown root:symbolon /etc/symbolon/broker.key
+   chmod 0440          /etc/symbolon/broker.key
    ```
 
 3. Delete `/var/lib/symbolon/psks` and `/var/lib/symbolon/clients.json`,

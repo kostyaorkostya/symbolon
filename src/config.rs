@@ -67,7 +67,7 @@ pub struct ListenConfig {
     /// Loaded once at startup; atomically rewritten by enroll/revoke.
     pub psk_file: PathBuf,
     /// Path to the broker's static X25519 private key: 64 hex chars on
-    /// one line (`openssl rand -hex 32`), mode 0400. Loaded once at
+    /// one line (`openssl rand -hex 32`), root-owned, mode 0440. Loaded once at
     /// startup, before the sandbox closes; rotating it requires
     /// re-enrolling every client (see docs/OPERATIONS.md).
     pub static_key_file: PathBuf,

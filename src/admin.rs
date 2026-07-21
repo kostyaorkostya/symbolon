@@ -13,8 +13,8 @@
 //! (Clone2Leak-class defense applied to the admin path too).
 //!
 //! State writes are atomic per PROTOCOLS.md § "Atomic writes":
-//! tempfile → fsync → rename → fsync parent. `clients.json` lands
-//! with mode `0o640`, the symbolon-owned `psks` file with `0o600`.
+//! tempfile → fsync → rename → fsync parent. Both `clients.json`
+//! and the symbolon-owned `psks` file land with mode `0o600`.
 //! The daemon owns the PSK store directly — atomic write to disk
 //! and in-memory swap happen in the same enroll/revoke handler.
 
@@ -259,11 +259,15 @@ pub async fn run_admin_loop(
     listener: UnixListener,
     state: Rc<SharedState>,
 ) -> Result<(), AdminError> {
-    // Access control lives entirely in the filesystem: `INSTALL.md` pins
-    // the parent dir (`/run/symbolon`) to 0o750 root:symbolon and the
-    // socket inode is born 0o600 via the umask sandwich at bind-time
-    // (see daemon::prepare). Operators who deviate from that setup own
-    // the resulting exposure — the daemon does not second-guess them.
+    // Access control lives entirely with the supervisor that binds this
+    // socket (socket activation, AGENTS.md invariant #15 — the daemon
+    // never touches the inode): systemd chmods it via `SocketMode=0600`;
+    // under OpenRC, supervise-daemon's umask (`umask=077` in the init
+    // script; its built-in default is 022) sets what the inode is born
+    // with, and the 0700 `/run/symbolon` directory is the outer gate
+    // either way. See INSTALL.md §§3.9–3.11. Operators who deviate from
+    // that setup own the resulting exposure — the daemon does not
+    // second-guess them.
     let tracker = ConnectionTracker::new(PER_CONNECTION_TIMEOUT, Duration::from_secs(5));
     loop {
         // `select_biased!` with shutdown listed first: when both arms

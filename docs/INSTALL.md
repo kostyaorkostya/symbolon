@@ -63,9 +63,9 @@ apk add ca-certificates
 addgroup -S symbolon
 adduser  -S -G symbolon -H -D -s /sbin/nologin symbolon
 
-install -d -o symbolon -g symbolon -m 0700 /etc/symbolon
+install -d -o root     -g symbolon -m 0750 /etc/symbolon
 install -d -o symbolon -g symbolon -m 0700 /var/lib/symbolon
-install -d -o symbolon -g symbolon -m 0750 /run/symbolon
+install -d -o symbolon -g symbolon -m 0700 /run/symbolon
 ```
 
 `/etc/symbolon/` holds the provider private key, the broker
@@ -76,8 +76,21 @@ separate because the daemon's landlock ruleset grants write access
 to `/var/lib/symbolon/`; putting either key under that dir would
 defeat the sandbox's protection of the keys.
 
+`/etc/symbolon/` is **root-owned with group read** (files land
+`root:symbolon 0440`/`0640` in §§3.4–3.6): a file's owner can
+always `chmod`/`chown` it back open, and Landlock does not govern
+metadata operations (there is no `LANDLOCK_ACCESS_FS_*` right for
+chmod — see landlock(7)), so ownership by the daemon's own uid
+would let a compromised broker rewrite its config to weaken the
+next restart (`sandbox = "off"`, a different `api_base`) or
+replace its keys. Root ownership makes the config surface
+read-only to the broker unconditionally. `/var/lib/symbolon/`
+cannot get the same treatment — the daemon is the sole writer
+there (tempfile + rename needs dir write); that residual is fine
+because everything in it is already in the daemon's memory.
+
 The `/run/symbolon` directory is recreated on every boot — under
-systemd by the `.service` unit's `RuntimeDirectory=symbolon` (§3.10),
+systemd by the `.socket` unit's `RuntimeDirectory=symbolon` (§3.10),
 under OpenRC by the init script's `start_pre` + `checkpath` (§3.11).
 The `install -d` above seeds it for the first start before either
 supervisor is wired up.
@@ -106,7 +119,7 @@ Pick one:
 sandboxed subprocess owns the PEM:
 
 ```sh
-install -o symbolon -g symbolon -m 0400 /path/to/github-app.pem /etc/symbolon/github-app.pem
+install -o root -g symbolon -m 0440 /path/to/github-app.pem /etc/symbolon/github-app.pem
 ```
 
 **`tpm` backend** — the RSA key lives in a per-instance vTPM. On an
@@ -151,7 +164,8 @@ X25519 key — stored as 64 hex chars on one line:
 ```sh
 umask 277
 openssl rand -hex 32 > /etc/symbolon/broker.key
-chown symbolon:symbolon /etc/symbolon/broker.key
+chown root:symbolon /etc/symbolon/broker.key
+chmod 0440          /etc/symbolon/broker.key
 ```
 
 There is no keygen subcommand and no rotation machinery: the
@@ -211,8 +225,8 @@ private_key_path = "/etc/symbolon/github-app.pem"
 ```
 
 ```sh
-chown symbolon:symbolon /etc/symbolon/config.toml
-chmod 0600    /etc/symbolon/config.toml
+chown root:symbolon /etc/symbolon/config.toml
+chmod 0640          /etc/symbolon/config.toml
 ```
 
 ### 3.7 Initialize state files
@@ -291,8 +305,17 @@ the per-connection logic.
 
 ### 3.10 systemd (`.socket` + `.service`)
 
-The runtime directory is created by systemd via the `.service`
+The runtime directory is created by systemd via the `.socket`
 unit's `RuntimeDirectory=` (no `tmpfiles.d` needed).
+`RuntimeDirectory=` is a systemd.exec setting and socket units
+support it; it must live on the `.socket`, NOT the `.service`,
+for two reasons: on a fresh boot the socket unit binds
+`/run/symbolon/admin.sock` before the service has ever started
+(`/run` is tmpfs — a service-side `RuntimeDirectory=` isn't there
+yet and the bind fails), and systemd removes a unit's runtime
+directory when that unit stops, so a service-side declaration
+would unlink the still-listening socket's parent directory on
+every `systemctl restart symbolon.service`.
 
 **`/etc/systemd/system/symbolon.socket`:**
 
@@ -306,6 +329,8 @@ ListenStream=/run/symbolon/admin.sock
 SocketMode=0600
 SocketUser=symbolon
 SocketGroup=symbolon
+RuntimeDirectory=symbolon
+RuntimeDirectoryMode=0700
 Backlog=128
 BindIPv6Only=both
 
@@ -332,8 +357,12 @@ Sockets=symbolon.socket
 ExecStart=/usr/local/bin/symbolon daemon
 User=symbolon
 Group=symbolon
-RuntimeDirectory=symbolon
-RuntimeDirectoryMode=0750
+# Belt-and-braces for state-file modes: the daemon passes explicit
+# 0600 modes to open(2), and a 0077 umask guarantees nothing it
+# ever creates can be born group/world-accessible even if a mode
+# slips. (The admin UDS is unaffected — the .socket unit binds it
+# and SocketMode= chmods it.)
+UMask=0077
 # Required for `[security] mlock = "best_effort"` (the default).
 # Without it, mlockall fails with EAGAIN under the per-user
 # 64 KB default ulimit; daemon logs `evt=mlock status=skipped`
@@ -383,6 +412,8 @@ command="/usr/local/bin/systemfd"
 command_args="--no-pid -b 128 -s tcp::0.0.0.0:9418 -s unix::/run/symbolon/admin.sock -- /usr/local/bin/symbolon daemon"
 command_user="symbolon:symbolon"
 supervisor="supervise-daemon"
+# Socket + state-file modes hang on this line; see the caveat below.
+umask="077"
 output_log="/var/log/symbolon.log"
 error_log="/var/log/symbolon.log"
 
@@ -394,20 +425,37 @@ depend() {
 # /run is tmpfs and is cleared at every boot; re-create the daemon's
 # runtime directory before starting. checkpath is idempotent.
 start_pre() {
-    checkpath -d -m 0750 -o symbolon:symbolon /run/symbolon
+    checkpath -d -m 0700 -o symbolon:symbolon /run/symbolon
 }
 ```
 
 The `-s` flag arguments must appear in this order — the daemon takes
 slot 0 as the TCP wire and slot 1 as the admin UDS.
 
-**Caveat: socket mode under OpenRC.** Unlike systemd's
-`SocketMode=0600`, `systemfd` does not chmod the UDS — it inherits
-the daemon process's umask (typically `0o755` for sockets). Access
-control falls entirely on the `/run/symbolon/` directory mode
-(`0o750 root:symbolon`, per `start_pre`'s `checkpath`). This matches
-the broker's threat model — the directory mode is the primary gate —
-but is worth knowing if you ever loosen the directory perms.
+**Caveat: socket mode under OpenRC — `umask="077"` is what sets
+it.** Unlike systemd's `SocketMode=0600`, `systemfd` never chmods
+the UDS: it binds and leaves the inode at `0777 & ~umask`
+(verified against systemfd's `src/fd.rs` — no mode handling in
+the bind path). And the umask systemfd runs under is NOT inherited
+from the environment: `supervise-daemon` unconditionally resets it
+to its own default of `022` before exec (see `numask` in OpenRC's
+`src/supervise-daemon/supervise-daemon.c`), which would leave the
+socket world-readable-looking at `0755` — connectable only by
+owner and root, since connect(2) on a Unix socket requires *write*
+permission on the inode (unix(7)), but sloppy. The `umask="077"`
+service variable is OpenRC's first-class knob for this (passed
+through as `supervise-daemon --umask`); with it the socket is born
+`0700` and the daemon's state files are additionally clamped to
+owner-only. A `umask` call in `start_pre` would be silently
+overridden — it must be the service variable. The
+`0700 symbolon:symbolon` directory is the outer gate either way;
+run the CLI as root (or as the `symbolon` user).
+
+Unlike the systemd flow (where the `.socket` unit's
+`RuntimeDirectory=` owns `/run/symbolon`), here `start_pre`'s
+`checkpath` recreates it every boot — systemfd runs as
+`symbolon` and needs write on the directory to create the socket
+inode, hence `symbolon`-owned rather than root-owned.
 
 ```sh
 chmod +x /etc/init.d/symbolon

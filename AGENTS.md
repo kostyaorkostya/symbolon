@@ -64,7 +64,7 @@ publishes binaries with sha256 attestations. The workflow:
    toolchain for musl).
 3. Post-strips `.eh_frame` / `.eh_frame_hdr` /
    `.gcc_except_table` (safe with `panic = "abort"`; saves
-   ~390 KB).
+   ~400 KB).
 4. Hands each target's binaries+sha256s to a single downstream
    `release` job via `actions/upload-artifact`. The release job
    downloads everything and makes ONE `softprops/action-gh-release`
@@ -335,6 +335,11 @@ Pinned in `Cargo.toml`:
   JOSE algorithms; the actual signing is a single `rsa::SigningKey`
   call. Output is locked by a known-vector test in
   `jwt_rs256::tests::known_vector_round_trip`.
+- `getrandom` (fills the 32-byte PSK buffer in `src/psk.rs` straight
+  from the kernel CSPRNG. Already in the graph transitively via
+  snow's `use-getrandom` feature, so the explicit dep adds no
+  surface; listing it top-level makes the audit trail for
+  secret-generating randomness explicit.)
 - `hex` (encode/decode for the per-line PSK file format in
   `src/psk_store.rs`, the enroll output's `psk_hex` field in
   `src/admin.rs`, and the client binary's PSK file load in
@@ -412,10 +417,12 @@ Pinned in `Cargo.toml`:
   serde-derive and thiserror, so the marginal cost is one small
   proc-macro crate.)
 - `time` with `default-features = false, features = ["parsing",
-  "formatting"]` (RFC3339 → `SystemTime` for GitHub's `expires_at`,
-  RFC2822 for the HTTP `Date` header in selfcheck, and RFC3339
-  rendering of `enrolled_at` on enroll). Defaults disabled to
-  strip the surface we don't use.
+  "formatting", "serde", "serde-well-known", "std"]` (RFC3339 →
+  `SystemTime` for GitHub's `expires_at`, RFC2822 for the HTTP
+  `Date` header in selfcheck, and RFC3339 rendering of
+  `enrolled_at` on enroll; `serde` + `serde-well-known` let serde
+  structs deserialize RFC3339 timestamps directly). Defaults
+  disabled to strip the surface we don't use.
 - `tracing` with `default-features = false, features = ["std",
   "release_max_level_info"]`. `release_max_level_info` compiles
   out every `debug!` / `trace!` callsite in our code and our
@@ -639,6 +646,8 @@ src/
     jwt_backend.rs     # the signing seam: `JwtBackend` trait + `JwtClaims`
     jwt_rs256.rs       # RS256 JWS framing: signing_input / assemble / whole-token sign
     tpm_backend.rs     # `tpm` backend: vTPM signer, fd-owning actor thread
+    tpm_backend/
+      wire.rs          # TPM2_ReadPublic / TPM2_Sign command marshal/unmarshal
     agent_backend.rs   # `file` backend daemon side: socketpair spawn + actor
     agent_protocol.rs  # daemon↔agent SEQPACKET message types
     agent.rs           # `__sign-agent` subprocess: key custody + self-sandbox + serve
@@ -647,6 +656,8 @@ tests/
   client_binary.rs     # end-to-end smoke against a one-shot Noise responder
   daemon.rs            # TCP wire round-trip against the daemon
   github_provider.rs   # wiremock-rs against the GitHub provider
+  sign_agent.rs        # real `__sign-agent` subprocess under Landlock+seccomp
+  tpm_backend.rs       # live swtpm E2E (ignored by default; opt-in)
   common/              # shared test scaffolding
   fixtures/            # test_app_key.pem
 fuzz/                  # cargo-fuzz subproject (nightly-pinned)

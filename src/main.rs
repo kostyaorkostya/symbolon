@@ -178,9 +178,11 @@ async fn run_daemon(config_path: PathBuf) -> ExitCode {
     service.selfcheck().await;
 
     // Lifecycle order: Service::prepare above already loaded
-    // config, bound BOTH Unix sockets (the kernel begins queueing
-    // incoming connections at bind time), applied the sandbox, and
-    // built providers. selfcheck just hit GitHub via HTTPS.
+    // config, reclaimed both pre-bound listeners (TCP wire + admin
+    // UDS) from the supervisor via LISTEN_FDS (the kernel has been
+    // queueing connections since the supervisor's bind), applied
+    // the sandbox, and built providers. selfcheck just hit GitHub
+    // via HTTPS.
     //
     // Now we tell the init system we're ready. `service.run` below
     // starts the accept loop; any connections the kernel queued

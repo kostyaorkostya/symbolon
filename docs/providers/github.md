@@ -297,10 +297,11 @@ In-memory cache keyed by `(provider_name, owner/repo)`
 (case-insensitive for `owner/repo`). Cache hits skip both steps
 and go straight to `mint_token`.
 
-**TTL: 600 seconds per entry.** On any 404 from a subsequent
-`mint_token` call referring to a cached entry, invalidate it; the
-next mint re-resolves. This handles the delete-then-recreate-
-with-same-name case where the numeric ID changes.
+**No TTL — entries live for the process lifetime.** On any 404
+from a subsequent `mint_token` call referring to a cached entry,
+invalidate it; the next mint re-resolves. This handles the
+delete-then-recreate-with-same-name case where the numeric ID
+changes, and is the only invalidation path.
 
 ### Token mint
 

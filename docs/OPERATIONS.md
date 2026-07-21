@@ -156,9 +156,9 @@ ls -l /run/symbolon/admin.sock   # admin UDS, owner+mode set by supervisor:
 ```
 
 If the admin socket is missing after a reboot: `/run` is tmpfs,
-cleared at boot. `checkpath` (OpenRC) or `tmpfiles.d` (systemd)
-must recreate `/run/symbolon`. See
-[INSTALL.md §3.9 / §3.10](INSTALL.md).
+cleared at boot. `checkpath` (OpenRC) or the `.socket` unit's
+`RuntimeDirectory=` (systemd) must recreate `/run/symbolon`. See
+[INSTALL.md §3.10 / §3.11](INSTALL.md).
 
 **3. Can the client reach the broker over Noise?**
 

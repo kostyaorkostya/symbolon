@@ -555,7 +555,7 @@ extending the enum and adding a row below.
 | `accept` | `psk_identity` (decrypted out of handshake msg1), `peer` (TCP source addr, audit-only) |
 | `mint` | `provider`, `repo`, `client`, `ttl_sec`, `expires_at_unix`, `provider_ms` |
 | `mint_denied` | `provider`, `client`, `repo`, `reason`, `provider_status`; `retry_after_sec` when `provider_status=429` and the provider's `Retry-After` header was parseable (else `0`) |
-| `provider_error` | `provider`, `endpoint`, `status`, `body_snippet` |
+| `provider_error` | `provider`, `repo`, `provider_ms`, plus `status` (HTTP status from the provider) or `error` (error chain); the response-write variant instead carries `reason="response_write"`, `client` (mint succeeded upstream but delivering the response to the client failed). `endpoint`, `body_snippet` deferred (below) |
 | `selfcheck` | `provider`, `ok`, `clock_skew_sec` |
 | `enroll` | `provider`, `client` |
 | `revoke` | `provider`, `client` |

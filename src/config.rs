@@ -59,9 +59,11 @@ pub struct RuntimeConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListenConfig {
-    /// TCP address the daemon binds for inbound client connections.
-    /// Default deployment: `0.0.0.0:9418`. Symbolon terminates Noise NKpsk2
-    /// in-process.
+    /// Wire TCP address, informational: the daemon never binds — the
+    /// supervisor binds and hands the listener via `LISTEN_FDS` slot 0
+    /// (AGENTS.md invariant #15). Not consumed at runtime; documents
+    /// the intended wire address so config and supervisor stay in
+    /// sync by hand.
     pub bind: SocketAddr,
     /// Path to the symbolon-owned PSK store (`identity:hex_psk` per line).
     /// Loaded once at startup; atomically rewritten by enroll/revoke.

@@ -182,9 +182,10 @@ client's key file (see
 
 ```toml
 [listen]
-# TCP address the daemon binds for inbound client connections.
-# 0.0.0.0:9418 = git smart-http port; pick another if you're
-# already using 9418 for something else.
+# Wire TCP address. Informational: the daemon does NOT bind — the
+# supervisor (systemd .socket / systemfd) binds and hands the fd
+# via LISTEN_FDS (§3.9). Keep this in sync with the supervisor
+# config. 0.0.0.0:9418 = git smart-http port.
 bind = "0.0.0.0:9418"
 # Symbolon-owned PSK store (`identity:hex_psk` per line, mode 0600).
 # Mutated atomically on enroll/revoke.
@@ -249,9 +250,10 @@ Symbolon's access control is the per-client PSK and the Noise
 NKpsk2 handshake. A connection that doesn't present a known
 identity and the matching PSK never completes the handshake,
 regardless of where it originated. **IP-based filtering is
-optional defense-in-depth, not required.** The daemon binds
-`0.0.0.0:9418` deliberately so it works behind any LAN topology
-(DHCP clients, NAT, container bridges).
+optional defense-in-depth, not required.** The wire listens on
+`0.0.0.0:9418` deliberately (the supervisor binds it — §3.9) so it
+works behind any LAN topology (DHCP clients, NAT, container
+bridges).
 
 Three deployment patterns when you do want a network-level layer:
 
@@ -429,6 +431,15 @@ umask="077"
 # `export` works: supervise-daemon passes the environment through
 # (it scrubs only RC_* variables), as does systemfd.
 export RUST_MIN_STACK=131072
+# OpenRC counterpart of the systemd unit's LimitMEMLOCK=infinity
+# (§3.10). Without it, mlockall fails under the kernel's 64 KB
+# default RLIMIT_MEMLOCK: `mlock = "best_effort"` (the default)
+# silently degrades to `evt=mlock status=skipped` and the daemon
+# runs without anti-swap hardening; `mlock = "required"` refuses
+# to start. openrc-run applies rc_ulimit before starting the
+# service; the limit is inherited through supervise-daemon and
+# systemfd.
+rc_ulimit="-l unlimited"
 output_log="/var/log/symbolon.log"
 error_log="/var/log/symbolon.log"
 
@@ -508,8 +519,9 @@ symbolon github selfcheck
 `selfcheck` should report the provider reachable and clock skew
 small. Exit code 0 means everything's good. (CLI commands talk to
 the daemon over its admin Unix socket; access is gated by the
-`/run/symbolon/` directory mode — group `symbolon` only. Run the
-commands as a user in that group, or as root.)
+`/run/symbolon/` directory, mode 0700 — owner-only. Run the
+commands as root, or as the `symbolon` user where it owns the
+directory (the OpenRC setup).)
 
 ## 4. Enroll a client
 

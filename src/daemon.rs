@@ -636,7 +636,9 @@ impl Service {
     }
 
     /// Run the accept loops until `shutdown` is cancelled, drain
-    /// per-connection handlers, unlink the admin socket. Returns RunStats.
+    /// per-connection handlers. The supervisor-owned admin socket
+    /// inode is left untouched (the daemon never unlinks it).
+    /// Returns RunStats.
     pub async fn run(self) -> Result<RunStats, DaemonError> {
         let Service {
             state,

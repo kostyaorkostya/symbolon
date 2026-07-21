@@ -760,6 +760,29 @@ No CI integration today. Operator runs fuzz on demand.
 
 Known omissions, not oversights:
 
+- **Static-PIE release binaries (ASLR).** Both shipped musl
+  binaries are `ET_EXEC` — position-dependent static executables
+  with no image ASLR — because `cargo zigbuild`'s `zig cc` (0.16.0)
+  does not implement `-static-pie` and discards it with an
+  "argument unused" warning. rustc's x86_64-musl target spec
+  enables static-PIE (`static_position_independent_executables`)
+  and passes `-static-pie` to the linker driver, so a plain
+  `cargo build --release --target x86_64-unknown-linux-musl`
+  (rustc's bundled musl + self-contained crt, host cc for ring's C)
+  produces a correct static-PIE (`ET_DYN`, no `INTERP`,
+  `DF_1_PIE`); splitting the release pipeline that way was
+  considered and rejected — build symmetry across the two targets
+  is worth more than defense-in-depth ASLR on a memory-safe
+  binary with a tiny FFI surface. aarch64 is blocked deeper:
+  its rustc target spec lacks the static-PIE flag entirely, so
+  rustc emits `-no-pie` (which conflicts with any injected
+  `-static-pie`) even though `rcrt1.o` already ships in the
+  aarch64-musl sysroot. Reopen when any of: zig implements
+  `-static-pie`; cargo-zigbuild translates or at least surfaces
+  the dropped flag; rustc's `aarch64-unknown-linux-musl` spec
+  gains `static_position_independent_executables = true` (one-line
+  change, x86_64 precedent). All three are upstream-filing
+  candidates.
 - **Mint coalescing.** Concurrent mints for the same repo each call
   the provider API. Acceptable at homelab traffic; revisit if it
   changes.

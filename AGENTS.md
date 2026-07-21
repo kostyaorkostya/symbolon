@@ -521,7 +521,11 @@ Never hand-edit version strings in `Cargo.toml` from guessed values.
 Let `cargo add` write them, then commit `Cargo.lock`.
 
 Release profile: `opt-level = "z"`, `lto = "fat"`,
-`codegen-units = 1`, `panic = "abort"`, `strip = "symbols"`.
+`codegen-units = 1`, `panic = "abort"`, `strip = "symbols"`,
+`overflow-checks = true` (silent integer wrap-around becomes an
+abort — in a credential broker the arithmetic is lengths, TTLs,
+and counters, exactly where a quiet wrap is worst; the few percent
+of size/speed are invisible at broker traffic).
 
 ## Style guide
 

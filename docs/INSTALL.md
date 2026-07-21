@@ -363,6 +363,15 @@ Group=symbolon
 # slips. (The admin UDS is unaffected — the .socket unit binds it
 # and SocketMode= chmods it.)
 UMask=0077
+# Shrink default-sized thread stacks (Rust's default is 2 MiB) to
+# musl's own 128 KiB per-thread default. Under mlockall (see
+# LimitMEMLOCK below) every live thread's full stack is pre-faulted
+# into locked, unevictable memory, so the default costs 2 MiB per
+# thread. The only threads taking the default are compio's blocking
+# pool (DNS getaddrinfo; measured worst-case frame ~16 KiB) — the
+# daemon's own actor threads set their size explicitly and ignore
+# this. Musl-target-only guidance; overflow is a loud SIGSEGV.
+Environment=RUST_MIN_STACK=131072
 # Required for `[security] mlock = "best_effort"` (the default).
 # Without it, mlockall fails with EAGAIN under the per-user
 # 64 KB default ulimit; daemon logs `evt=mlock status=skipped`
@@ -414,6 +423,12 @@ command_user="symbolon:symbolon"
 supervisor="supervise-daemon"
 # Socket + state-file modes hang on this line; see the caveat below.
 umask="077"
+# Same rationale as Environment=RUST_MIN_STACK in the systemd unit
+# (§3.10): cap default-sized thread stacks at musl's 128 KiB so
+# mlockall doesn't lock 2 MiB per blocking-pool thread. Plain
+# `export` works: supervise-daemon passes the environment through
+# (it scrubs only RC_* variables), as does systemfd.
+export RUST_MIN_STACK=131072
 output_log="/var/log/symbolon.log"
 error_log="/var/log/symbolon.log"
 

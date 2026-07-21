@@ -59,6 +59,17 @@ impl Sandboxed {
     }
 }
 
+/// Stack size for daemon-spawned threads: musl's own
+/// `DEFAULT_STACK_SIZE`, the budget every C thread gets by default on
+/// our targets. Rust's 2 MiB default is 16× this, and under
+/// `mlockall(MCL_FUTURE)` (no `MCL_ONFAULT` — invariant #14) a
+/// thread's full stack is pre-faulted into *locked* memory at spawn,
+/// so the default would cost 2 MiB of unevictable RSS per thread.
+/// The actor threads keep their working buffers on the heap; their
+/// frames are far below this. Overflow hits the guard page — a loud
+/// SIGSEGV, not corruption.
+const SPAWN_STACK_SIZE: usize = 128 * 1024;
+
 /// Spawn an OS thread — the ONLY thread-spawning path in the daemon.
 /// The `&Sandboxed` argument proves the sandbox step has run on this
 /// thread, so the child inherits the Landlock ruleset. `name` shows
@@ -68,7 +79,10 @@ pub fn spawn(
     name: &str,
     f: impl FnOnce() + Send + 'static,
 ) -> io::Result<std::thread::JoinHandle<()>> {
-    std::thread::Builder::new().name(name.to_string()).spawn(f)
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(SPAWN_STACK_SIZE)
+        .spawn(f)
 }
 
 /// Filesystem paths the daemon needs after restriction. Anything

@@ -681,6 +681,20 @@ OS-thread-spawning API in the daemon — don't reach for
 There was a shared `CpuWorker` here for in-process RSA; it was
 removed with the in-process signer.
 
+`sandbox::spawn` also caps the thread stack at 128 KiB — musl's own
+per-thread default (`DEFAULT_STACK_SIZE` in
+`src/internal/pthread_impl.h`); Rust's default is 2 MiB. This
+matters because of `mlockall(MCL_CURRENT | MCL_FUTURE)` without
+`MCL_ONFAULT` (invariant #14): a spawned thread's entire stack is
+pre-faulted into locked, unevictable memory, so stack size is
+locked RSS, not just address space. Actor working buffers live on
+the heap; frames stay far below the cap, and overflow hits the
+guard page (loud SIGSEGV, not corruption). Threads that take
+Rust's default — compio's blocking pool, where DNS `getaddrinfo`
+runs (worst-case measured frame ~16 KiB on musl) — can't be sized
+through compio's API; deployments opt in via the
+`RUST_MIN_STACK=131072` env var (see INSTALL.md §§3.10–3.11).
+
 For one-off CPU bursts, **`compio::runtime::spawn_blocking(f)`**
 still exists (compio's pool lazily spawns up to 256 threads, 60 s
 idle reap) — good when work is occasional, bad for high-frequency
